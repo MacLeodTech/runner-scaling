@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-18
+
 ### Security
 - The JIT config is passed to the runner as `ACTIONS_RUNNER_INPUT_JITCONFIG` instead of `--jitconfig`, so it no longer
   appears in the runner's `/proc/<pid>/cmdline` (readable by every user on the host, and by jobs through `ps`).
