@@ -12,14 +12,25 @@ Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's
 
 ## How it works
 
-```
-GitHub ◄── long poll (outbound) ── scaler ──── unix socket ────► guard ──── docker.sock
-                                   holds GitHub creds             holds the Docker socket
-                                   no Docker access               no network, no GitHub creds
-                                                                   │  builds every container from guard.yaml
-                                                                   ▼
-                                          <prefix>-runner-N + <prefix>-dind-N on network <prefix>-slot-N
-                                          fresh work volume per runner, removed with it
+```mermaid
+flowchart LR
+    GH[("GitHub<br/>Actions service")]
+    subgraph host["Docker host"]
+        direction LR
+        S["<b>scaler</b><br/>holds the GitHub credential<br/>no Docker access"]
+        G["<b>guard</b><br/>holds the Docker socket<br/>no network, no GitHub credential"]
+        D[("docker.sock")]
+        subgraph slot["slot N (network &lt;prefix&gt;-slot-N)"]
+            R["&lt;prefix&gt;-runner-N"]
+            DIND["&lt;prefix&gt;-dind-N<br/>(optional)"]
+        end
+    end
+    S -- "long poll, outbound only" --> GH
+    S -- "unix socket API" --> G
+    G --> D
+    G -. "builds every container<br/>from guard.yaml" .-> slot
+    R -- "register with JIT config" --> GH
+    R --- DIND
 ```
 
 The software has two parts, both in one small image (`runner-scaling guard` / `runner-scaling scaler`):
@@ -27,7 +38,7 @@ The software has two parts, both in one small image (`runner-scaling guard` / `r
 - **The scaler** registers a runner scale set, receives job messages, and asks GitHub for a single-use
   just-in-time (JIT) runner config whenever it needs a runner. It hands that config to the guard. It never
   touches Docker.
-- **The guard** owns the Docker socket and exposes four calls to the scaler, on a unix socket:
+- **The guard** owns the Docker socket and exposes five calls to the scaler, on a unix socket:
 
   | Call | What it does |
   |---|---|
@@ -35,10 +46,37 @@ The software has two parts, both in one small image (`runner-scaling guard` / `r
   | `GET /v1/slots` | which slots exist and their state |
   | `PUT /v1/slots/{n}` | `{runner_name, jit_config}`: start slot *n* |
   | `DELETE /v1/slots/{n}` | stop slot *n* |
+  | `POST /v1/slots/{n}/keep-cache` | `{runner_name}`: the job on slot *n* is trusted, so keep its caches (see [Caches](#caches)) |
 
   Image, mounts, capabilities, limits, networks, `privileged`: every detail of the containers comes from
   `guard.yaml`, a file the scaler can't change. The guard has no network. It also reaps slots whose runner has
   exited, so slots never leak even if the scaler dies.
+
+### Life of a job
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub
+    participant S as scaler
+    participant G as guard
+    participant C as slot containers
+    GH-->>S: job queued (long poll)
+    S->>GH: request single-use JIT config
+    GH-->>S: JIT config
+    S->>G: PUT /v1/slots/N (runner name, JIT config)
+    G->>G: validate JIT config, check memory budget
+    G->>C: start dind (if configured), then runner
+    C->>GH: runner registers and takes the job
+    GH-->>S: JobStarted (event, workflow ref)
+    opt trusted job: push, schedule, dispatch or release on a trusted ref
+        S->>G: POST /v1/slots/N/keep-cache
+    end
+    GH-->>S: JobCompleted
+    S->>G: DELETE /v1/slots/N
+    G->>C: remove containers and work volume
+    G->>C: wipe cache_dirs (unless vouched for)
+```
 
 ## Threat model
 
@@ -54,7 +92,7 @@ They can't:
   has no way to express any of that;
 - point a runner at a server of their own, or at a GitHub org of their own. The guard checks every JIT config
   (see below);
-- reach the Docker API in any other way. Every request outside the four calls above is refused and logged as `DENY`.
+- reach the Docker API in any other way. Every request outside the five calls above is refused and logged as `DENY`.
 
 **What the guard checks in a JIT config.** A JIT config isn't signed, and a runner trusts whatever servers it
 names. The guard decodes it and requires that:
@@ -67,7 +105,7 @@ names. The guard decodes it and requires that:
 
 **Not solved by this tool. Know these before you use it:**
 - **The guard itself is root-equivalent**, because it holds the Docker socket. It is kept small: no network, no
-  credentials, a fixed four-call API, read-only filesystem, all capabilities dropped.
+  credentials, a fixed five-call API, read-only filesystem, all capabilities dropped.
 - **With the dind sidecar, any job is root on the host.** The sidecar is privileged, so a job can start a
   `--privileged` container against it and mount the host's disk. The guard's API limits what a taken-over *scaler*
   can ask for; it does not limit what a *job* can do. Anyone who can get a workflow onto a repo that uses these
@@ -113,7 +151,10 @@ names. The guard decodes it and requires that:
 4. **Pin the tenant.** The first runner request is refused with
    `DENY ... no tenant_url pinned: this config's ServerUrl is "https://…/<tenant>/"`. Check it, put it in
    `tenant_url`, and restart the guard.
-5. **Target it from workflows** with the scale set's labels, for example `runs-on: [self-hosted, ci]`.
+5. **Fence the slot networks (recommended).** Give `subnet` a fixed range and add host firewall rules, in Docker's
+   `DOCKER-USER` chain, so jobs reach the internet but not your LAN or the host. Set `require_file` to a file your
+   firewall script creates (on a tmpfs), and the guard won't start a slot until the rules are in place.
+6. **Target it from workflows** with the scale set's labels, for example `runs-on: [self-hosted, ci]`.
 
 ### Scaler flags (or environment)
 
@@ -125,7 +166,9 @@ names. The guard decodes it and requires that:
 | `--min-runners` | `MIN_RUNNERS` | 0 | runners kept warm |
 | `--max-runners` | `MAX_RUNNERS` | guard `max_slots` | can't exceed `max_slots` |
 | `--delete-scale-set` | | | delete the scale set and exit |
-| `--socket` | `GUARD_SOCKET` | `/run/runner-scaling/guard.sock` | |
+| `--socket` | `GUARD_SOCKET` | `/run/runner-scaling/guard.sock` | guard API socket |
+| | `CACHE_TRUSTED_REFS` | `refs/heads/main` | refs whose push/schedule/dispatch/release jobs keep their caches; `none` wipes always |
+| | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 ### Operations
 
@@ -154,14 +197,58 @@ names. The guard decodes it and requires that:
   the first container exists; the backstop covers that. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
-- **Caches.** Bind per-slot cache directories (`{slot}` in a path is replaced with the slot number) so warm jobs
-  skip downloads. A dind `/var/lib/docker` must never be shared between slots. Slots are only ever reused one
-  runner at a time. List the same directories under `cache_dirs` to keep them safe: the guard empties them (in a
-  one-shot container, no network) when a slot is torn down, at startup, and before reusing a slot whose wipe failed,
-  except after a job the scaler marked trusted. The scaler marks a job trusted when its event is `push`, `schedule`,
-  `workflow_dispatch` or `release` and its workflow ref is in `CACHE_TRUSTED_REFS` (comma-separated, default
-  `refs/heads/main`; `none` wipes after every job). If the scaler is down or misses the job start, the caches are
-  wiped: the failure costs speed, not safety. The cost is cold caches for every PR and branch job.
+
+### Caches
+
+Bind per-slot cache directories (`{slot}` in a path is replaced with the slot number) so warm jobs skip downloads.
+A dind `/var/lib/docker` must never be shared between slots. Slots are only ever reused one runner at a time.
+
+A job can plant code in a cache that the next job on that slot runs, so list the same directories under
+`cache_dirs`. The guard then empties them in a one-shot container (no network) when a slot is torn down, at startup,
+and before reusing a slot whose wipe failed, unless the scaler vouched for the job:
+
+```mermaid
+flowchart TD
+    A["Job started on slot N"] --> B{"event is push, schedule,<br/>workflow_dispatch or release?"}
+    B -- no --> W
+    B -- yes --> C{"workflow ref in<br/>CACHE_TRUSTED_REFS?"}
+    C -- no --> W
+    C -- yes --> V["scaler calls keep-cache"]
+    V --> K["slot torn down: caches kept"]
+    W["slot torn down: caches wiped"]
+    M["scaler down or missed the job start"] --> W
+    W --> F{"wipe succeeded?"}
+    F -- yes --> R["slot can be reused"]
+    F -- no --> X["slot blocked until a wipe succeeds"]
+```
+
+`CACHE_TRUSTED_REFS` is comma-separated and defaults to `refs/heads/main`; `none` wipes after every job. A missing
+vouch always means a wipe, so a failure costs speed, not safety. The cost is cold caches for every PR and branch job.
+
+### guard.yaml reference
+
+[examples/guard.yaml](examples/guard.yaml) shows the common fields. All of them:
+
+| Field | Meaning |
+|---|---|
+| `github_url` | org or repo URL the scale set is registered at |
+| `tenant_url` | pinned Actions tenant URL; leave empty on first start |
+| `shared_hosts` | extra hosts allowed in a JIT config with any path (default: the Actions broker) |
+| `prefix` | names everything the guard creates; 1-31 lowercase letters, digits, dashes |
+| `max_slots` | most runners at once (1-250) |
+| `subnet` | per-slot network such as `172.30.{slot}.0/24`; empty lets Docker pick |
+| `work_dir` | job workspace path inside the runner (and dind); not under `/tmp` with dind |
+| `work_bind` | host directory (`{slot}` required) to use as `work_dir` instead of a Docker volume |
+| `cache_dirs` | host directories (`{slot}` required) emptied after untrusted jobs |
+| `memory_budget`, `memory_reserve` | host-wide memory cap and per-slot admission estimate |
+| `cgroup_parent` | put all runner containers under one cgroup you can cap with systemd |
+| `require_file` | the guard starts no slot until this file exists (a gate for a host firewall) |
+| `start_timeout` | how long a slot may take to come up (default 2m) |
+| `max_runtime` | the reaper removes a runner that runs longer than this (default: no limit) |
+| `reap_interval` | how often exited runners are cleaned up (default 5s) |
+| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
+
+Omit `dind` for runners without a private Docker daemon.
 
 ## Development
 
