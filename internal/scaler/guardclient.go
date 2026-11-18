@@ -30,9 +30,13 @@ func NewGuardClient(socket string) *GuardClient {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}
-	// Start waits for dind to become healthy, so allow it a while.
-	return &GuardClient{c: &http.Client{Transport: tr, Timeout: 10 * time.Minute}}
+	return &GuardClient{c: &http.Client{Transport: tr}} // each call gets its own deadline, see do
 }
+
+const (
+	quickTimeout = 30 * time.Second // reads and keep-cache: the guard answers at once
+	slowTimeout  = 10 * time.Minute // Start waits for dind to become healthy; Stop wipes work dirs and prunes images
+)
 
 func (g *GuardClient) do(ctx context.Context, method, path string, body, out any, want int) error {
 	var rd io.Reader
@@ -43,6 +47,12 @@ func (g *GuardClient) do(ctx context.Context, method, path string, body, out any
 		}
 		rd = bytes.NewReader(b)
 	}
+	timeout := quickTimeout
+	if method == http.MethodPut || method == http.MethodDelete {
+		timeout = slowTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, "http://guard"+path, rd)
 	if err != nil {
 		return err

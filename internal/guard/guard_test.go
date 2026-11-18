@@ -27,20 +27,22 @@ import (
 
 // fakeDocker keeps containers in memory.
 type fakeDocker struct {
-	mu         sync.Mutex
-	containers map[string]*fakeContainer // by name
-	volumes    map[string]bool
-	networks   map[string]string
-	execs      [][]string
-	pulled     []string
-	dindHealth string
-	wipes      []ContainerSpec
-	wipeExit   int              // exit code of one-shot wipers
-	mem        map[string]int64 // by container name
-	memErr     error
-	memCalls   int
-	cpu        map[string]int64 // cumulative CPU ns by container name
-	statCalls  int
+	mu          sync.Mutex
+	containers  map[string]*fakeContainer // by name
+	volumes     map[string]bool
+	networks    map[string]string
+	execs       [][]string
+	pulled      []string
+	dindHealth  string
+	wipes       []ContainerSpec
+	wipeExit    int              // exit code of one-shot wipers
+	mem         map[string]int64 // by container name
+	memErr      error
+	memCalls    int
+	cpu         map[string]int64 // cumulative CPU ns by container name
+	statCalls   int
+	execGate    chan struct{} // if set, Exec blocks until it is closed (to hold a teardown mid-prune)
+	execEntered chan struct{} // if set, receives one value when Exec is reached
 }
 
 type fakeContainer struct {
@@ -149,6 +151,12 @@ func (f *fakeDocker) ContainerStats(_ context.Context, id string) (ContainerUsag
 	return ContainerUsage{MemBytes: f.mem[id], CPUNanos: f.cpu[id], PIDs: 3, NetRx: 10, NetTx: 20, BlkRead: 1, BlkWrite: 2}, nil
 }
 func (f *fakeDocker) Exec(_ context.Context, _ string, cmd []string) (int, error) {
+	if f.execEntered != nil {
+		f.execEntered <- struct{}{}
+	}
+	if f.execGate != nil {
+		<-f.execGate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.execs = append(f.execs, cmd)
@@ -1018,5 +1026,49 @@ func TestListWithStatsSumsContainersAndComputesCPU(t *testing.T) {
 	second, _ := g.ListWithStats(context.Background())
 	if c := second[0].Stats.CPUPercent; c <= 5 || c > 60 {
 		t.Errorf("cpu%% = %v", c)
+	}
+}
+
+func TestSlowStopDoesNotBlockOtherSlots(t *testing.T) {
+	g, f := newGuard(t)
+	ctx := context.Background()
+	org := "https://github.com/example-org"
+	for _, n := range []int{1, 2} {
+		name := fmt.Sprintf("ci-%d-abcd12", n)
+		if err := g.Start(ctx, n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, org)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.execGate, f.execEntered = make(chan struct{}), make(chan struct{}, 1)
+	stopped := make(chan error, 1)
+	go func() { stopped <- g.Stop(ctx, 1) }()
+	<-f.execEntered // slot 1's teardown is now stuck in its prune
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		slots, err := g.List(ctx)
+		if err != nil || len(slots) != 2 || !slots[0].Starting || slots[1].Starting {
+			t.Errorf("List during stop: %+v, %v", slots, err)
+		}
+		name := "ci-3-abcd12"
+		if err := g.Start(ctx, 3, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, org)}); err != nil {
+			t.Errorf("Start of another slot during stop: %v", err)
+		}
+		if err := g.Stop(ctx, 1); !errors.Is(err, ErrConflict) {
+			t.Errorf("second Stop of a stopping slot: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("List/Start/Stop blocked behind a slow teardown")
+	}
+	close(f.execGate)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	if slots, _ := g.List(ctx); len(slots) != 2 || slots[0].Slot != 2 {
+		t.Errorf("after stop: %+v", slots)
 	}
 }

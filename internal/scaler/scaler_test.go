@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/actions/scaleset"
 
@@ -15,13 +17,17 @@ import (
 )
 
 type fakeGuard struct {
+	mu      sync.Mutex // the retry timer calls in from another goroutine
 	slots   map[int]api.Slot
 	failing bool
+	onStart func()   // runs before Start takes its lock; lets a test hold starts open
 	kept    []string // runners whose caches were vouched for
 }
 
 func (g *fakeGuard) Info(context.Context) (api.Info, error) { return api.Info{}, nil }
 func (g *fakeGuard) Slots(context.Context) ([]api.Slot, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	var out []api.Slot
 	for _, s := range g.slots {
 		out = append(out, s)
@@ -30,6 +36,11 @@ func (g *fakeGuard) Slots(context.Context) ([]api.Slot, error) {
 	return out, nil
 }
 func (g *fakeGuard) Start(_ context.Context, n int, r api.StartRequest) error {
+	if g.onStart != nil {
+		g.onStart()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.failing {
 		return errors.New("boom")
 	}
@@ -40,9 +51,15 @@ func (g *fakeGuard) KeepCache(_ context.Context, _ int, runner string) error {
 	g.kept = append(g.kept, runner)
 	return nil
 }
-func (g *fakeGuard) Stop(_ context.Context, n int) error { delete(g.slots, n); return nil }
+func (g *fakeGuard) Stop(_ context.Context, n int) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.slots, n)
+	return nil
+}
 
 type fakeGitHub struct {
+	mu       sync.Mutex // starts run in parallel
 	nextID   int
 	removed  []int64
 	busyIDs  map[int64]bool
@@ -51,11 +68,15 @@ type fakeGitHub struct {
 }
 
 func (f *fakeGitHub) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.nextID++
 	f.byName[s.Name] = f.nextID
 	return &scaleset.RunnerScaleSetJitRunnerConfig{Runner: &scaleset.RunnerReference{ID: f.nextID, Name: s.Name}, EncodedJITConfig: "jit"}, nil
 }
 func (f *fakeGitHub) GetRunnerByName(_ context.Context, n string) (*scaleset.RunnerReference, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	id, ok := f.byName[n]
 	if !ok {
 		return nil, nil
@@ -63,6 +84,8 @@ func (f *fakeGitHub) GetRunnerByName(_ context.Context, n string) (*scaleset.Run
 	return &scaleset.RunnerReference{ID: id, Name: n}, nil
 }
 func (f *fakeGitHub) RemoveRunner(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.busyIDs[id] {
 		return errors.New("runner is busy")
 	}
@@ -70,6 +93,8 @@ func (f *fakeGitHub) RemoveRunner(_ context.Context, id int64) error {
 	return nil
 }
 func (f *fakeGitHub) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.acquired = append(f.acquired, ids...)
 	return ids, nil
 }
@@ -136,10 +161,22 @@ func TestJobCompletedFreesSlotAndRefills(t *testing.T) {
 	name := g.slots[1].RunnerName
 	msg := stats(1) // another job is queued behind it
 	msg.JobCompletedMessages = []*scaleset.JobCompleted{{RunnerName: name}}
-	s.Scale(ctx, msg)
-	if len(g.slots) != 1 || g.slots[1].RunnerName == name {
-		t.Fatalf("want a fresh runner in slot 1, got %v", g.slots)
+	s.Scale(ctx, msg) // the stop runs in the background and triggers the refill when it is done
+	waitFor(t, func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return len(g.slots) == 1 && g.slots[1].RunnerName != name
+	})
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if cond() {
+			return
+		}
 	}
+	t.Fatal("condition not reached")
 }
 
 func TestFailedStartRemovesRegistration(t *testing.T) {
@@ -210,5 +247,55 @@ func TestIdleRunnerKeepsCachesWhenRemoved(t *testing.T) {
 	}
 	if len(g.slots) != 1 || len(g.kept) != 1 {
 		t.Fatalf("slots=%v kept=%v: want one idle runner removed with its caches kept", g.slots, g.kept)
+	}
+}
+
+func TestFailedStartRetriesWithoutNewMessage(t *testing.T) {
+	s, g, _ := newScaler(2)
+	s.RetryDelay = 10 * time.Millisecond
+	g.failing = true
+	if err := s.Scale(context.Background(), stats(1)); err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	g.failing = false // the guard recovers; no further message arrives
+	g.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		g.mu.Lock()
+		n := len(g.slots)
+		g.mu.Unlock()
+		if n == 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("start was not retried")
+}
+
+func TestSlotsStartInParallel(t *testing.T) {
+	s, g, _ := newScaler(3)
+	var arrived sync.WaitGroup
+	arrived.Add(3)
+	g.onStart = func() { // returns only once all three starts are in flight at the same time
+		arrived.Done()
+		done := make(chan struct{})
+		go func() { arrived.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	begin := time.Now()
+	if err := s.Scale(context.Background(), stats(3)); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(begin) >= 2*time.Second {
+		t.Error("starts ran one after another")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.slots) != 3 {
+		t.Fatalf("want 3 slots, got %v", g.slots)
 	}
 }

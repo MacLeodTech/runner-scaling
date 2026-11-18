@@ -180,7 +180,22 @@ func (d *SocketDocker) ImagePull(ctx context.Context, ref string) error {
 }
 
 func (d *SocketDocker) NetworkEnsure(ctx context.Context, name, subnet string, labels map[string]string) error {
-	if _, err := d.do(ctx, http.MethodGet, "/networks/"+name, nil, nil, nil); err == nil {
+	var existing struct {
+		IPAM struct {
+			Config []struct{ Subnet string }
+		}
+	}
+	if _, err := d.do(ctx, http.MethodGet, "/networks/"+name, nil, nil, &existing); err == nil {
+		// A network with the right name but another subnet would sit outside
+		// the firewall fence, so refuse it rather than reuse it.
+		if subnet != "" {
+			for _, c := range existing.IPAM.Config {
+				if c.Subnet == subnet {
+					return nil
+				}
+			}
+			return fmt.Errorf("network %q exists but is not on subnet %s; remove it so it can be recreated", name, subnet)
+		}
 		return nil
 	} else if !errors.Is(err, ErrNotFound) {
 		return err

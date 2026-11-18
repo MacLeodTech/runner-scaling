@@ -45,10 +45,10 @@ type Guard struct {
 	d   Docker
 	log *slog.Logger
 
-	admitMu    sync.Mutex // held across the memory-budget check and marking a slot as starting
-	afterAdmit func()     // test seam: runs after the budget check passes, before the slot is claimed; nil in production
-	mu         sync.Mutex
-	starting   map[int]bool
+	admitMu    sync.Mutex     // held across the memory-budget check and marking a slot as starting
+	afterAdmit func()         // test seam: runs after the budget check passes, before the slot is claimed; nil in production
+	mu         sync.Mutex     // guards starting only; never held across Docker calls that can take long
+	starting   map[int]bool   // slots in transition: being started or being torn down (List shows both as Starting)
 	keepMu     sync.Mutex     // guards keepCache and cacheDirty
 	keepCache  map[int]string // slot -> runner whose caches the scaler vouched for; consumed at teardown
 	cacheDirty map[int]bool   // slots whose caches could not be emptied
@@ -242,7 +242,7 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 	if err := g.reserveSlot(ctx, slot); err != nil {
 		return err
 	}
-	defer func() { g.mu.Lock(); delete(g.starting, slot); g.mu.Unlock() }()
+	defer g.release(slot)
 
 	ctx, cancel := context.WithTimeout(ctx, g.cfg.StartTimeout.Duration)
 	defer cancel()
@@ -527,12 +527,29 @@ func (g *Guard) Stop(ctx context.Context, slot int) error {
 	if slot < 1 || slot > g.cfg.MaxSlots {
 		return fmt.Errorf("%w: slot %d outside 1..%d", ErrBadRequest, slot, g.cfg.MaxSlots)
 	}
+	if !g.claim(slot) {
+		return fmt.Errorf("%w: slot %d is starting or stopping", ErrConflict, slot)
+	}
+	defer g.release(slot)
+	return g.teardown(ctx, slot, true, !g.takeKeep(slot))
+}
+
+// claim marks a slot as in transition so nothing else starts, stops or reaps it, and reports whether it was free.
+// The slow work (wipes, prunes) then runs without g.mu, so it can't stall Start and List for the other slots.
+func (g *Guard) claim(slot int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.starting[slot] {
-		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
+		return false
 	}
-	return g.teardown(ctx, slot, true, !g.takeKeep(slot))
+	g.starting[slot] = true
+	return true
+}
+
+func (g *Guard) release(slot int) {
+	g.mu.Lock()
+	delete(g.starting, slot)
+	g.mu.Unlock()
 }
 
 // KeepCache records that the runner on slot is running a trusted job, so teardown leaves the slot's caches alone.
@@ -651,9 +668,11 @@ func (g *Guard) WipeStale(ctx context.Context) {
 		return
 	}
 	for slot := 1; slot <= g.cfg.MaxSlots; slot++ {
-		g.mu.Lock()
+		if !g.claim(slot) {
+			continue
+		}
 		busy, err := g.slotHasContainers(ctx, slot)
-		if err == nil && !busy && !g.starting[slot] {
+		if err == nil && !busy {
 			if g.cfg.WorkBind != "" {
 				wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 				var code int
@@ -672,7 +691,7 @@ func (g *Guard) WipeStale(ctx context.Context) {
 				g.log.Info("wiped caches at startup", "slot", slot)
 			}
 		}
-		g.mu.Unlock()
+		g.release(slot)
 		if err != nil {
 			g.log.Warn("startup wipe failed", "slot", slot, "err", err)
 		}
@@ -722,15 +741,14 @@ func (g *Guard) Reap(ctx context.Context) {
 			}
 			reason = "max_runtime"
 		}
-		g.mu.Lock()
-		if !g.starting[s.Slot] {
+		if g.claim(s.Slot) {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
 			reaped[s.Slot] = true
 			if err := g.teardown(ctx, s.Slot, true, !g.takeKeep(s.Slot)); err != nil {
 				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
 			}
+			g.release(s.Slot)
 		}
-		g.mu.Unlock()
 	}
 	g.memoryBackstop(ctx, slots, starts, reaped)
 }
@@ -859,15 +877,14 @@ func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map
 			victim = s
 		}
 	}
-	g.mu.Lock()
-	if !g.starting[victim.Slot] {
+	if g.claim(victim.Slot) {
 		g.log.Info("reaping slot", "slot", victim.Slot, "runner", victim.RunnerName, "runner_state", victim.RunnerState,
 			"reason", "memory_budget", "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
 		if err := g.teardown(ctx, victim.Slot, true, true); err != nil {
 			g.log.Error("reap: teardown", "slot", victim.Slot, "err", err)
 		}
+		g.release(victim.Slot)
 	}
-	g.mu.Unlock()
 }
 
 // fmtBytes renders sizes like 6.1G, 512M.
