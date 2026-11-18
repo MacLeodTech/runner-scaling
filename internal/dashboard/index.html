@@ -16,17 +16,30 @@ section h2{font-size:13px;margin:0;padding:10px 14px;border-bottom:1px solid var
 .t{font-weight:600}.m{color:var(--mut);font-size:12px}.r{text-align:right;color:var(--mut);font-size:12px;white-space:nowrap}
 .i{width:12px;height:12px;border-radius:50%;margin:auto}.success,.succeeded{background:var(--ok)}.failure,.failed{background:var(--bad)}.running{background:var(--run);animation:p 1.4s infinite}.queued{background:var(--q)}.idle,.cancelled,.canceled,.skipped,.abandoned{background:var(--idle)}.starting{background:var(--q);animation:p 1.4s infinite}
 @keyframes p{50%{opacity:.35}}.empty{padding:16px 14px;color:var(--mut)}.err{background:var(--bad);color:#fff;padding:8px 24px;display:none}
+input,select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+button{cursor:pointer;background:var(--card)}button.pri{background:var(--q);border-color:var(--q);color:#fff}button.dng{color:var(--bad)}button:disabled{opacity:.5}
+.card{max-width:380px;margin:12vh auto 0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:22px}
+.card h2{margin:0 0 6px;font-size:18px;text-transform:none;letter-spacing:0;color:var(--fg);padding:0;border:0}.card p{color:var(--mut);margin:0 0 14px}
+.card label{display:block;margin:10px 0 4px;color:var(--mut);font-size:12px}.card input{width:100%}.card button{margin-top:16px;width:100%}
+.msg{margin-top:12px;color:var(--bad);min-height:1.2em}.good{color:var(--ok)}
+.bar{margin-left:auto;display:flex;gap:8px;align-items:center}.bar #dot{margin:0 8px 0 0}header .bar button{padding:3px 10px;font-size:12px}
+.urow{display:grid;grid-template-columns:1fr 80px auto;gap:10px;padding:10px 14px;border-top:1px solid var(--line);align-items:center}
+.add{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--line);flex-wrap:wrap}.add input{flex:1;min-width:140px}
+.secret{margin:12px 14px;padding:12px;border:1px dashed var(--run);border-radius:6px}.secret code{font-size:16px;user-select:all}.hide{display:none}
 code{font:12px ui-monospace,monospace;background:var(--bg);padding:1px 5px;border-radius:4px}
 </style></head><body>
 <div class="err" id="err"></div>
-<header><h1 id="title">Runners</h1><span id="sub"></span><span id="dot"></span></header>
+<div id="auth" class="hide"></div>
+<div id="app" class="hide">
+<header><h1 id="title">Runners</h1><span id="sub"></span><div class="bar"><span id="dot"></span><span id="who"></span><button id="bUsers" class="hide" onclick="showUsers()">Users</button><button id="bPw" class="hide" onclick="showChange(false)">Password</button><button id="bOut" class="hide" onclick="logout()">Log out</button></div></header>
 <main>
+<section id="users" class="hide"><h2>Users</h2><div id="ulist"></div><div class="add"><input id="nu" placeholder="new username" autocomplete="off" maxlength="32"><select id="nr"><option value="user">user</option><option value="admin">admin</option></select><button class="pri" onclick="addUser()">Add user</button></div><div id="secret"></div><div class="msg" id="umsg" style="padding:0 14px 10px"></div></section>
 <div class="tiles" id="tiles"></div>
 <section><h2>Runners</h2><div id="slots"></div></section>
 <section><h2>Running</h2><div id="running"></div></section>
 <section><h2>Queued</h2><div id="queued"></div></section>
 <section><h2>Recent jobs</h2><div id="recent"></div></section>
-</main>
+</main></div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -54,7 +67,7 @@ function merge(r){
 }
 async function tick(){
  try{
-  const r=await fetch('api/state'+location.search,{cache:'no-store'});if(!r.ok)throw new Error(r.status);
+  const r=await fetch('api/state'+location.search,{cache:'no-store'});if(r.status===401){boot();return}if(!r.ok)throw new Error(r.status);
   const raw=await r.json();const s=merge(raw);off=Date.parse(s.now)-Date.now();
   $('err').style.display=s.guard_error?'block':'none';$('err').textContent=s.guard_error||'';
   $('title').textContent=s.name||'Runners';$('sub').textContent='v'+s.version;
@@ -71,5 +84,41 @@ async function tick(){
   $('dot').textContent='● live';$('dot').style.color='var(--ok)';
  }catch(e){$('dot').textContent='● offline';$('dot').style.color='var(--bad)'}
 }
-tick();setInterval(tick,3000);
+
+async function api(path,body){const r=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});
+ let j={};try{j=await r.json()}catch(e){}return {ok:r.ok,status:r.status,j}}
+let timer=null,me=null;
+function show(app){$('app').classList.toggle('hide',!app);$('auth').classList.toggle('hide',app)}
+function card(h,p,fields,btn,fn){
+ $('auth').innerHTML=`<div class="card"><h2>${h}</h2><p>${p}</p>${fields.map(([id,l,t,ac])=>`<label for="${id}">${l}</label><input id="${id}" type="${t}" autocomplete="${ac}">`).join('')}<button class="pri" id="go">${btn}</button><div class="msg" id="amsg"></div></div>`;
+ const run=async()=>{$('go').disabled=true;$('amsg').textContent='';try{await fn()}finally{$('go').disabled=false}};
+ $('go').onclick=run;$('auth').querySelectorAll('input').forEach(i=>i.onkeydown=e=>{if(e.key==='Enter')run()});show(false);($('auth').querySelector('input')||{}).focus?.()}
+function showLogin(){clearInterval(timer);me=null;card('Runners','Log in to see the runners.',[['u','Username','text','username'],['p','Password','password','current-password']],'Log in',async()=>{
+ const r=await api('api/login',{username:$('u').value,password:$('p').value});if(!r.ok){$('amsg').textContent=r.j.error||'login failed';$('p').value='';return}boot()})}
+function showChange(forced){clearInterval(timer);card('Change password',forced?'You are using a temporary password. Choose your own to continue.':'Choose a new password.',[['o','Current password','password','current-password'],['n','New password (8+ characters)','password','new-password'],['n2','New password again','password','new-password']],'Change password',async()=>{
+ if($('n').value!==$('n2').value){$('amsg').textContent='The new passwords do not match';return}
+ const r=await api('api/password',{old:$('o').value,new:$('n').value});if(!r.ok){$('amsg').textContent=r.j.error||'failed';return}boot()})}
+async function logout(){await api('api/logout',{});showLogin()}
+function startDash(){show(true);if(me){$('who').textContent=me.name+(me.role==='admin'?' (admin)':'');['bPw','bOut'].forEach(i=>$(i).classList.remove('hide'));$('bUsers').classList.toggle('hide',me.role!=='admin')}
+ $('users').classList.add('hide');tick();clearInterval(timer);timer=setInterval(tick,3000)}
+async function showUsers(){const sec=$('users');if(!sec.classList.toggle('hide')){await loadUsers()}}
+async function loadUsers(){const r=await api('api/users');if(!r.ok){$('umsg').textContent=r.j.error||'failed';return}
+ $('ulist').innerHTML=r.j.map(u=>`<div class="urow"><div><span class="t">${esc(u.name)}</span> <span class="m">${u.must_change?'· must change password':''}${u.last_login&&u.last_login>'1971'?' · last login '+ago(u.last_login):' · never logged in'}</span></div><div class="m">${esc(u.role)}</div><div><button data-r="${esc(u.name)}">Reset password</button> ${u.name===me.name?'':`<button class="dng" data-d="${esc(u.name)}">Delete</button>`}</div></div>`).join('');
+ $('ulist').querySelectorAll('button[data-r]').forEach(b=>b.onclick=()=>userAct(b.dataset.r,'reset'));
+ $('ulist').querySelectorAll('button[data-d]').forEach(b=>b.onclick=()=>{if(confirm('Delete '+b.dataset.d+'?'))userAct(b.dataset.d,'delete')})}
+function secret(name,pw){$('secret').innerHTML=`<div class="secret">Temporary password for <b>${esc(name)}</b> (shown once; they must change it at first login):<br><code>${esc(pw)}</code> <button onclick="navigator.clipboard.writeText('${esc(pw)}');this.textContent='Copied'">Copy</button></div>`}
+async function userAct(name,act){$('umsg').textContent='';$('secret').innerHTML='';const r=await api('api/users/'+encodeURIComponent(name)+'/'+act,{});
+ if(!r.ok){$('umsg').textContent=r.j.error||'failed';return}if(r.j.password)secret(name,r.j.password);loadUsers()}
+async function addUser(){$('umsg').textContent='';$('secret').innerHTML='';const r=await api('api/users',{username:$('nu').value,role:$('nr').value});
+ if(!r.ok){$('umsg').textContent=r.j.error||'failed';return}$('nu').value='';secret(r.j.username,r.j.password);loadUsers()}
+async function boot(){
+ const r=await api('api/me');
+ if(r.status===404||!r.ok&&r.status!==401){me=null;startDash();return} // accounts are off: the page works as before
+ me=r.j.authenticated?r.j:null;
+ if(me&&me.must_change)return showChange(true);
+ if(me)return startDash();
+ const s=await fetch('api/state'+location.search,{cache:'no-store'}); // a ?token= link still works
+ if(s.ok){startDash();return}
+ showLogin()}
+boot();
 </script></body></html>
