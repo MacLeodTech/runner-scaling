@@ -55,6 +55,7 @@ type Guard struct {
 	cpuMu      sync.Mutex
 	cpuPrev    map[string]cpuSample // container id -> last CPU reading, for the dashboard's CPU %
 	overMem    int                  // consecutive reap ticks over memory_budget; only touched by Reap
+	gateDown   bool                 // require_file was missing at the last reap tick; only touched by Reap
 	nameRE     *regexp.Regexp
 	count      counters
 }
@@ -786,6 +787,7 @@ func (g *Guard) Reap(ctx context.Context) {
 			starts = nil
 		}
 	}
+	g.watchGate(slots)
 	reaped := map[int]bool{}
 	for _, s := range slots {
 		if s.Starting {
@@ -810,6 +812,30 @@ func (g *Guard) Reap(ctx context.Context) {
 		}
 	}
 	g.memoryBackstop(ctx, slots, starts, reaped)
+}
+
+// watchGate notices when require_file disappears while slots are running. The gate only stops new slots from
+// starting; a runner that is already up keeps running, and may be unfenced if the rules that the file vouches for
+// were flushed. The guard cannot repair that (it has no network and no firewall), so it makes it loud: one ERROR
+// line and one count per outage, and an INFO line when the file is back. Never touches a running job.
+func (g *Guard) watchGate(slots []api.Slot) {
+	if g.cfg.RequireFile == "" {
+		return
+	}
+	if _, err := os.Stat(g.cfg.RequireFile); err == nil {
+		if g.gateDown {
+			g.gateDown = false
+			g.log.Info("gate restored", "file", g.cfg.RequireFile)
+		}
+		return
+	}
+	if g.gateDown {
+		return
+	}
+	g.gateDown = true
+	g.count.add(CounterGateWithdrawn)
+	g.log.Error("GATE WITHDRAWN: require_file is gone, new slots are refused and running slots may be unfenced",
+		"file", g.cfg.RequireFile, "running_slots", len(slots))
 }
 
 // ReapLoop runs Reap until ctx ends.

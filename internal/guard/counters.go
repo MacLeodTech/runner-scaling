@@ -13,6 +13,7 @@ const (
 	CounterAdmissionRefused = "admission_refused_total" // starts held back by the memory budget
 	CounterStarts           = "starts_total"            // slots started
 	CounterStartFailures    = "start_failures_total"    // starts that failed after being admitted
+	CounterGateWithdrawn    = "gate_withdrawn_total"    // times require_file vanished (firewall rules lost): running slots may be unfenced. Alert on any.
 	CounterReapedPrefix     = "reaped_"                 // + reason + "_total": runner_exited, max_runtime, memory_budget
 )
 
@@ -41,7 +42,7 @@ func (c *counters) snapshot() map[string]int64 {
 // sees them from the start and rate() works from the first event.
 func (g *Guard) Counters() map[string]int64 {
 	out := map[string]int64{
-		CounterDenied: 0, CounterNotReady: 0, CounterConflicts: 0, CounterAdmissionRefused: 0, CounterStarts: 0, CounterStartFailures: 0,
+		CounterDenied: 0, CounterNotReady: 0, CounterConflicts: 0, CounterAdmissionRefused: 0, CounterStarts: 0, CounterStartFailures: 0, CounterGateWithdrawn: 0,
 		CounterReapedPrefix + "runner_exited_total": 0, CounterReapedPrefix + "max_runtime_total": 0,
 		CounterReapedPrefix + "memory_budget_total": 0,
 	}

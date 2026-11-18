@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 - Docs: the ghcr image is in private preview for now; the README and example compose say how to build it locally.
 
+### Added
+
+- **Gate watch.** The guard now notices when `require_file` vanishes while slots are running (the firewall lost its
+  rules): one `GATE WITHDRAWN` error line and a `gate_withdrawn_total` count per outage. Running jobs are left alone.
+- **Runner image check.** `scripts/check-runner-image.sh guard.yaml [...]` compares the runner version inside each
+  pinned runner image with the newest `actions/runner` release. Runners never update themselves
+  (`DisableUpdate`), so run it now and then.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

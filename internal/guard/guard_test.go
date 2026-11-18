@@ -451,6 +451,36 @@ func TestRequireFileGatesStarts(t *testing.T) {
 	}
 }
 
+func TestGateWithdrawnIsCountedOnceAndRunnersSurvive(t *testing.T) {
+	g, f := newGuard(t)
+	ctx := context.Background()
+	g.cfg.RequireFile = filepath.Join(t.TempDir(), "firewall-ok")
+	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
+	if err := g.Start(ctx, 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}); err != nil {
+		t.Fatal(err)
+	}
+	g.Reap(ctx)
+	if n := g.Counters()[CounterGateWithdrawn]; n != 0 {
+		t.Fatalf("counted with the gate in place: %d", n)
+	}
+	os.Remove(g.cfg.RequireFile)
+	g.Reap(ctx)
+	g.Reap(ctx)
+	if n := g.Counters()[CounterGateWithdrawn]; n != 1 {
+		t.Fatalf("one outage should count once, got %d", n)
+	}
+	if f.containers["ci-runner-1"] == nil {
+		t.Fatal("a running job was killed because the gate went away")
+	}
+	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
+	g.Reap(ctx)
+	os.Remove(g.cfg.RequireFile)
+	g.Reap(ctx)
+	if n := g.Counters()[CounterGateWithdrawn]; n != 2 {
+		t.Fatalf("second outage should count: %d", n)
+	}
+}
+
 func TestConfigExpandsBracedEnvOnly(t *testing.T) {
 	t.Setenv("RS_TEST_DIR", "/big")
 	cfg := strings.Replace(testConfig, `"/srv/runners/{slot}/cache:/cache"`, `"${RS_TEST_DIR}/{slot}/cache:/cache"`, 1)
