@@ -14,15 +14,15 @@ Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's
 
 ```mermaid
 flowchart LR
-    GH[("GitHub<br/>Actions service")]
+    GH[("GitHub<br/>Actions service")]:::ext
     subgraph host["Docker host"]
         direction LR
-        S["<b>scaler</b><br/>holds the GitHub credential<br/>no Docker access"]
-        G["<b>guard</b><br/>holds the Docker socket<br/>no network, no GitHub credential"]
-        D[("docker.sock")]
+        S["<b>scaler</b><br/>holds the GitHub credential<br/>no Docker access"]:::net
+        G["<b>guard</b><br/>holds the Docker socket<br/>no network, no GitHub credential"]:::priv
+        D[("docker.sock")]:::priv
         subgraph slot["slot N (network &lt;prefix&gt;-slot-N)"]
-            R["&lt;prefix&gt;-runner-N"]
-            DIND["&lt;prefix&gt;-dind-N<br/>(optional)"]
+            R["&lt;prefix&gt;-runner-N"]:::job
+            DIND["&lt;prefix&gt;-dind-N<br/>(optional)"]:::job
         end
     end
     S -- "long poll, outbound only" --> GH
@@ -31,6 +31,13 @@ flowchart LR
     G -. "builds every container<br/>from guard.yaml" .-> slot
     R -- "register with JIT config" --> GH
     R --- DIND
+
+    classDef ext fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef net fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
+    classDef priv fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
+    classDef job fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    style host fill:#f8fafc22,stroke:#64748b,stroke-dasharray:4 3
+    style slot fill:#16a34a22,stroke:#16a34a,stroke-dasharray:4 3
 ```
 
 The software has two parts, both in one small image (`runner-scaling guard` / `runner-scaling scaler`):
@@ -61,21 +68,33 @@ sequenceDiagram
     participant S as scaler
     participant G as guard
     participant C as slot containers
+    rect rgba(37, 99, 235, 0.15)
+    Note over GH,S: scale up
     GH-->>S: job queued (long poll)
     S->>GH: request single-use JIT config
     GH-->>S: JIT config
+    end
+    rect rgba(217, 119, 6, 0.15)
+    Note over S,C: start a slot
     S->>G: PUT /v1/slots/N (runner name, JIT config)
     G->>G: validate JIT config, check memory budget
     G->>C: start dind (if configured), then runner
+    end
+    rect rgba(22, 163, 74, 0.15)
+    Note over GH,C: run the job
     C->>GH: runner registers and takes the job
     GH-->>S: JobStarted (event, workflow ref)
     opt trusted job: push, schedule, dispatch or release on a trusted ref
         S->>G: POST /v1/slots/N/keep-cache
     end
+    end
+    rect rgba(220, 38, 38, 0.15)
+    Note over GH,C: tear down
     GH-->>S: JobCompleted
     S->>G: DELETE /v1/slots/N
     G->>C: remove containers and work volume
     G->>C: wipe cache_dirs (unless vouched for)
+    end
 ```
 
 ## Threat model
@@ -209,17 +228,23 @@ and before reusing a slot whose wipe failed, unless the scaler vouched for the j
 
 ```mermaid
 flowchart TD
-    A["Job started on slot N"] --> B{"event is push, schedule,<br/>workflow_dispatch or release?"}
+    A["Job started on slot N"]:::start --> B{"event is push, schedule,<br/>workflow_dispatch or release?"}:::q
     B -- no --> W
-    B -- yes --> C{"workflow ref in<br/>CACHE_TRUSTED_REFS?"}
+    B -- yes --> C{"workflow ref in<br/>CACHE_TRUSTED_REFS?"}:::q
     C -- no --> W
-    C -- yes --> V["scaler calls keep-cache"]
-    V --> K["slot torn down: caches kept"]
-    W["slot torn down: caches wiped"]
-    M["scaler down or missed the job start"] --> W
-    W --> F{"wipe succeeded?"}
-    F -- yes --> R["slot can be reused"]
-    F -- no --> X["slot blocked until a wipe succeeds"]
+    C -- yes --> V["scaler calls keep-cache"]:::good
+    V --> K["slot torn down:<br/>caches kept"]:::good
+    W["slot torn down:<br/>caches wiped"]:::wipe
+    M["scaler down or<br/>missed the job start"]:::bad --> W
+    W --> F{"wipe succeeded?"}:::q
+    F -- yes --> R["slot can be reused"]:::good
+    F -- no --> X["slot blocked until<br/>a wipe succeeds"]:::bad
+
+    classDef start fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    classDef q fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
+    classDef good fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    classDef wipe fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+    classDef bad fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
 ```
 
 `CACHE_TRUSTED_REFS` is comma-separated and defaults to `refs/heads/main`; `none` wipes after every job. A missing
