@@ -186,6 +186,8 @@ names. The guard decodes it and requires that:
 | `--max-runners` | `MAX_RUNNERS` | guard `max_slots` | can't exceed `max_slots` |
 | `--delete-scale-set` | | | delete the scale set and exit |
 | `--socket` | `GUARD_SOCKET` | `/run/runner-scaling/guard.sock` | guard API socket |
+| | `DASHBOARD_ADDR` | off | e.g. `127.0.0.1:8080`: serve the [dashboard](#dashboard) |
+| | `DASHBOARD_TOKEN[_FILE]` | none | if set, the dashboard requires it (bearer, `?token=`, or basic-auth password) |
 | | `CACHE_TRUSTED_REFS` | `refs/heads/main` | refs whose push/schedule/dispatch/release jobs keep their caches; `none` wipes always |
 | | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
@@ -216,6 +218,19 @@ names. The guard decodes it and requires that:
   the first container exists; the backstop covers that. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
+
+### Dashboard
+
+Set `DASHBOARD_ADDR` and the scaler serves a read-only status page, a bit like the Actions tab: the runner slots and
+their state, running jobs with elapsed time, queued jobs with wait time, and the last 100 finished jobs (repo,
+workflow, event, branch, result, duration). It refreshes every few seconds from `/api/state` (JSON).
+
+- It is read-only (GET only) and has no controls. History lives in memory, so a scaler restart empties it.
+- Job names and repos can be sensitive for private repos. Bind it to loopback or a private network, and put a reverse
+  proxy with TLS in front if it leaves the host. `DASHBOARD_TOKEN` adds a shared-secret check but sends it in clear
+  without TLS.
+- In a container, listen on `0.0.0.0:8080` and publish the port on loopback only (`ports: ["127.0.0.1:8080:8080"]`).
+  `/healthz` is always open.
 
 ### Caches
 

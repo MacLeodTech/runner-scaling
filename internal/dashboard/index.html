@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Runners</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--mut:#656d76;--line:#d0d7de;--ok:#1a7f37;--bad:#cf222e;--run:#9a6700;--q:#0969da;--idle:#8c959f}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#8b949e;--line:#30363d;--ok:#3fb950;--bad:#f85149;--run:#d29922;--q:#58a6ff;--idle:#6e7681}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:baseline;padding:16px 24px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:18px;margin:0}header span{color:var(--mut)}#dot{margin-left:auto;font-size:12px}
+main{max-width:1100px;margin:0 auto;padding:20px 24px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:20px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px}.tile b{display:block;font-size:24px}.tile small{color:var(--mut)}
+section{background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:20px;overflow:hidden}
+section h2{font-size:13px;margin:0;padding:10px 14px;border-bottom:1px solid var(--line);color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.row{display:grid;grid-template-columns:22px 1fr auto;gap:10px;padding:10px 14px;border-top:1px solid var(--line);align-items:center}.row:first-of-type{border-top:0}
+.t{font-weight:600}.m{color:var(--mut);font-size:12px}.r{text-align:right;color:var(--mut);font-size:12px;white-space:nowrap}
+.i{width:12px;height:12px;border-radius:50%;margin:auto}.success,.succeeded{background:var(--ok)}.failure,.failed{background:var(--bad)}.running{background:var(--run);animation:p 1.4s infinite}.queued{background:var(--q)}.idle,.cancelled,.canceled,.skipped,.abandoned{background:var(--idle)}.starting{background:var(--q);animation:p 1.4s infinite}
+@keyframes p{50%{opacity:.35}}.empty{padding:16px 14px;color:var(--mut)}.err{background:var(--bad);color:#fff;padding:8px 24px;display:none}
+code{font:12px ui-monospace,monospace;background:var(--bg);padding:1px 5px;border-radius:4px}
+</style></head><body>
+<div class="err" id="err"></div>
+<header><h1 id="title">Runners</h1><span id="sub"></span><span id="dot"></span></header>
+<main>
+<div class="tiles" id="tiles"></div>
+<section><h2>Runners</h2><div id="slots"></div></section>
+<section><h2>Running</h2><div id="running"></div></section>
+<section><h2>Queued</h2><div id="queued"></div></section>
+<section><h2>Recent jobs</h2><div id="recent"></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let off=0;
+const dur=ms=>{ms=Math.max(0,Math.round(ms/1000));const m=Math.floor(ms/60),s=ms%60,h=Math.floor(m/60);return h?`${h}h ${m%60}m`:m?`${m}m ${s}s`:`${s}s`};
+const ago=t=>t&&t>'1971'?dur(Date.now()+off-Date.parse(t))+' ago':'';
+const job=(j,right)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${esc(j.name)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}</div></div><div class="r">${right}</div></div>`;
+const list=(id,items,f)=>$(id).innerHTML=items.length?items.map(f).join(''):'<div class="empty">Nothing here.</div>';
+async function tick(){
+ try{
+  const r=await fetch('api/state'+location.search,{cache:'no-store'});if(!r.ok)throw new Error(r.status);
+  const s=await r.json();off=Date.parse(s.now)-Date.now();
+  $('err').style.display=s.guard_error?'block':'none';$('err').textContent=s.guard_error||'';
+  $('title').textContent=s.name||'Runners';$('sub').textContent='v'+s.version;
+  const st=s.stats||{};
+  $('tiles').innerHTML=[['Running',s.running.length],['Queued',s.queued.length],['Runners',`${s.slots.length} / ${s.max_slots}`],['Idle runners',st.idle_runners??0],['Registered',st.registered_runners??0]].map(([k,v])=>`<div class="tile"><b>${v}</b><small>${k}</small></div>`).join('');
+  const busy=new Set(s.running.map(j=>j.runner));
+  list('slots',s.slots,x=>{const state=x.starting?'starting':busy.has(x.runner_name)?'running':x.runner_state==='running'?'idle':'failed';
+   return `<div class="row"><div class="i ${state}"></div><div><div class="t">Slot ${x.slot} <span class="m">${state}</span></div><div class="m">${esc(x.runner_name||'starting…')}${x.dind_state?' · dind '+esc(x.dind_state):''}</div></div><div class="r"></div></div>`});
+  list('running',s.running,j=>job(j,'running '+dur(Date.now()+off-Date.parse(j.started||j.queued))));
+  list('queued',s.queued,j=>job(j,'waiting '+dur(Date.now()+off-Date.parse(j.queued))));
+  list('recent',s.recent,j=>job(j,esc(j.state)+(j.started&&j.finished?' in '+dur(Date.parse(j.finished)-Date.parse(j.started)):'')+'<br>'+ago(j.finished)));
+  $('dot').textContent='● live';$('dot').style.color='var(--ok)';
+ }catch(e){$('dot').textContent='● offline';$('dot').style.color='var(--bad)'}
+}
+tick();setInterval(tick,3000);
+</script></body></html>
