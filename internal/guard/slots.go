@@ -707,6 +707,37 @@ func (g *Guard) wipeCaches(ctx context.Context, slot int) error {
 	return nil
 }
 
+// trimCaches enforces cache_max on a slot whose caches were kept: if the cache_dirs together hold more than the
+// limit, they are emptied (same one-shot container as wipeCaches), so growth is bounded without ever mixing
+// kept and discarded entries.
+func (g *Guard) trimCaches(ctx context.Context, slot int) error {
+	if g.cfg.cacheMax <= 0 || len(g.cfg.CacheDirs) == 0 {
+		return nil
+	}
+	var binds, targets []string
+	for i, d := range g.cfg.CacheDirs {
+		t := "/wipe/" + strconv.Itoa(i)
+		binds = append(binds, g.cfg.Expand(d, slot)+":"+t)
+		targets = append(targets, t)
+	}
+	script := `max="$1"; shift; used=$(du -sk "$@" | awk '{t+=$1} END{print t+0}'); [ "$used" -le "$max" ] && exit 0; for d in "$@"; do find "$d" -mindepth 1 -delete || exit 1; done`
+	cmd := append([]string{"sh", "-c", script, "trim", strconv.FormatInt(g.cfg.cacheMax/1024, 10)}, targets...)
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	code, err := g.wipeOneShot(wctx, slot, cmd, binds)
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	if err != nil {
+		// A half-done trim leaves a partly deleted cache: treat it like a failed wipe and start the slot clean.
+		g.keepMu.Lock()
+		g.cacheDirty[slot] = true
+		g.keepMu.Unlock()
+		return err
+	}
+	return nil
+}
+
 func (g *Guard) teardown(ctx context.Context, slot int, prune, wipeCaches bool) error {
 	runnerName, dindName, _, volName := g.names(slot)
 	var errs []error
@@ -748,6 +779,8 @@ func (g *Guard) teardown(ctx context.Context, slot int, prune, wipeCaches bool) 
 		if err := g.wipeCaches(ctx, slot); err != nil {
 			errs = append(errs, err)
 		}
+	} else if err := g.trimCaches(ctx, slot); err != nil {
+		g.log.Warn("cache trim failed", "slot", slot, "err", err) // the caches are intact (and trusted): not an error
 	}
 	if g.cfg.WorkBind == "" {
 		if err := g.d.VolumeRemove(ctx, volName); err != nil {

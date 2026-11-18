@@ -52,6 +52,10 @@ type Config struct {
 	// (POST /v1/slots/{n}/keep-cache). They are also emptied at startup and before a slot whose last wipe failed
 	// is reused.
 	CacheDirs []string `yaml:"cache_dirs"`
+	// CacheMax bounds the warm caches that survive a trusted job (e.g. 20G, all cache_dirs of one slot together).
+	// When a slot's caches are kept but have grown past it, the guard empties them instead, so the next trusted job
+	// starts cold and the caches grow back from zero. Empty means unbounded.
+	CacheMax string `yaml:"cache_max"`
 	// CgroupParent puts every container the guard creates under one cgroup, so one memory limit can cover all
 	// runners together (several guards may share it). With Docker's systemd cgroup driver this is a slice, e.g.
 	// runner-scaling.slice; set its limit on the host: systemctl set-property runner-scaling.slice MemoryMax=8G.
@@ -91,6 +95,7 @@ type Config struct {
 	ReapInterval Duration `yaml:"reap_interval"`
 
 	memBudget, memReserve int64 // parsed MemoryBudget and MemoryReserve
+	cacheMax              int64 // parsed CacheMax
 	memRamp               time.Duration
 	memRampShare          float64
 
@@ -257,6 +262,20 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("max_runtime must be 0 (disabled) or at least 1m"))
 	}
 	c.memBudget, c.memReserve, c.memRamp, c.memRampShare = 0, 0, 0, 0
+	c.cacheMax = 0
+	if c.CacheMax != "" {
+		n, err := ParseBytes(c.CacheMax)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("cache_max: %w", err))
+		case n < 1<<20:
+			errs = append(errs, errors.New("cache_max must be at least 1M"))
+		case len(c.CacheDirs) == 0:
+			errs = append(errs, errors.New("cache_max needs cache_dirs"))
+		default:
+			c.cacheMax = n
+		}
+	}
 	if c.MemoryBudget != "" {
 		b, err := ParseBytes(c.MemoryBudget)
 		if err != nil {

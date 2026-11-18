@@ -21,6 +21,7 @@ memory_reserve: 1G          # assumed minimum per slot (runner+dind) for admissi
 # cache_dirs:                 # optional: warm caches that are emptied when a slot is torn down, unless the scaler vouches
 #   - /srv/runner-scaling/{slot}/toolcache   # for the job (a push/schedule/dispatch/release on CACHE_TRUSTED_REFS,
 #   - /srv/runner-scaling/{slot}/docker      # default refs/heads/main). Also emptied at guard startup. List every cache bind.
+# cache_max: 20G              # optional: if a slot's kept caches together exceed this after a job, they are emptied
 work_dir: /home/runner/_work  # fresh Docker volume per runner, mounted here in the runner and in dind
 
 runner:

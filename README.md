@@ -473,6 +473,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `work_dir` | job workspace path inside the runner (and dind); not under `/tmp` with dind |
 | `work_bind` | host directory (`{slot}` required) to use as `work_dir` instead of a Docker volume |
 | `cache_dirs` | host directories (`{slot}` required) emptied after untrusted jobs |
+| `cache_max` | optional size cap (e.g. `20G`) for one slot's kept caches together; over it, they are emptied after the job |
 | `memory_budget`, `memory_reserve` | host-wide memory cap and per-slot admission estimate |
 | `memory_ramp`, `memory_ramp_share` | how long a new slot counts at a share of its memory limits (default `2m`, `0.5`; `0s` turns the ramp off) |
 | `cgroup_parent` | put all runner containers under one cgroup you can cap with systemd |

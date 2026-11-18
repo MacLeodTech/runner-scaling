@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+
+### Added
+- `cache_max` (guard config): caps the warm caches a slot keeps after trusted jobs. Over the cap, the guard empties
+  them after the job (a cold start for the next one), so cache growth is bounded.
+- The dashboard links each job to its workflow run on GitHub.
+
 ## [0.6.1] - 2026-11-18
 
 ### Security
