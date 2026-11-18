@@ -79,7 +79,7 @@ func newScaler(max int) (*Scaler, *fakeGuard, *fakeGitHub) {
 	gh := &fakeGitHub{busyIDs: map[int64]bool{}, byName: map[string]int{}}
 	return &Scaler{
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Guard: g, GitHub: gh, Session: gh,
-		Info: api.Info{Prefix: "homelab", MaxSlots: max, WorkDir: "/tmp/runner"}, Max: max,
+		Info: api.Info{Prefix: "ci", MaxSlots: max, WorkDir: "/tmp/runner"}, Max: max,
 	}, g, gh
 }
 
@@ -98,7 +98,7 @@ func TestScalesUpToMaxAndNames(t *testing.T) {
 		t.Fatalf("want 3 slots, got %v", g.slots)
 	}
 	for n, sl := range g.slots {
-		if !strings.HasPrefix(sl.RunnerName, "homelab-"+string(rune('0'+n))+"-") {
+		if !strings.HasPrefix(sl.RunnerName, "ci-"+string(rune('0'+n))+"-") {
 			t.Errorf("slot %d runner %q", n, sl.RunnerName)
 		}
 	}
@@ -188,7 +188,7 @@ func TestTrustedJobsKeepCaches(t *testing.T) {
 			}
 			name := g.slots[1].RunnerName
 			started := &scaleset.JobStarted{RunnerName: name, JobMessageBase: scaleset.JobMessageBase{
-				EventName: c.event, JobWorkflowRef: "MacLeodTech/example-repo/.github/workflows/rust.yml@" + c.ref,
+				EventName: c.event, JobWorkflowRef: "example-org/app/.github/workflows/rust.yml@" + c.ref,
 			}}
 			if err := s.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{started}}); err != nil {
 				t.Fatal(err)

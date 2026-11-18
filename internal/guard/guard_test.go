@@ -148,9 +148,9 @@ func (f *fakeDocker) Exec(_ context.Context, _ string, cmd []string) (int, error
 }
 
 const testConfig = `
-github_url: https://github.com/MacLeodTech
+github_url: https://github.com/example-org
 tenant_url: https://pipelines.actions.githubusercontent.com/OURS/
-prefix: homelab
+prefix: ci
 max_slots: 3
 subnet: 172.41.{slot}.0/24
 work_dir: /runner/work
@@ -190,12 +190,12 @@ func newGuard(t *testing.T) (*Guard, *fakeDocker) {
 	return New(cfg, f, slog.New(slog.NewTextHandler(io.Discard, nil))), f
 }
 
-// jitFor makes a JIT config for a runner. org selects the tenant: the guard's own ("https://github.com/MacLeodTech")
+// jitFor makes a JIT config for a runner. org selects the tenant: the guard's own ("https://github.com/example-org")
 // or another one.
 func jitFor(name, org string) string {
 	enc := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 	tenant := "OURS"
-	if org != "https://github.com/MacLeodTech" {
+	if org != "https://github.com/example-org" {
 		tenant = "THEIRS"
 	}
 	runner := fmt.Sprintf(`{"AgentName":%q,"ServerUrl":"https://pipelines.actions.githubusercontent.com/%s/","ServerUrlV2":"https://broker.actions.githubusercontent.com/","WorkFolder":"/runner/work"}`, name, tenant)
@@ -220,27 +220,27 @@ func do(t *testing.T, h http.Handler, method, path string, body any) *httptest.R
 func TestStartBuildsSpecFromTemplate(t *testing.T) {
 	g, f := newGuard(t)
 	h := g.Handler()
-	rec := do(t, h, "PUT", "/v1/slots/2", api.StartRequest{RunnerName: "homelab-2-abcd12", JITConfig: jitFor("homelab-2-abcd12", "https://github.com/MacLeodTech")})
+	rec := do(t, h, "PUT", "/v1/slots/2", api.StartRequest{RunnerName: "ci-2-abcd12", JITConfig: jitFor("ci-2-abcd12", "https://github.com/example-org")})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("start: %d %s", rec.Code, rec.Body)
 	}
-	r, d := f.containers["homelab-runner-2"], f.containers["homelab-dind-2"]
+	r, d := f.containers["ci-runner-2"], f.containers["ci-dind-2"]
 	if r == nil || d == nil {
 		t.Fatalf("containers: %v", f.containers)
 	}
 	if r.spec.HostConfig.Privileged || !d.spec.HostConfig.Privileged {
 		t.Error("only dind may be privileged")
 	}
-	if !slices.Contains(r.spec.Env, "DOCKER_HOST=tcp://homelab-dind-2:2375") || !slices.Contains(d.spec.Env, "DOCKER_TLS_CERTDIR=") {
+	if !slices.Contains(r.spec.Env, "DOCKER_HOST=tcp://ci-dind-2:2375") || !slices.Contains(d.spec.Env, "DOCKER_TLS_CERTDIR=") {
 		t.Errorf("env: runner %v dind %v", r.spec.Env, d.spec.Env)
 	}
-	if !slices.Contains(r.spec.HostConfig.Binds, "/srv/runners/2/cache:/cache") || !slices.Contains(r.spec.HostConfig.Binds, "homelab-work-2:/runner/work") {
+	if !slices.Contains(r.spec.HostConfig.Binds, "/srv/runners/2/cache:/cache") || !slices.Contains(r.spec.HostConfig.Binds, "ci-work-2:/runner/work") {
 		t.Errorf("runner binds: %v", r.spec.HostConfig.Binds)
 	}
-	if !slices.Contains(d.spec.HostConfig.Binds, "homelab-work-2:/runner/work") {
+	if !slices.Contains(d.spec.HostConfig.Binds, "ci-work-2:/runner/work") {
 		t.Errorf("dind binds: %v", d.spec.HostConfig.Binds)
 	}
-	if f.networks["homelab-slot-2"] != "172.41.2.0/24" || !f.volumes["homelab-work-2"] {
+	if f.networks["ci-slot-2"] != "172.41.2.0/24" || !f.volumes["ci-work-2"] {
 		t.Errorf("network/volume: %v %v", f.networks, f.volumes)
 	}
 	if r.spec.HostConfig.Memory != 3<<30 || *r.spec.HostConfig.PidsLimit != 1024 || r.spec.HostConfig.NanoCPUs != 2e9 {
@@ -254,7 +254,7 @@ func TestStartBuildsSpecFromTemplate(t *testing.T) {
 	}
 
 	// Same slot again: conflict. Then stop, which prunes and removes everything.
-	rec = do(t, h, "PUT", "/v1/slots/2", api.StartRequest{RunnerName: "homelab-2-zzzz99", JITConfig: jitFor("homelab-2-zzzz99", "https://github.com/MacLeodTech")})
+	rec = do(t, h, "PUT", "/v1/slots/2", api.StartRequest{RunnerName: "ci-2-zzzz99", JITConfig: jitFor("ci-2-zzzz99", "https://github.com/example-org")})
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("second start: %d", rec.Code)
 	}
@@ -269,20 +269,20 @@ func TestStartBuildsSpecFromTemplate(t *testing.T) {
 func TestRefusals(t *testing.T) {
 	g, f := newGuard(t)
 	h := g.Handler()
-	good := jitFor("homelab-1-abcd12", "https://github.com/MacLeodTech")
+	good := jitFor("ci-1-abcd12", "https://github.com/example-org")
 	cases := []struct {
 		name, method, path string
 		body               any
 		want               int
 	}{
-		{"slot 0", "PUT", "/v1/slots/0", api.StartRequest{RunnerName: "homelab-0-abcd12", JITConfig: good}, 400},
-		{"slot over max", "PUT", "/v1/slots/4", api.StartRequest{RunnerName: "homelab-4-abcd12", JITConfig: good}, 400},
-		{"slot not a number", "PUT", "/v1/slots/1x", api.StartRequest{RunnerName: "homelab-1-abcd12", JITConfig: good}, 400},
-		{"name for another slot", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "homelab-2-abcd12", JITConfig: jitFor("homelab-2-abcd12", "https://github.com/MacLeodTech")}, 400},
-		{"name with wrong prefix", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "evil-1-abcd12", JITConfig: jitFor("evil-1-abcd12", "https://github.com/MacLeodTech")}, 400},
-		{"jit names another runner", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "homelab-1-abcd12", JITConfig: jitFor("homelab-1-other1", "https://github.com/MacLeodTech")}, 400},
-		{"jit for another org", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "homelab-1-abcd12", JITConfig: jitFor("homelab-1-abcd12", "https://github.com/evil")}, 400},
-		{"unknown field", "PUT", "/v1/slots/1", `{"runner_name":"homelab-1-abcd12","jit_config":"x","image":"evil"}`, 400},
+		{"slot 0", "PUT", "/v1/slots/0", api.StartRequest{RunnerName: "ci-0-abcd12", JITConfig: good}, 400},
+		{"slot over max", "PUT", "/v1/slots/4", api.StartRequest{RunnerName: "ci-4-abcd12", JITConfig: good}, 400},
+		{"slot not a number", "PUT", "/v1/slots/1x", api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: good}, 400},
+		{"name for another slot", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "ci-2-abcd12", JITConfig: jitFor("ci-2-abcd12", "https://github.com/example-org")}, 400},
+		{"name with wrong prefix", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "evil-1-abcd12", JITConfig: jitFor("evil-1-abcd12", "https://github.com/example-org")}, 400},
+		{"jit names another runner", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-other1", "https://github.com/example-org")}, 400},
+		{"jit for another org", "PUT", "/v1/slots/1", api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/evil")}, 400},
+		{"unknown field", "PUT", "/v1/slots/1", `{"runner_name":"ci-1-abcd12","jit_config":"x","image":"evil"}`, 400},
 		{"not json", "PUT", "/v1/slots/1", `nope`, 400},
 		{"stop over max", "DELETE", "/v1/slots/9", nil, 400},
 		{"raw docker api", "POST", "/containers/create", `{}`, 404},
@@ -304,7 +304,7 @@ func TestRefusals(t *testing.T) {
 func TestUnhealthyDindTearsDown(t *testing.T) {
 	g, f := newGuard(t)
 	f.dindHealth = "unhealthy"
-	err := g.Start(context.Background(), 1, api.StartRequest{RunnerName: "homelab-1-abcd12", JITConfig: jitFor("homelab-1-abcd12", "https://github.com/MacLeodTech")})
+	err := g.Start(context.Background(), 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")})
 	if err == nil {
 		t.Fatal("start succeeded with unhealthy dind")
 	}
@@ -317,21 +317,21 @@ func TestReapRemovesExitedRunners(t *testing.T) {
 	g, f := newGuard(t)
 	ctx := context.Background()
 	for _, n := range []int{1, 2} {
-		name := fmt.Sprintf("homelab-%d-abcd12", n)
-		if err := g.Start(ctx, n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/MacLeodTech")}); err != nil {
+		name := fmt.Sprintf("ci-%d-abcd12", n)
+		if err := g.Start(ctx, n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/example-org")}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	f.containers["homelab-runner-1"].state = "exited"
+	f.containers["ci-runner-1"].state = "exited"
 	g.Reap(ctx)
-	if f.containers["homelab-dind-1"] != nil || f.containers["homelab-runner-1"] != nil {
+	if f.containers["ci-dind-1"] != nil || f.containers["ci-runner-1"] != nil {
 		t.Error("slot 1 not reaped")
 	}
-	if f.containers["homelab-runner-2"] == nil {
+	if f.containers["ci-runner-2"] == nil {
 		t.Error("slot 2 reaped while running")
 	}
 	slots, _ := g.List(ctx)
-	if len(slots) != 1 || slots[0].Slot != 2 || slots[0].RunnerName != "homelab-2-abcd12" {
+	if len(slots) != 1 || slots[0].Slot != 2 || slots[0].RunnerName != "ci-2-abcd12" {
 		t.Errorf("slots: %+v", slots)
 	}
 }
@@ -339,9 +339,9 @@ func TestReapRemovesExitedRunners(t *testing.T) {
 func TestConfigRejects(t *testing.T) {
 	base := testConfig
 	cases := map[string][2]string{
-		"unknown key":       {"prefix: homelab", "prefix: homelab\nimage_override: x"},
-		"bad prefix":        {"prefix: homelab", "prefix: Home_Lab"},
-		"http github url":   {"https://github.com/MacLeodTech", "http://github.com/MacLeodTech"},
+		"unknown key":       {"prefix: ci", "prefix: ci\nimage_override: x"},
+		"bad prefix":        {"prefix: ci", "prefix: Home_Lab"},
+		"http github url":   {"https://github.com/example-org", "http://github.com/example-org"},
 		"too many slots":    {"max_slots: 3", "max_slots: 900"},
 		"privileged runner": {"  cap_drop: [ALL]", "  privileged: true\n  cap_drop: [ALL]"},
 		"socket bind":       {`"/srv/runners/{slot}/cache:/cache"`, `"/var/run/docker.sock:/var/run/docker.sock"`},
@@ -386,13 +386,13 @@ func TestWorkBindIsWipedThroughDind(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := g.Start(ctx, 1, api.StartRequest{RunnerName: "homelab-1-abcd12", JITConfig: jitFor("homelab-1-abcd12", "https://github.com/MacLeodTech")}); err != nil {
+	if err := g.Start(ctx, 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.volumes) != 0 {
 		t.Errorf("created a volume in bind mode: %v", f.volumes)
 	}
-	if b := f.containers["homelab-runner-1"].spec.HostConfig.Binds; !slices.Contains(b, "/big/runners/1/work:/runner/work") {
+	if b := f.containers["ci-runner-1"].spec.HostConfig.Binds; !slices.Contains(b, "/big/runners/1/work:/runner/work") {
 		t.Errorf("runner binds: %v", b)
 	}
 	if len(f.execs) != 1 || f.execs[0][len(f.execs[0])-1] != "/runner/work" {
@@ -407,7 +407,7 @@ func TestWorkBindIsWipedThroughDind(t *testing.T) {
 func TestRequireFileGatesStarts(t *testing.T) {
 	g, f := newGuard(t)
 	g.cfg.RequireFile = filepath.Join(t.TempDir(), "firewall-ok")
-	req := api.StartRequest{RunnerName: "homelab-1-abcd12", JITConfig: jitFor("homelab-1-abcd12", "https://github.com/MacLeodTech")}
+	req := api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}
 	if rec := do(t, g.Handler(), "PUT", "/v1/slots/1", req); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("started without the gate file: %d", rec.Code)
 	}
@@ -448,7 +448,7 @@ func TestNoDindPoolWipesInOneShotContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := g.Start(ctx, 2, api.StartRequest{RunnerName: "homelab-2-abcd12", JITConfig: jitFor("homelab-2-abcd12", "https://github.com/MacLeodTech")}); err != nil {
+	if err := g.Start(ctx, 2, api.StartRequest{RunnerName: "ci-2-abcd12", JITConfig: jitFor("ci-2-abcd12", "https://github.com/example-org")}); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.wipes) != 1 {
@@ -458,14 +458,14 @@ func TestNoDindPoolWipesInOneShotContainer(t *testing.T) {
 	if w.HostConfig.NetworkMode != "none" || w.HostConfig.Privileged || len(w.HostConfig.Binds) != 1 || w.HostConfig.Binds[0] != "/big/lite/2/work:/runner/work" {
 		t.Errorf("wiper spec: %+v", w.HostConfig)
 	}
-	r := f.containers["homelab-runner-2"]
+	r := f.containers["ci-runner-2"]
 	if r == nil || slices.ContainsFunc(r.spec.Env, func(e string) bool { return strings.HasPrefix(e, "DOCKER_HOST=") }) {
 		t.Fatalf("runner: %+v", r)
 	}
 	if r.spec.HostConfig.CgroupParent != "runner-scaling.slice" || w.HostConfig.CgroupParent != "runner-scaling.slice" {
 		t.Errorf("cgroup parent not applied")
 	}
-	if f.containers["homelab-wipe-2"] != nil {
+	if f.containers["ci-wipe-2"] != nil {
 		t.Error("wiper left behind")
 	}
 	g.Stop(ctx, 2)
@@ -484,7 +484,7 @@ func TestWipeStaleAtStartup(t *testing.T) {
 			g.cfg.WorkBind = "/big/runners/{slot}/work"
 			ctx := context.Background()
 			// slot 2 is in use and must be left alone.
-			f.containers["homelab-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: g.labels(2, "runner", "homelab-2-abcd12")}}
+			f.containers["ci-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: g.labels(2, "runner", "ci-2-abcd12")}}
 			g.WipeStale(ctx)
 			var got []string
 			for _, w := range f.wipes {
@@ -530,18 +530,18 @@ func TestReapMaxRuntime(t *testing.T) {
 			g, f := newGuard(t)
 			g.cfg.MaxRuntime.Duration = c.max
 			ctx := context.Background()
-			name := "homelab-1-abcd12"
-			if err := g.Start(ctx, 1, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/MacLeodTech")}); err != nil {
+			name := "ci-1-abcd12"
+			if err := g.Start(ctx, 1, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/example-org")}); err != nil {
 				t.Fatal(err)
 			}
-			f.containers["homelab-runner-1"].created = time.Now().Add(-c.age)
+			f.containers["ci-runner-1"].created = time.Now().Add(-c.age)
 			if c.starting {
 				g.mu.Lock()
 				g.starting[1] = true
 				g.mu.Unlock()
 			}
 			g.Reap(ctx)
-			if gone := f.containers["homelab-runner-1"] == nil; gone != c.reaped {
+			if gone := f.containers["ci-runner-1"] == nil; gone != c.reaped {
 				t.Errorf("reaped=%v, want %v", gone, c.reaped)
 			}
 		})
@@ -551,7 +551,7 @@ func TestReapMaxRuntime(t *testing.T) {
 func TestMaxRuntimeValidation(t *testing.T) {
 	for in, ok := range map[string]bool{"max_runtime: 0s": true, "max_runtime: 6h": true, "max_runtime: 1m": true, "max_runtime: 30s": false, "max_runtime: -1h": false} {
 		p := filepath.Join(t.TempDir(), "guard.yaml")
-		os.WriteFile(p, []byte(strings.Replace(testConfig, "prefix: homelab", "prefix: homelab\n"+in, 1)), 0o600)
+		os.WriteFile(p, []byte(strings.Replace(testConfig, "prefix: ci", "prefix: ci\n"+in, 1)), 0o600)
 		if _, err := LoadConfig(p); (err == nil) != ok {
 			t.Errorf("%s: err=%v, want ok=%v", in, err, ok)
 		}
@@ -572,8 +572,8 @@ func memGuard(t *testing.T, budget string) (*Guard, *fakeDocker) {
 }
 
 func startSlot(t *testing.T, g *Guard, n int) error {
-	name := fmt.Sprintf("homelab-%d-abcd12", n)
-	return g.Start(context.Background(), n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/MacLeodTech")})
+	name := fmt.Sprintf("ci-%d-abcd12", n)
+	return g.Start(context.Background(), n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/example-org")})
 }
 
 func TestMemoryAdmission(t *testing.T) {
@@ -585,10 +585,10 @@ func TestMemoryAdmission(t *testing.T) {
 		ok    bool
 	}{
 		{"empty", nil, false, true},
-		{"exactly fits", map[string]int64{"homelab-runner-2": 7 * gib}, false, true},
-		{"one byte over", map[string]int64{"homelab-runner-2": 7*gib + 1}, false, false},
-		{"runner+dind summed", map[string]int64{"homelab-runner-2": 4 * gib, "homelab-dind-2": 4 * gib}, false, false},
-		{"small slot counts as reserve", map[string]int64{"homelab-runner-2": 1 << 20}, false, true},
+		{"exactly fits", map[string]int64{"ci-runner-2": 7 * gib}, false, true},
+		{"one byte over", map[string]int64{"ci-runner-2": 7*gib + 1}, false, false},
+		{"runner+dind summed", map[string]int64{"ci-runner-2": 4 * gib, "ci-dind-2": 4 * gib}, false, false},
+		{"small slot counts as reserve", map[string]int64{"ci-runner-2": 1 << 20}, false, true},
 		{"reserve floor denies", nil, false, true},
 		{"other pool counts", map[string]int64{"lite-runner-1": 7*gib + 1}, true, false},
 		{"other pool fits", map[string]int64{"lite-runner-1": 7 * gib}, true, true},
@@ -597,7 +597,7 @@ func TestMemoryAdmission(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			g, f := memGuard(t, "8G")
 			for n, v := range c.usage {
-				pool, slot := "homelab", "2"
+				pool, slot := "ci", "2"
 				if c.other {
 					pool, slot = "lite", "1"
 				}
@@ -666,16 +666,16 @@ func TestMemoryBackstop(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		f.containers["homelab-runner-1"].created = time.Now().Add(-time.Hour)
-		f.containers["homelab-runner-2"].created = time.Now().Add(-time.Minute)
+		f.containers["ci-runner-1"].created = time.Now().Add(-time.Hour)
+		f.containers["ci-runner-2"].created = time.Now().Add(-time.Minute)
 		return g, f
 	}
-	alive := func(f *fakeDocker, n int) bool { return f.containers[fmt.Sprintf("homelab-runner-%d", n)] != nil }
+	alive := func(f *fakeDocker, n int) bool { return f.containers[fmt.Sprintf("ci-runner-%d", n)] != nil }
 
 	t.Run("kills newest after 3 ticks and resets", func(t *testing.T) {
 		g, f := setup(t)
-		f.mem["homelab-runner-1"] = 5 * gib
-		f.mem["homelab-runner-2"] = 5 * gib
+		f.mem["ci-runner-1"] = 5 * gib
+		f.mem["ci-runner-2"] = 5 * gib
 		g.Reap(ctx)
 		g.Reap(ctx)
 		if !alive(f, 1) || !alive(f, 2) {
@@ -685,7 +685,7 @@ func TestMemoryBackstop(t *testing.T) {
 		if !alive(f, 1) || alive(f, 2) {
 			t.Fatalf("want only newest (2) killed: %v", f.containers)
 		}
-		if f.containers["homelab-dind-2"] != nil {
+		if f.containers["ci-dind-2"] != nil {
 			t.Error("dind of killed slot left behind")
 		}
 		g.Reap(ctx) // 10G was only slot 1's 5G + ... still counted? slot 2 gone from fake list but mem map stays
@@ -696,12 +696,12 @@ func TestMemoryBackstop(t *testing.T) {
 	})
 	t.Run("under-budget tick resets", func(t *testing.T) {
 		g, f := setup(t)
-		f.mem["homelab-runner-1"] = 9 * gib
+		f.mem["ci-runner-1"] = 9 * gib
 		g.Reap(ctx)
 		g.Reap(ctx)
-		f.mem["homelab-runner-1"] = gib
+		f.mem["ci-runner-1"] = gib
 		g.Reap(ctx)
-		f.mem["homelab-runner-1"] = 9 * gib
+		f.mem["ci-runner-1"] = 9 * gib
 		g.Reap(ctx)
 		g.Reap(ctx)
 		if !alive(f, 1) || !alive(f, 2) {
@@ -714,7 +714,7 @@ func TestMemoryBackstop(t *testing.T) {
 	})
 	t.Run("ignores starting slots", func(t *testing.T) {
 		g, f := setup(t)
-		f.mem["homelab-runner-1"] = 9 * gib
+		f.mem["ci-runner-1"] = 9 * gib
 		g.mu.Lock()
 		g.starting[2] = true
 		g.mu.Unlock()
@@ -743,15 +743,15 @@ func TestMemoryAndCPUConfigValidation(t *testing.T) {
 		name, old, new string
 		ok             bool
 	}{
-		{"budget only", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G", true},
-		{"budget and reserve", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: 2G", true},
-		{"reserve equals budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: 8G", true},
-		{"one slot over budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 4G", false},
-		{"reserve over budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 1G\nmemory_reserve: 2G", false},
-		{"default reserve over small budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 512M", false},
-		{"bad budget", "prefix: homelab", "prefix: homelab\nmemory_budget: lots", false},
-		{"bad reserve", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: x", false},
-		{"reserve without budget", "prefix: homelab", "prefix: homelab\nmemory_reserve: 1G", false},
+		{"budget only", "prefix: ci", "prefix: ci\nmemory_budget: 8G", true},
+		{"budget and reserve", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_reserve: 2G", true},
+		{"reserve equals budget", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_reserve: 8G", true},
+		{"one slot over budget", "prefix: ci", "prefix: ci\nmemory_budget: 4G", false},
+		{"reserve over budget", "prefix: ci", "prefix: ci\nmemory_budget: 1G\nmemory_reserve: 2G", false},
+		{"default reserve over small budget", "prefix: ci", "prefix: ci\nmemory_budget: 512M", false},
+		{"bad budget", "prefix: ci", "prefix: ci\nmemory_budget: lots", false},
+		{"bad reserve", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_reserve: x", false},
+		{"reserve without budget", "prefix: ci", "prefix: ci\nmemory_reserve: 1G", false},
 		{"cpu_shares ok", "  cpus: 2", "  cpus: 2\n  cpu_shares: 512", true},
 		{"cpu_shares 1", "  cpus: 2", "  cpus: 2\n  cpu_shares: 1", false},
 		{"cpu_shares huge", "  cpus: 2", "  cpus: 2\n  cpu_shares: 262145", false},
@@ -781,13 +781,13 @@ func TestCPUSharesInHostConfig(t *testing.T) {
 	if err := startSlot(t, g, 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.containers["homelab-runner-1"].spec.HostConfig.CPUShares; got != 512 {
+	if got := f.containers["ci-runner-1"].spec.HostConfig.CPUShares; got != 512 {
 		t.Errorf("runner CpuShares %d", got)
 	}
-	if got := f.containers["homelab-dind-1"].spec.HostConfig.CPUShares; got != 0 {
+	if got := f.containers["ci-dind-1"].spec.HostConfig.CPUShares; got != 0 {
 		t.Errorf("dind CpuShares %d", got)
 	}
-	b, _ := json.Marshal(f.containers["homelab-runner-1"].spec.HostConfig)
+	b, _ := json.Marshal(f.containers["ci-runner-1"].spec.HostConfig)
 	if !strings.Contains(string(b), `"CpuShares":512`) {
 		t.Errorf("json: %s", b)
 	}
@@ -895,7 +895,7 @@ func TestCachesWipedAtTeardownUnlessVouched(t *testing.T) {
 	if err := startSlot(t, g, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.KeepCache(ctx, 2, "homelab-2-abcd12"); err != nil {
+	if err := g.KeepCache(ctx, 2, "ci-2-abcd12"); err != nil {
 		t.Fatal(err)
 	}
 	if err := g.Stop(ctx, 2); err != nil {
@@ -927,7 +927,7 @@ func TestKeepCacheRejectsWrongRunner(t *testing.T) {
 		slot   int
 		runner string
 		want   error
-	}{{1, "homelab-1-zzzzzz", ErrConflict}, {1, "", ErrConflict}, {3, "homelab-3-abcd12", ErrConflict}, {9, "homelab-9-abcd12", ErrBadRequest}} {
+	}{{1, "ci-1-zzzzzz", ErrConflict}, {1, "", ErrConflict}, {3, "ci-3-abcd12", ErrConflict}, {9, "ci-9-abcd12", ErrBadRequest}} {
 		if err := g.KeepCache(ctx, c.slot, c.runner); !errors.Is(err, c.want) {
 			t.Errorf("KeepCache(%d,%q) = %v, want %v", c.slot, c.runner, err, c.want)
 		}
@@ -939,7 +939,7 @@ func TestReapWipesCachesOfExitedRunner(t *testing.T) {
 	if err := startSlot(t, g, 1); err != nil {
 		t.Fatal(err)
 	}
-	f.containers["homelab-runner-1"].state = "exited"
+	f.containers["ci-runner-1"].state = "exited"
 	g.Reap(context.Background())
 	if w := cacheWipes(f); len(w) != 1 {
 		t.Fatalf("reap wiped %v, want one wipe", w)
@@ -967,7 +967,7 @@ func TestFailedCacheWipeBlocksReuse(t *testing.T) {
 
 func TestWipeStaleEmptiesCaches(t *testing.T) {
 	g, f := cacheGuard(t)
-	f.containers["homelab-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: g.labels(2, "runner", "homelab-2-abcd12")}}
+	f.containers["ci-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: g.labels(2, "runner", "ci-2-abcd12")}}
 	g.WipeStale(context.Background())
 	if got := len(cacheWipes(f)); got != 2 { // slots 1 and 3; slot 2 is in use
 		t.Fatalf("startup wiped caches of %d slots, want 2", got)
