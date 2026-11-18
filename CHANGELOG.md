@@ -3,7 +3,7 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-18
 
 ### Changed
 
@@ -73,5 +73,6 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.3.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.3.0
 [0.2.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.2.0
 [0.1.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.1.0
