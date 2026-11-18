@@ -1,0 +1,57 @@
+# Same as guard.yaml, but the dind sidecar runs under Sysbox instead of privileged. Use it as a pool of its own.
+# See the README, "Running dind under Sysbox". It has its own prefix, subnets and state directories, so it can run beside guard.yaml.
+# Example guard config using GitHub's official runner image. Everything about the containers the guard creates
+# comes from this file; the scaler can only pick a slot number and hand over a JIT config.
+# Mount it read-only into the guard, and keep it writable only by root on the host.
+
+github_url: https://github.com/YOUR-ORG          # or https://github.com/OWNER/REPO for a repo-level scale set
+# Leave tenant_url out on first start. The guard refuses the first JIT config and logs its ServerUrl
+# (`docker logs <guard> | grep DENY`). Check it came from your own scaler talking to your own org, then pin it here.
+# tenant_url: https://pipelines….actions.githubusercontent.com/<tenant>/
+
+prefix: ci-sysbox             # containers ci-sysbox-runner-N, networks ci-sysbox-slot-N
+max_slots: 2
+subnet: 172.30.3{slot}.0/24   # next to the other examples; all sit inside the 172.30.0.0/16 fence
+require_file: /gate/firewall-ok   # the guard starts no slot until firewall.sh has put the fence up; drop it if you run no fence
+max_runtime: 6h             # optional: the reaper removes a runner that has run longer than this (min 1m, default off)
+memory_budget: 8G           # optional: cap on the memory working set of ALL runner-scaling containers on this host.
+#                             # Shared by every pool: give every guard the same value. New slots wait (503) when full.
+# memory_ramp: 2m             # optional: a new slot counts at memory_ramp_share (default 0.5) of its limits this long
+#                             # (default 2m; 0s = off), so a burst of fresh jobs isn't admitted against memory they haven't used yet
+memory_reserve: 1G          # assumed minimum per slot (runner+dind) for admission; default 1G with memory_budget
+# cache_dirs:                 # optional: warm caches that are emptied when a slot is torn down, unless the scaler vouches
+#   - /srv/runner-scaling/sbx-{slot}/toolcache   # for the job (a push/schedule/dispatch/release on CACHE_TRUSTED_REFS,
+#   - /srv/runner-scaling/sbx-{slot}/docker      # default refs/heads/main). Also emptied at guard startup. List every cache bind.
+work_dir: /home/runner/_work  # fresh Docker volume per runner, mounted here in the runner and in dind
+
+runner:
+  image: ghcr.io/actions/actions-runner:latest  # pin a digest: ghcr.io/actions/actions-runner@sha256:…
+  command: [/home/runner/run.sh]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  memory: 4G                  # hard limit: past it the container is OOM-killed
+  # memory_high: 3G           # optional soft limit: past it the container is slowed down instead (see the README)
+  cpus: 2
+  # cpu_shares: 512           # optional relative CPU weight vs other host workloads (Docker default 1024; 2..262144)
+  pids: 2048
+  env:
+    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+  binds:
+    - /srv/runner-scaling/sbx-{slot}/toolcache:/opt/hostedtoolcache   # warm caches, one per slot
+  log_opts: {max-size: 10m, max-file: "3"}
+
+# Optional private Docker daemon per runner. Jobs get DOCKER_HOST=tcp://<prefix>-dind-<slot>:2375 on their own
+# network. Remove this section if jobs don't need Docker.
+dind:
+  image: docker:28-dind       # pin a digest
+  runtime: sysbox-runc        # Sysbox must be installed and registered with Docker; replaces privileged: true
+  memory: 4G
+  cpus: 2
+  pids: 4096
+  binds:
+    - /srv/runner-scaling/sbx-{slot}/docker:/var/lib/docker            # image and layer cache, one per slot
+  healthcheck: {test: [CMD, docker, info], interval: 3s, timeout: 5s, retries: 40, start_period: 3s}
+  prune_on_stop:
+    - [docker, builder, prune, -f, --filter, until=168h]
+    - [docker, image, prune, -af, --filter, until=336h]
+  log_opts: {max-size: 10m, max-file: "3"}
