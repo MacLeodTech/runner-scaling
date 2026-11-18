@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +33,9 @@ type fakeDocker struct {
 	pulled     []string
 	dindHealth string
 	wipes      []ContainerSpec
+	mem        map[string]int64 // by container name
+	memErr     error
+	memCalls   int
 }
 
 type fakeContainer struct {
@@ -110,14 +115,24 @@ func (f *fakeDocker) ContainerRemove(_ context.Context, id string) error {
 func (f *fakeDocker) ContainerList(_ context.Context, label string) ([]ContainerSummary, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	k, v, _ := strings.Cut(label, "=")
+	k, v, hasV := strings.Cut(label, "=")
 	var out []ContainerSummary
 	for n, c := range f.containers {
-		if c.spec.Labels[k] == v {
+		got, present := c.spec.Labels[k]
+		if present && (!hasV || got == v) {
 			out = append(out, ContainerSummary{ID: n, Names: []string{"/" + n}, State: c.state, Created: c.created.Unix(), Labels: c.spec.Labels})
 		}
 	}
 	return out, nil
+}
+func (f *fakeDocker) ContainerMemory(_ context.Context, id string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.memCalls++
+	if f.memErr != nil {
+		return 0, f.memErr
+	}
+	return f.mem[id], nil
 }
 func (f *fakeDocker) Exec(_ context.Context, _ string, cmd []string) (int, error) {
 	f.mu.Lock()
@@ -534,5 +549,239 @@ func TestMaxRuntimeValidation(t *testing.T) {
 		if _, err := LoadConfig(p); (err == nil) != ok {
 			t.Errorf("%s: err=%v, want ok=%v", in, err, ok)
 		}
+	}
+}
+
+const gib = int64(1) << 30
+
+func memGuard(t *testing.T, budget string) (*Guard, *fakeDocker) {
+	t.Helper()
+	g, f := newGuard(t)
+	g.cfg.MemoryBudget, g.cfg.MemoryReserve = budget, "1G"
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f.mem = map[string]int64{}
+	return g, f
+}
+
+func startSlot(t *testing.T, g *Guard, n int) error {
+	name := fmt.Sprintf("homelab-%d-abcd12", n)
+	return g.Start(context.Background(), n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/MacLeodTech")})
+}
+
+func TestMemoryAdmission(t *testing.T) {
+	// Budget 8G, reserve 1G: admit while total+1G <= 8G.
+	cases := []struct {
+		name  string
+		usage map[string]int64 // container name -> bytes
+		other bool             // put usage on another pool's slot
+		ok    bool
+	}{
+		{"empty", nil, false, true},
+		{"exactly fits", map[string]int64{"homelab-runner-2": 7 * gib}, false, true},
+		{"one byte over", map[string]int64{"homelab-runner-2": 7*gib + 1}, false, false},
+		{"runner+dind summed", map[string]int64{"homelab-runner-2": 4 * gib, "homelab-dind-2": 4 * gib}, false, false},
+		{"small slot counts as reserve", map[string]int64{"homelab-runner-2": 1 << 20}, false, true},
+		{"reserve floor denies", nil, false, true},
+		{"other pool counts", map[string]int64{"lite-runner-1": 7*gib + 1}, true, false},
+		{"other pool fits", map[string]int64{"lite-runner-1": 7 * gib}, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, f := memGuard(t, "8G")
+			for n, v := range c.usage {
+				pool, slot := "homelab", "2"
+				if c.other {
+					pool, slot = "lite", "1"
+				}
+				f.containers[n] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: pool, labelSlot: slot, labelRole: "runner"}}}
+				f.mem[n] = v
+			}
+			err := startSlot(t, g, 1)
+			if (err == nil) != c.ok {
+				t.Fatalf("err=%v, want ok=%v", err, c.ok)
+			}
+			if err != nil {
+				if !errors.Is(err, ErrNotReady) || !strings.Contains(err.Error(), "of 8G, need 1G reserve") {
+					t.Errorf("err: %v", err)
+				}
+				if len(f.containers) != len(c.usage) {
+					t.Errorf("containers created on deny: %v", f.containers)
+				}
+			}
+		})
+	}
+}
+
+func TestMemoryAdmissionReserveFloor(t *testing.T) {
+	// Seven idle slots of other pools each count as 1G: 7G + 1G reserve fits 8G, an eighth does not.
+	g, f := memGuard(t, "8G")
+	for i := 1; i <= 8; i++ {
+		f.containers[fmt.Sprintf("lite-runner-%d", i)] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: "lite", labelSlot: strconv.Itoa(i), labelRole: "runner"}}}
+		if i == 7 {
+			if err := startSlot(t, g, 1); err != nil {
+				t.Fatalf("7 idle slots: %v", err)
+			}
+			g.Stop(context.Background(), 1)
+		}
+	}
+	if err := startSlot(t, g, 1); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("8 idle slots: %v", err)
+	}
+}
+
+func TestMemoryStatsErrorFailsOpen(t *testing.T) {
+	g, f := memGuard(t, "8G")
+	f.containers["lite-runner-1"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: "lite", labelSlot: "1", labelRole: "runner"}}}
+	f.memErr = errors.New("stats broke")
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatalf("blocked on stats error: %v", err)
+	}
+}
+
+func TestMemoryDisabledMakesNoStatsCalls(t *testing.T) {
+	g, f := newGuard(t)
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	g.Reap(context.Background())
+	if f.memCalls != 0 {
+		t.Errorf("stats calls with no budget: %d", f.memCalls)
+	}
+}
+
+func TestMemoryBackstop(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Guard, *fakeDocker) {
+		g, f := memGuard(t, "8G")
+		for _, n := range []int{1, 2} {
+			if err := startSlot(t, g, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.containers["homelab-runner-1"].created = time.Now().Add(-time.Hour)
+		f.containers["homelab-runner-2"].created = time.Now().Add(-time.Minute)
+		return g, f
+	}
+	alive := func(f *fakeDocker, n int) bool { return f.containers[fmt.Sprintf("homelab-runner-%d", n)] != nil }
+
+	t.Run("kills newest after 3 ticks and resets", func(t *testing.T) {
+		g, f := setup(t)
+		f.mem["homelab-runner-1"] = 5 * gib
+		f.mem["homelab-runner-2"] = 5 * gib
+		g.Reap(ctx)
+		g.Reap(ctx)
+		if !alive(f, 1) || !alive(f, 2) {
+			t.Fatal("killed before 3 ticks")
+		}
+		g.Reap(ctx)
+		if !alive(f, 1) || alive(f, 2) {
+			t.Fatalf("want only newest (2) killed: %v", f.containers)
+		}
+		if f.containers["homelab-dind-2"] != nil {
+			t.Error("dind of killed slot left behind")
+		}
+		g.Reap(ctx) // 10G was only slot 1's 5G + ... still counted? slot 2 gone from fake list but mem map stays
+		g.Reap(ctx)
+		if !alive(f, 1) {
+			t.Fatal("counter not reset: second kill after 2 ticks")
+		}
+	})
+	t.Run("under-budget tick resets", func(t *testing.T) {
+		g, f := setup(t)
+		f.mem["homelab-runner-1"] = 9 * gib
+		g.Reap(ctx)
+		g.Reap(ctx)
+		f.mem["homelab-runner-1"] = gib
+		g.Reap(ctx)
+		f.mem["homelab-runner-1"] = 9 * gib
+		g.Reap(ctx)
+		g.Reap(ctx)
+		if !alive(f, 1) || !alive(f, 2) {
+			t.Fatal("killed despite reset")
+		}
+		g.Reap(ctx)
+		if alive(f, 2) {
+			t.Fatal("not killed after 3 consecutive")
+		}
+	})
+	t.Run("ignores starting slots", func(t *testing.T) {
+		g, f := setup(t)
+		f.mem["homelab-runner-1"] = 9 * gib
+		g.mu.Lock()
+		g.starting[2] = true
+		g.mu.Unlock()
+		for range 3 {
+			g.Reap(ctx)
+		}
+		if !alive(f, 2) || alive(f, 1) {
+			t.Fatalf("want slot 1 killed, starting slot 2 kept: %v", f.containers)
+		}
+	})
+	t.Run("no running slots does nothing", func(t *testing.T) {
+		g, f := memGuard(t, "8G")
+		f.containers["lite-runner-1"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: "lite", labelSlot: "1", labelRole: "runner"}}}
+		f.mem["lite-runner-1"] = 20 * gib
+		for range 5 {
+			g.Reap(ctx)
+		}
+		if f.memCalls != 0 || f.containers["lite-runner-1"] == nil {
+			t.Errorf("calls %d containers %v", f.memCalls, f.containers)
+		}
+	})
+}
+
+func TestMemoryAndCPUConfigValidation(t *testing.T) {
+	cases := []struct {
+		name, old, new string
+		ok             bool
+	}{
+		{"budget only", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G", true},
+		{"budget and reserve", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: 2G", true},
+		{"reserve equals budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 2G\nmemory_reserve: 2G", true},
+		{"reserve over budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 1G\nmemory_reserve: 2G", false},
+		{"default reserve over small budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 512M", false},
+		{"bad budget", "prefix: homelab", "prefix: homelab\nmemory_budget: lots", false},
+		{"bad reserve", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: x", false},
+		{"reserve without budget", "prefix: homelab", "prefix: homelab\nmemory_reserve: 1G", false},
+		{"cpu_shares ok", "  cpus: 2", "  cpus: 2\n  cpu_shares: 512", true},
+		{"cpu_shares 1", "  cpus: 2", "  cpus: 2\n  cpu_shares: 1", false},
+		{"cpu_shares huge", "  cpus: 2", "  cpus: 2\n  cpu_shares: 262145", false},
+		{"cpu_shares negative", "  cpus: 2", "  cpus: 2\n  cpu_shares: -5", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "guard.yaml")
+			os.WriteFile(p, []byte(strings.Replace(testConfig, c.old, c.new, 1)), 0o600)
+			if _, err := LoadConfig(p); (err == nil) != c.ok {
+				t.Fatalf("err=%v, want ok=%v", err, c.ok)
+			}
+		})
+	}
+	g, _ := memGuard(t, "8G")
+	if g.cfg.memBudget != 8*gib || g.cfg.memReserve != gib {
+		t.Errorf("parsed %d %d", g.cfg.memBudget, g.cfg.memReserve)
+	}
+}
+
+func TestCPUSharesInHostConfig(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.Runner.CPUShares = 512
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.containers["homelab-runner-1"].spec.HostConfig.CPUShares; got != 512 {
+		t.Errorf("runner CpuShares %d", got)
+	}
+	if got := f.containers["homelab-dind-1"].spec.HostConfig.CPUShares; got != 0 {
+		t.Errorf("dind CpuShares %d", got)
+	}
+	b, _ := json.Marshal(f.containers["homelab-runner-1"].spec.HostConfig)
+	if !strings.Contains(string(b), `"CpuShares":512`) {
+		t.Errorf("json: %s", b)
 	}
 }

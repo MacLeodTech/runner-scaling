@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ type Guard struct {
 
 	mu       sync.Mutex
 	starting map[int]bool
+	overMem  int // consecutive reap ticks over memory_budget; only touched by Reap
 	nameRE   *regexp.Regexp
 }
 
@@ -146,6 +148,9 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 		if _, err := os.Stat(g.cfg.RequireFile); err != nil {
 			return fmt.Errorf("%w: %s is missing (is the firewall up?)", ErrNotReady, g.cfg.RequireFile)
 		}
+	}
+	if err := g.admit(ctx, slot); err != nil {
+		return err
 	}
 	g.mu.Lock()
 	if g.starting[slot] {
@@ -377,6 +382,7 @@ func (g *Guard) spec(t *Template, slot int, network, work string, extra map[stri
 		SecurityOpt:   t.SecurityOpt,
 		DNS:           t.DNS,
 		NanoCPUs:      int64(t.CPUs * 1e9),
+		CPUShares:     t.CPUShares,
 		CgroupParent:  g.cfg.CgroupParent,
 	}
 	if t.Memory != "" {
@@ -515,12 +521,13 @@ func (g *Guard) Reap(ctx context.Context) {
 		return
 	}
 	var starts map[int]time.Time
-	if g.cfg.MaxRuntime.Duration > 0 {
+	if g.cfg.MaxRuntime.Duration > 0 || g.cfg.memBudget > 0 {
 		if starts, err = g.runnerStarts(ctx); err != nil {
 			g.log.Error("reap: list", "err", err)
 			starts = nil
 		}
 	}
+	reaped := map[int]bool{}
 	for _, s := range slots {
 		if s.Starting {
 			continue
@@ -528,7 +535,7 @@ func (g *Guard) Reap(ctx context.Context) {
 		reason := "runner_exited"
 		if s.RunnerState == "running" || s.RunnerState == "created" || s.RunnerState == "restarting" {
 			t, ok := starts[s.Slot]
-			if !ok || time.Since(t) <= g.cfg.MaxRuntime.Duration {
+			if g.cfg.MaxRuntime.Duration <= 0 || !ok || time.Since(t) <= g.cfg.MaxRuntime.Duration {
 				continue
 			}
 			reason = "max_runtime"
@@ -536,12 +543,14 @@ func (g *Guard) Reap(ctx context.Context) {
 		g.mu.Lock()
 		if !g.starting[s.Slot] {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
+			reaped[s.Slot] = true
 			if err := g.teardown(ctx, s.Slot, true); err != nil {
 				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
 			}
 		}
 		g.mu.Unlock()
 	}
+	g.memoryBackstop(ctx, slots, starts, reaped)
 }
 
 // ReapLoop runs Reap until ctx ends.
@@ -555,5 +564,126 @@ func (g *Guard) ReapLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+	}
+}
+
+// slotKey identifies a slot across pools.
+type slotKey struct {
+	instance string
+	slot     int
+}
+
+// memoryBySlot measures the working set of every running runner-scaling container on the host, all pools together
+// (the label filter is on the key only), summed per (instance, slot).
+func (g *Guard) memoryBySlot(ctx context.Context) (map[slotKey]int64, error) {
+	cs, err := g.d.ContainerList(ctx, labelInstance)
+	if err != nil {
+		return nil, err
+	}
+	out := map[slotKey]int64{}
+	for _, c := range cs {
+		n, err := strconv.Atoi(c.Labels[labelSlot])
+		if err != nil || c.State != "running" {
+			continue
+		}
+		m, err := g.d.ContainerMemory(ctx, c.ID)
+		if errors.Is(err, ErrNotFound) {
+			continue // gone since the list
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[slotKey{c.Labels[labelInstance], n}] += m
+	}
+	return out, nil
+}
+
+// admit refuses a start that would not fit the shared memory budget. Slots count as at least memory_reserve so
+// fresh ones are not seen as empty. Stats failures fail open.
+func (g *Guard) admit(ctx context.Context, slot int) error {
+	if g.cfg.memBudget <= 0 {
+		return nil
+	}
+	by, err := g.memoryBySlot(ctx)
+	if err != nil {
+		g.log.Warn("memory budget: cannot read stats, admitting", "slot", slot, "err", err)
+		return nil
+	}
+	// This guard's own slots that are still coming up may have no containers yet.
+	g.mu.Lock()
+	for n := range g.starting {
+		if _, ok := by[slotKey{g.cfg.Prefix, n}]; !ok && n != slot {
+			by[slotKey{g.cfg.Prefix, n}] = 0
+		}
+	}
+	g.mu.Unlock()
+	var total int64
+	for _, m := range by {
+		total += max(m, g.cfg.memReserve)
+	}
+	if total+g.cfg.memReserve > g.cfg.memBudget {
+		return fmt.Errorf("%w: memory budget: %s in use of %s, need %s reserve", ErrNotReady,
+			fmtBytes(total), fmtBytes(g.cfg.memBudget), fmtBytes(g.cfg.memReserve))
+	}
+	return nil
+}
+
+// memoryBackstop reaps this guard's newest running slot once measured use has been over memory_budget on 3
+// consecutive reap ticks. It makes no stats calls unless a budget is set and a slot of this guard is running.
+func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map[int]time.Time, reaped map[int]bool) {
+	if g.cfg.memBudget <= 0 {
+		return
+	}
+	var cand []api.Slot
+	for _, s := range slots {
+		if !s.Starting && !reaped[s.Slot] && s.RunnerState == "running" {
+			cand = append(cand, s)
+		}
+	}
+	if len(cand) == 0 {
+		g.overMem = 0
+		return
+	}
+	by, err := g.memoryBySlot(ctx)
+	if err != nil {
+		g.log.Warn("memory budget: cannot read stats", "err", err)
+		return
+	}
+	var total int64
+	for _, m := range by {
+		total += m
+	}
+	if total <= g.cfg.memBudget {
+		g.overMem = 0
+		return
+	}
+	if g.overMem++; g.overMem < 3 {
+		return
+	}
+	g.overMem = 0
+	victim := cand[0]
+	for _, s := range cand[1:] {
+		if starts[s.Slot].After(starts[victim.Slot]) {
+			victim = s
+		}
+	}
+	g.mu.Lock()
+	if !g.starting[victim.Slot] {
+		g.log.Info("reaping slot", "slot", victim.Slot, "runner", victim.RunnerName, "runner_state", victim.RunnerState,
+			"reason", "memory_budget", "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
+		if err := g.teardown(ctx, victim.Slot, true); err != nil {
+			g.log.Error("reap: teardown", "slot", victim.Slot, "err", err)
+		}
+	}
+	g.mu.Unlock()
+}
+
+// fmtBytes renders sizes like 6.1G, 512M.
+func fmtBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return strings.TrimSuffix(strconv.FormatFloat(float64(n)/(1<<30), 'f', 1, 64), ".0") + "G"
+	default:
+		return strconv.FormatInt((n+(1<<20)-1)>>20, 10) + "M"
 	}
 }
