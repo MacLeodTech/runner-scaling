@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1331,5 +1332,126 @@ func TestInfoCarriesTheMemoryBudget(t *testing.T) {
 	g2, _ := newGuard(t)
 	if g2.Info().MemoryBudget != 0 {
 		t.Error("budget reported without one set")
+	}
+}
+
+func TestModuleBlocklistIsWrittenFromANetworklessOneShot(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.ModuleBlocklist = []string{"ifb", "bonding", "nf-foo"}
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.ApplyModuleBlocklist(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wipes) != 1 {
+		t.Fatalf("want one one-shot container, got %d", len(f.wipes))
+	}
+	w := f.wipes[0]
+	if w.HostConfig.NetworkMode != "none" || w.HostConfig.Privileged || !slices.Equal(w.HostConfig.Binds, []string{"/etc/modprobe.d:/modprobe.d"}) {
+		t.Errorf("one-shot must have no network, not be privileged, and mount only /etc/modprobe.d: %+v", w.HostConfig)
+	}
+	args := strings.Join(w.Entrypoint, " ")
+	for _, want := range []string{"50-runner-scaling-ci.conf", "ifb bonding nf-foo"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("entrypoint %q lacks %q", args, want)
+		}
+	}
+	if f.containers["ci-wipe-0"] != nil {
+		t.Error("one-shot container left behind")
+	}
+}
+
+func TestModuleBlocklistOmittedTouchesNothing(t *testing.T) {
+	g, f := newGuard(t)
+	if err := g.ApplyModuleBlocklist(context.Background()); err != nil || len(f.wipes) != 0 {
+		t.Fatalf("omitted option must not start a container: err=%v wipes=%d", err, len(f.wipes))
+	}
+	g.cfg.ModuleBlocklist = []string{} // explicit empty list: clean up the guard's own file
+	if err := g.ApplyModuleBlocklist(context.Background()); err != nil || len(f.wipes) != 1 {
+		t.Fatalf("explicit empty list should run the cleanup: err=%v wipes=%d", err, len(f.wipes))
+	}
+}
+
+func TestModuleBlocklistFailureIsCountedNotFatal(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.ModuleBlocklist = []string{"ifb"}
+	f.wipeExit = 1
+	if err := g.ApplyModuleBlocklist(context.Background()); err == nil {
+		t.Fatal("a failed write must be reported")
+	}
+	if got := g.Counters()[CounterModuleBlocklistFailures]; got != 1 {
+		t.Errorf("failure counter = %d, want 1", got)
+	}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Errorf("a failed blocklist must not stop slots from starting: %v", err)
+	}
+}
+
+func TestModuleBlocklistValidation(t *testing.T) {
+	for _, tc := range []struct {
+		mods []string
+		ok   bool
+	}{
+		{[]string{"ifb", "bonding", "nf_conntrack", "8021q"}, true},
+		{nil, true},
+		{[]string{}, true},
+		{[]string{"Ifb"}, false},
+		{[]string{"ifb;rm -rf /"}, false},
+		{[]string{"a b"}, false},
+		{[]string{""}, false},
+		{[]string{"../x"}, false},
+		{[]string{"ifb", "ifb"}, false},
+		{[]string{"nf-x", "nf_x"}, false},
+	} {
+		g, _ := newGuard(t)
+		g.cfg.ModuleBlocklist = tc.mods
+		if err := g.cfg.Validate(); (err == nil) != tc.ok {
+			t.Errorf("%q: ok=%v, err=%v", tc.mods, tc.ok, err)
+		}
+	}
+}
+
+// The script runs for real here (sh against a temp dir) because it is what actually edits the host's modprobe rules.
+func TestModprobeScriptBehaviour(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		script := strings.ReplaceAll(modprobeScript, "/modprobe.d", dir)
+		out, err := exec.Command("sh", append([]string{"-c", script, "sh"}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("script failed: %v\n%s", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	file := filepath.Join(dir, "50-x.conf")
+	if got := run("50-x.conf", "ifb", "bonding"); got != "written" {
+		t.Fatalf("first run: %q", got)
+	}
+	b, _ := os.ReadFile(file)
+	want := "# managed by the runner-scaling guard: do not edit\ninstall ifb /bin/false\ninstall bonding /bin/false\n"
+	if string(b) != want {
+		t.Fatalf("file content:\n%q\nwant\n%q", b, want)
+	}
+	if got := run("50-x.conf", "ifb", "bonding"); got != "unchanged" {
+		t.Errorf("same list twice: %q", got)
+	}
+	if got := run("50-x.conf", "ifb"); got != "written" {
+		t.Errorf("changed list: %q", got)
+	}
+	if _, err := os.Stat(file + ".tmp"); err == nil {
+		t.Error("temp file left behind")
+	}
+	if got := run("50-x.conf"); got != "removed" {
+		t.Errorf("empty list should remove the managed file: %q", got)
+	}
+	// a file the guard did not write must never be removed or replaced by an empty list
+	foreign := filepath.Join(dir, "60-mine.conf")
+	os.WriteFile(foreign, []byte("blacklist foo\n"), 0o644)
+	if got := run("60-mine.conf"); got != "nothing" {
+		t.Errorf("foreign file with empty list: %q", got)
+	}
+	if b, _ := os.ReadFile(foreign); string(b) != "blacklist foo\n" {
+		t.Error("foreign file was modified")
 	}
 }

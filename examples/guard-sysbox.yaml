@@ -13,6 +13,7 @@ prefix: ci-sysbox             # containers ci-sysbox-runner-N, networks ci-sysbo
 max_slots: 2
 subnet: 172.30.3{slot}.0/24   # next to the other examples; all sit inside the 172.30.0.0/16 fence
 require_file: /gate/firewall-ok   # the guard starts no slot until firewall.sh has put the fence up; drop it if you run no fence
+module_blocklist: [dummy, ifb, nlmon, bonding, team, geneve, bareudp, gtp, amt, netdevsim, macsec, ipvlan, vxlan]  # optional: stop jobs from making the host kernel load these modules (README, "Kernel module autoload"); only list modules your host never uses
 max_runtime: 6h             # optional: the reaper removes a runner that has run longer than this (min 1m, default off)
 memory_budget: 8G           # optional: cap on the memory working set of ALL runner-scaling containers on this host.
 #                             # Shared by every pool: give every guard the same value. New slots wait (503) when full.

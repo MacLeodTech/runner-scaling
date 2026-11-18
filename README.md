@@ -318,6 +318,7 @@ serve metrics itself; its read-only `GET /v1/counters` is what the scaler reads)
 | `denied_total` | a bad or refused request, or an unknown endpoint: the guard's API was misused. **Alert on any.** |
 | `not_ready_total` | a start refused with 503: the memory budget was full, or the firewall gate was missing |
 | `admission_refused_total` | starts held back by the memory budget (normal under load; a steady climb with idle memory means the reserve or ramp is too cautious) |
+| `module_blocklist_failures_total` | `module_blocklist` could not be written at startup: jobs can still make the host load those modules. **Alert on any.** |
 | `gate_withdrawn_total` | `require_file` vanished (the firewall rules were lost): running slots may be unfenced until it returns. **Alert on any.** |
 | `conflicts_total` | a start or stop refused because the slot was in use or in transition |
 | `starts_total`, `start_failures_total` | slots started, and starts that failed after being admitted |
@@ -431,6 +432,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `memory_ramp`, `memory_ramp_share` | how long a new slot counts at a share of its memory limits (default `2m`, `0.5`; `0s` turns the ramp off) |
 | `cgroup_parent` | put all runner containers under one cgroup you can cap with systemd |
 | `require_file` | the guard starts no slot until this file exists (a gate for a host firewall) |
+| `module_blocklist` | kernel modules the host must not autoload for a job (see [Kernel module autoload](#kernel-module-autoload)). Omitted: the host is not touched. `[]`: remove the guard's own file |
 | `start_timeout` | how long a slot may take to come up (default 2m) |
 | `max_runtime` | the reaper removes a runner that runs longer than this (default: no limit) |
 | `reap_interval` | how often exited runners are cleaned up (default 5s) |
@@ -475,11 +477,38 @@ What it does not do:
 - A job can still make the host kernel load a module. A container with `NET_ADMIN` that creates a link of a type the host
   hasn't loaded (`ip link add ... type ifb`) makes the kernel autoload that module on the host. We saw this under plain runc
   (`bonding`) and under Sysbox, from an unprivileged inner container (`ifb`) and from a privileged one (`nlmon`), so Sysbox
-  does not prevent it. Block the link types you don't use with `install <module> /bin/false` in `/etc/modprobe.d`.
+  does not prevent it. Set `module_blocklist` in the guard config to stop it (see
+  [Kernel module autoload](#kernel-module-autoload)).
 - It only changes the dind sidecar. The runner container, the guard and the firewall are as before.
 - Only a few kinds of workflow were tried. Jobs that need KVM, kernel modules or `/proc/sys` writes may not work.
 - Start and stop took no longer on a quiet host. Under heavy load on a slow disk we saw slow starts and a container
   that would not stop; keep runner state on a fast local disk.
+
+## Kernel module autoload
+
+A container with `CAP_NET_ADMIN` that creates a network link of a type the host hasn't loaded (`ip link add ... type ifb`) makes
+the host kernel load that module. Any job with a dind can start such a container, and we saw it under plain runc and under
+Sysbox alike (`ifb`, `nlmon`, `bonding`, `dummy`). The modules are harmless, but a job should not change what the host kernel has loaded.
+
+`module_blocklist` in the guard config fixes it from the guard, with no manual host step:
+
+```yaml
+module_blocklist: [dummy, ifb, nlmon, bonding, team, geneve, bareudp, gtp, amt, netdevsim, macsec, ipvlan, vxlan]
+```
+
+At startup the guard runs a one-shot container (no network, no privileges, only `/etc/modprobe.d` mounted) that writes
+`install <module> /bin/false` for each entry to `/etc/modprobe.d/50-runner-scaling-<prefix>.conf`, so the autoload fails
+(`ip link add` says `Unknown device type`). Details:
+
+- **Name only modules the host never uses.** Modules that are already loaded stay loaded: the list only stops new loads.
+- It writes only its own file, marked on the first line, and replaces it atomically; a restart with the same list changes nothing.
+  `module_blocklist: []` removes its own file and never touches a file it didn't write. Omit the option and the guard doesn't touch the host.
+- It applies once per guard start. If the write fails the guard logs an error and counts `module_blocklist_failures_total` (**alert on any**);
+  the pool keeps running, without the protection.
+- Give every guard with a dind the same list (each writes its own file; the duplicate `install` lines are harmless). A pool without a dind
+  doesn't need it: its runner container has no `NET_ADMIN`.
+- Checked on a real host: with `nlmon` listed, a `NET_ADMIN` container's `ip link add type nlmon` failed and nothing loaded, while an
+  unlisted type (`ifb`) still loaded as before.
 
 ## The `runners` CLI
 
