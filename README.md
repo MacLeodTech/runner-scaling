@@ -154,6 +154,11 @@ names. The guard decodes it and requires that:
 
 ## Setup
 
+> **Image availability: private preview.** CI builds and attests `ghcr.io/macleodtech/runner-scaling` on every `v*`
+> tag, but the package is not public yet, so `docker pull` fails for anyone outside the org. Build it yourself for now:
+> `docker build -t runner-scaling:local .`, and use that tag wherever the examples name the ghcr image. The package will
+> be made public once the project settles; digests and tags won't change when it is.
+
 1. **Credentials for the scaler.** A GitHub App (recommended: `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_INSTALLATION_ID`,
    `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_FILE`) with organization *Self-hosted runners: read and
    write*, or a classic PAT with `admin:org` (`GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`). For a repo-level scale set, use

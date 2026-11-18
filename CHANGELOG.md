@@ -3,6 +3,12 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
+## [Unreleased]
+
+### Changed
+
+- Docs: the ghcr image is in private preview for now; the README and example compose say how to build it locally.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added
