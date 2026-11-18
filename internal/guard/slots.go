@@ -547,6 +547,7 @@ func (g *Guard) spec(t *Template, slot int, network, work string, extra map[stri
 		NetworkMode:   network,
 		RestartPolicy: map[string]any{"Name": "no"},
 		Privileged:    t.Privileged,
+		Runtime:       t.Runtime,
 		CapDrop:       t.CapDrop,
 		CapAdd:        t.CapAdd,
 		SecurityOpt:   t.SecurityOpt,

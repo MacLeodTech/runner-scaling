@@ -92,17 +92,20 @@ type Config struct {
 
 // Template describes one container.
 type Template struct {
-	Image       string            `yaml:"image"`
-	User        string            `yaml:"user"`
-	Command     []string          `yaml:"command"` // runner only: overrides the image's entrypoint (see defaults)
-	Env         map[string]string `yaml:"env"`
-	Binds       []string          `yaml:"binds"` // host:container[:opts], {slot} allowed in the host part
-	Privileged  bool              `yaml:"privileged"`
-	CapDrop     []string          `yaml:"cap_drop"`
-	CapAdd      []string          `yaml:"cap_add"`
-	SecurityOpt []string          `yaml:"security_opt"`
-	DNS         []string          `yaml:"dns"`
-	Memory      string            `yaml:"memory"` // e.g. 3G; a hard limit: a container that passes it is OOM-killed
+	Image      string            `yaml:"image"`
+	User       string            `yaml:"user"`
+	Command    []string          `yaml:"command"` // runner only: overrides the image's entrypoint (see defaults)
+	Env        map[string]string `yaml:"env"`
+	Binds      []string          `yaml:"binds"` // host:container[:opts], {slot} allowed in the host part
+	Privileged bool              `yaml:"privileged"`
+	// Runtime, if set, is the name of a container runtime registered with the Docker daemon (its `runtimes` setting),
+	// for example sysbox-runc (lets dind run without privileged) or runsc (gVisor). Empty means the daemon's default.
+	Runtime     string   `yaml:"runtime"`
+	CapDrop     []string `yaml:"cap_drop"`
+	CapAdd      []string `yaml:"cap_add"`
+	SecurityOpt []string `yaml:"security_opt"`
+	DNS         []string `yaml:"dns"`
+	Memory      string   `yaml:"memory"` // e.g. 3G; a hard limit: a container that passes it is OOM-killed
 	// MemoryHigh, if set (e.g. 2560M), is a soft limit below Memory (cgroup v2 memory.high): a container that passes it
 	// is slowed down by the kernel's reclaim instead of being killed. Docker has no setting for this, so the guard
 	// writes it after the container has started, from a one-shot container that mounts the host's /sys/fs/cgroup for
@@ -137,6 +140,8 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	d.Duration = v
 	return nil
 }
+
+var runtimeRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 var prefixRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
 
@@ -306,6 +311,9 @@ func (t *Template) validate(name string) []error {
 	} else if !strings.Contains(t.Image, "@sha256:") {
 		// Not fatal, but the whole point is that nothing about these containers changes behind your back.
 		fmt.Fprintf(os.Stderr, "warning: %s image %q is not pinned by digest\n", name, t.Image)
+	}
+	if t.Runtime != "" && !runtimeRE.MatchString(t.Runtime) {
+		errs = append(errs, fmt.Errorf("%s: runtime %q is not a plausible runtime name", name, t.Runtime))
 	}
 	if t.Memory != "" {
 		if _, err := ParseBytes(t.Memory); err != nil {

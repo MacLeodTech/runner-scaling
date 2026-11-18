@@ -131,7 +131,11 @@ names. The guard decodes it and requires that:
   runners (a push to any branch, a bot such as Dependabot, a stolen token) can run code as root on the host, and so
   can anyone who holds the scaler's GitHub credential (they can create a repo and a workflow of their own). That is
   the cost of letting jobs run `docker build`. Drop the `dind:` section if your jobs don't need Docker, and use a
-  Docker-less pool for everything else.
+  Docker-less pool for everything else. To narrow it, run the sidecar under a runtime that makes "privileged"
+  harmless to the host: install [Sysbox](https://github.com/nestybox/sysbox) (or another OCI runtime) on the host,
+  register it with the Docker daemon, set `runtime: sysbox-runc` on `dind` and drop `privileged`. The guard only
+  passes the name through to Docker; it hasn't been tested against any particular runtime, so try one on a
+  throwaway host before relying on it.
 - **Only run jobs from repos you trust.** On GitHub, limit the runner group to private repos, disable fork PR
   workflows (or require approval), keep bot PRs off the Docker pool, and fence the per-slot subnets with a host
   firewall so jobs reach only the internet. On plans without branch protection, any branch can change a workflow.
@@ -424,7 +428,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `start_timeout` | how long a slot may take to come up (default 2m) |
 | `max_runtime` | the reaper removes a runner that runs longer than this (default: no limit) |
 | `reap_interval` | how often exited runners are cleaned up (default 5s) |
-| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
+| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `runtime`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
 
 Omit `dind` for runners without a private Docker daemon.
 

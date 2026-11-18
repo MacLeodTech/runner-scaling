@@ -11,6 +11,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ### Added
 
+- **`runtime:`** on `runner` and `dind`: the name of an OCI runtime registered with Docker (Sysbox, gVisor), so the
+  dind sidecar can run without `privileged`. Passed through as-is; untested against a real runtime so far.
 - **Gate watch.** The guard now notices when `require_file` vanishes while slots are running (the firewall lost its
   rules): one `GATE WITHDRAWN` error line and a `gate_withdrawn_total` count per outage. Running jobs are left alone.
 - **Runner image check.** `scripts/check-runner-image.sh guard.yaml [...]` compares the runner version inside each
