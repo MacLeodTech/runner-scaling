@@ -27,8 +27,8 @@ func build(t *testing.T, files map[string]string) string {
 const tenant = "https://pipelinesghubeus22.actions.githubusercontent.com/TENANTabc123/"
 
 // Shaped like a real config from GitHub (November 2026), with made-up values.
-const goodRunner = `{"AgentId":42,"AgentName":"homelab-1-ab12cd","DisableUpdate":true,"Ephemeral":true,"PoolId":1,
- "PoolName":"Default","RunnerScaleSetId":1,"RunnerScaleSetName":"homelab",
+const goodRunner = `{"AgentId":42,"AgentName":"ci-1-ab12cd","DisableUpdate":true,"Ephemeral":true,"PoolId":1,
+ "PoolName":"Default","RunnerScaleSetId":1,"RunnerScaleSetName":"ci",
  "ServerUrl":"https://pipelinesghubeus22.actions.githubusercontent.com/TENANTabc123/",
  "ServerUrlV2":"https://broker.actions.githubusercontent.com/","UseV2Flow":true,"WorkFolder":"/tmp/runner"}`
 
@@ -37,7 +37,7 @@ const goodCreds = `{"Scheme":"OAuth","Data":{"ClientId":"x",
 
 const goodRSA = `{"d":"AA==","dp":"AA==","dq":"AA==","exponent":"AQAB","inverseQ":"AA==","modulus":"AA==","p":"AA==","q":"AA=="}`
 
-var expect = Expect{TenantURL: tenant, RunnerName: "homelab-1-ab12cd", WorkFolder: "/tmp/runner"}
+var expect = Expect{TenantURL: tenant, RunnerName: "ci-1-ab12cd", WorkFolder: "/tmp/runner"}
 
 func good(t *testing.T) map[string]string {
 	return map[string]string{".runner": goodRunner, ".credentials": goodCreds, ".credentials_rsaparams": goodRSA}
@@ -92,8 +92,8 @@ func TestValidateRejects(t *testing.T) {
 		"broker port":       with(".runner", "broker.actions.githubusercontent.com/", "broker.actions.githubusercontent.com:8443/"),
 		"http":              with(".runner", "https://broker", "http://broker"),
 		"userinfo":          with(".runner", "https://broker", "https://u:p@broker"),
-		"wrong name":        with(".runner", "homelab-1-ab12cd", "homelab-2-ab12cd"),
-		"no name":           with(".runner", `"AgentName":"homelab-1-ab12cd",`, ""),
+		"wrong name":        with(".runner", "ci-1-ab12cd", "ci-2-ab12cd"),
+		"no name":           with(".runner", `"AgentName":"ci-1-ab12cd",`, ""),
 		"workfolder":        with(".runner", `"/tmp/runner"`, `"/"`),
 		"url in rsa params": with(".credentials_rsaparams", `"AA=="`, `"https://evil.example/"`),
 		"non-json file":     build(t, map[string]string{".runner": goodRunner, "extra": "plain text"}),
@@ -120,7 +120,7 @@ func TestBadTenantConfig(t *testing.T) {
 
 func TestShapeHasNoSecrets(t *testing.T) {
 	s := Shape(build(t, good(t)))
-	for _, secret := range []string{"TENANTabc123", "AQAB", "homelab-1-ab12cd"} {
+	for _, secret := range []string{"TENANTabc123", "AQAB", "ci-1-ab12cd"} {
 		if strings.Contains(s, secret) {
 			t.Errorf("Shape leaks %q: %s", secret, s)
 		}
