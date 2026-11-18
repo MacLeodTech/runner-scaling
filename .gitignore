@@ -3,3 +3,6 @@
 .env*
 !.env.example
 examples/*.local.*
+
+# Private notes, never committed
+/ROADMAP.md
