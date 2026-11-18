@@ -8,7 +8,7 @@ is thrown away. Nothing runs while nothing is queued. The scaler is built on Git
 [`actions/scaleset`](https://github.com/actions/scaleset) client, the same runner scale set API that
 Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's no webhook endpoint to expose.
 
-> Status: early (0.x). The scale set API and the `actions/scaleset` module are in public preview.
+> Status: early (0.x); see the [changelog](CHANGELOG.md). The scale set API and the `actions/scaleset` module are in public preview.
 
 ## How it works
 
@@ -170,10 +170,38 @@ names. The guard decodes it and requires that:
 4. **Pin the tenant.** The first runner request is refused with
    `DENY ... no tenant_url pinned: this config's ServerUrl is "https://…/<tenant>/"`. Check it, put it in
    `tenant_url`, and restart the guard.
-5. **Fence the slot networks (recommended).** Give `subnet` a fixed range and add host firewall rules, in Docker's
-   `DOCKER-USER` chain, so jobs reach the internet but not your LAN or the host. Set `require_file` to a file your
-   firewall script creates (on a tmpfs), and the guard won't start a slot until the rules are in place.
+5. **Fence the slot networks (recommended).** Give `subnet` a fixed range and run the [firewall](#firewall)
+   sidecar, so jobs reach the internet but not your LAN or the host. Set `require_file` to its gate file, and the
+   guard won't start a slot until the rules are in place.
 6. **Target it from workflows** with the scale set's labels, for example `runs-on: [self-hosted, ci]`.
+7. **Optional: a second pool without Docker.** See [Several pools](#operations) and
+   [examples/guard-lite.yaml](examples/guard-lite.yaml).
+
+### Firewall
+
+A job can talk to anything its network can reach. With the default Docker bridge setup that includes your LAN, the
+host's own services and the other slots. The fence closes that: runner networks reach the internet and nothing else.
+
+[examples/firewall.sh](examples/firewall.sh) is a small sidecar that does it with `iptables` and is wired into
+[examples/compose.yaml](examples/compose.yaml):
+
+- **Rules.** A chain `GH_RUNNERS` is hooked into `DOCKER-USER` (traffic the runners send through the host) and
+  `INPUT` (traffic aimed at the host itself). Traffic from the fenced range to private and link-local addresses
+  (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`) is dropped, and the rest goes through to Docker's
+  normal handling. Replies to connections the host opened still work.
+- **Range.** `FENCE_SRC` (default `172.30.0.0/16`) must contain every guard's `subnet`. This is why `subnet` has a
+  fixed value: with `subnet` empty Docker picks ranges the fence can't know about.
+- **Gate.** After the rules are in place the script creates a file (`/gate/firewall-ok`, on a tmpfs volume).
+  Set `require_file` to it in every guard: no slot starts without it, so a reboot can't start an unfenced runner
+  before the rules are back.
+- **Upkeep.** Every 30 seconds it re-checks the rules and re-applies any that are missing. If it can't, it removes the
+  gate, so no new slot starts. Runners that are already running stay unfenced until the rules return (up to 30
+  seconds after something flushes them).
+- **Limits.** It needs host networking, `NET_ADMIN`, and a Docker that uses `iptables` and the `DOCKER-USER` chain.
+  Docker's nftables firewall backend has no such chain and isn't supported.
+
+Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` should time out, and
+`curl https://github.com` should work.
 
 ### Scaler flags (or environment)
 
@@ -201,15 +229,23 @@ names. The guard decodes it and requires that:
 - **Remove everything.** Stop the scaler, then
   `docker rm -f $(docker ps -aq -f label=io.github.runner-scaling.instance=<prefix>)`.
   To remove the scale set from GitHub too: `runner-scaling scaler --delete-scale-set`.
+- **Changing labels.** The scaler keeps the scale set's labels in step with `--labels`. GitHub accepts a label
+  update on an existing scale set and ignores it, so when the labels change the scaler deletes the scale set and
+  creates it again (with a new id). Runners already started for the old one finish their jobs. Renaming `--name` creates a second scale set and leaves the first behind: remove it with
+  `--delete-scale-set`.
 - **Several pools.** Run one guard + scaler pair per kind of runner, each with its own `prefix`, subnets, API
   socket and labels: for example one with a `dind:` section for jobs that build images, and a lighter one without
-  for everything else. Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
+  for everything else ([examples/guard-lite.yaml](examples/guard-lite.yaml) and
+  [examples/compose.yaml](examples/compose.yaml) show both). Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
   no network, no other mounts).
 - **One memory budget for all runners.** Set `memory_budget` (e.g. `8G`) and `memory_reserve` (default `1G`, the
   assumed minimum size of one slot) in every pool's guard config, with the same values. The guard measures the working
   set of every runner-scaling container on the host (all pools, found by label) through the Docker API. It starts a
   new slot only if measured use, counting each slot as at least the reserve, plus the reserve fits the budget;
-  otherwise the scaler is told to retry on its next poll. If measured use stays over the budget for three checks in a
+  otherwise the scaler is told to retry on its next poll. A slot counts as its measured use but at least the reserve,
+  and for `memory_ramp` (default 2m) after its containers were created, at least `memory_ramp_share` (default half)
+  of their memory limits: a job that has just started looks light and then grows, so a burst of new jobs isn't
+  admitted against memory they haven't used yet, while settled light jobs pack tightly. If measured use stays over the budget for three checks in a
   row, the guard removes its newest runner. This is enforced in the guard, so it needs no host or systemd setup, but it
   is a polling limit: a sudden spike can briefly overshoot, so keep the per-container `memory` limits as the hard
   stop. The guard rejects a config where one slot's `memory` limits add up to more than the budget (that slot could never
@@ -219,6 +255,27 @@ names. The guard decodes it and requires that:
   the first container exists; the backstop covers that. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
+
+### Slow a job down instead of killing it (`memory_high`)
+
+`memory` is a hard limit: a container that passes it is OOM-killed, and so is its job. Set `memory_high` below it
+(for example `memory: 3G`, `memory_high: 2560M`) and a container that passes `memory_high` is slowed by the kernel's
+memory reclaim instead, which usually lets a short spike pass. It is the cgroup v2 `memory.high` setting. It is optional and
+off unless you set it on `runner` or `dind`.
+
+Docker has no setting for it (the Engine API ignores cgroup v2 `Unified` values), so the guard writes it after the
+container has started, from a one-shot container: no network, all capabilities dropped but two, and the host's
+`/sys/fs/cgroup` mounted read-write for that one write. The guard container itself gets no cgroup access. The one-shot
+finds each container's cgroup by its id, wherever `cgroup_parent` puts it. This needs cgroup v2 and a runner image
+with `sh` and `find`. It is best effort: if the write fails, the guard logs `memory_high not applied` and the job runs
+with the hard limit alone.
+
+How it behaves: a container that grows past `memory_high` is held there, and the kernel pushes the excess to swap
+and throttles the allocating process. Tested with a 512M hard limit and a 256M `memory_high`: use stayed at about 256M,
+the rest went to swap, and nothing was killed until the swap allowance (by default as large as `memory`) ran out. That
+means the throttle needs swap on the host to work: with none, the excess is all that reclaim has to work with and the
+container ends up in the same place as without it. Pick a value that leaves headroom: a job held at `memory_high` runs
+slowly rather than failing, so a job that really needs more will crawl until it hits the hard limit or `max_runtime`.
 
 ### Dashboard
 
@@ -284,12 +341,13 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `work_bind` | host directory (`{slot}` required) to use as `work_dir` instead of a Docker volume |
 | `cache_dirs` | host directories (`{slot}` required) emptied after untrusted jobs |
 | `memory_budget`, `memory_reserve` | host-wide memory cap and per-slot admission estimate |
+| `memory_ramp`, `memory_ramp_share` | how long a new slot counts at a share of its memory limits (default `2m`, `0.5`; `0s` turns the ramp off) |
 | `cgroup_parent` | put all runner containers under one cgroup you can cap with systemd |
 | `require_file` | the guard starts no slot until this file exists (a gate for a host firewall) |
 | `start_timeout` | how long a slot may take to come up (default 2m) |
 | `max_runtime` | the reaper removes a runner that runs longer than this (default: no limit) |
 | `reap_interval` | how often exited runners are cleaned up (default 5s) |
-| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
+| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
 
 Omit `dind` for runners without a private Docker daemon.
 

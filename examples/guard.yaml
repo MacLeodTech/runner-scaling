@@ -9,11 +9,14 @@ github_url: https://github.com/YOUR-ORG          # or https://github.com/OWNER/R
 
 prefix: ci                    # names containers ci-runner-N, ci-dind-N, networks ci-slot-N, runners ci-N-xxxxxx
 max_slots: 2
-subnet: 172.30.{slot}.0/24    # optional: fixed per-slot subnets, so a host firewall can fence them
-# max_runtime: 6h             # optional: the reaper removes a runner that has run longer than this (min 1m, default off)
-# memory_budget: 8G           # optional: cap on the memory working set of ALL runner-scaling containers on this host.
+subnet: 172.30.{slot}.0/24    # fixed per-slot subnets, so the host firewall (firewall.sh) can fence them
+require_file: /gate/firewall-ok   # the guard starts no slot until firewall.sh has put the fence up; drop it if you run no fence
+max_runtime: 6h             # optional: the reaper removes a runner that has run longer than this (min 1m, default off)
+memory_budget: 8G           # optional: cap on the memory working set of ALL runner-scaling containers on this host.
 #                             # Shared by every pool: give every guard the same value. New slots wait (503) when full.
-# memory_reserve: 1G          # assumed minimum per slot (runner+dind) for admission; default 1G with memory_budget
+# memory_ramp: 2m             # optional: a new slot counts at memory_ramp_share (default 0.5) of its limits this long
+#                             # (default 2m; 0s = off), so a burst of fresh jobs isn't admitted against memory they haven't used yet
+memory_reserve: 1G          # assumed minimum per slot (runner+dind) for admission; default 1G with memory_budget
 # cache_dirs:                 # optional: warm caches that are emptied when a slot is torn down, unless the scaler vouches
 #   - /srv/runner-scaling/{slot}/toolcache   # for the job (a push/schedule/dispatch/release on CACHE_TRUSTED_REFS,
 #   - /srv/runner-scaling/{slot}/docker      # default refs/heads/main). Also emptied at guard startup. List every cache bind.
@@ -24,7 +27,8 @@ runner:
   command: [/home/runner/run.sh]
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
-  memory: 4G
+  memory: 4G                  # hard limit: past it the container is OOM-killed
+  # memory_high: 3G           # optional soft limit: past it the container is slowed down instead (see the README)
   cpus: 2
   # cpu_shares: 512           # optional relative CPU weight vs other host workloads (Docker default 1024; 2..262144)
   pids: 2048

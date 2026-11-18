@@ -9,6 +9,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -42,7 +45,11 @@ type Scaler struct {
 	TrustedRefs []string
 	// Dash, if set, records every message for the dashboard. It never influences scaling.
 	Dash *dashboard.Tracker
+	// RetryDelay is how long to wait before retrying a failed start without a new message from GitHub (default 15s).
+	RetryDelay time.Duration
 
+	mu           sync.Mutex // serialises Scale and the retry timer
+	retry        *time.Timer
 	busy         map[string]bool // runners that have started a job
 	lastAssigned int
 }
@@ -52,6 +59,12 @@ var _ listener.Scaler = (*Scaler)(nil)
 // Scale handles one poll. It only returns an error when the guard can't be reached, which stops the listener (and
 // the process, so the container restarts). Everything else is logged and retried on the next poll.
 func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scale(ctx, msg)
+}
+
+func (s *Scaler) scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
 	if s.busy == nil {
 		s.busy = map[string]bool{}
 	}
@@ -89,9 +102,7 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 			// slot sooner. A job that was cancelled before it reached a runner has no runner name.
 			for _, sl := range slots {
 				if j.RunnerName != "" && sl.RunnerName == j.RunnerName {
-					if err := s.Guard.Stop(ctx, sl.Slot); err != nil {
-						s.Log.Warn("stop slot", "slot", sl.Slot, "err", err)
-					}
+					s.stopAsync(ctx, sl.Slot)
 				}
 			}
 		}
@@ -155,15 +166,26 @@ func (s *Scaler) converge(ctx context.Context, assigned int) error {
 		}
 		need := target - current
 		s.Log.Info("scaling up", "current", current, "target", target)
-		for n := 1; n <= s.Info.MaxSlots && need > 0; n++ {
-			if used[n] {
-				continue
+		var free []int
+		for n := 1; n <= s.Info.MaxSlots && len(free) < need; n++ {
+			if !used[n] {
+				free = append(free, n)
 			}
-			if err := s.startSlot(ctx, n); err != nil {
-				s.Log.Error("start slot", "slot", n, "err", err)
-				return nil // try again on the next poll
-			}
-			need--
+		}
+		// Each start waits for dind to be healthy, so run them side by side.
+		var wg sync.WaitGroup
+		var failed atomic.Bool
+		for _, n := range free {
+			wg.Go(func() {
+				if err := s.startSlot(ctx, n); err != nil {
+					s.Log.Error("start slot", "slot", n, "err", err)
+					failed.Store(true)
+				}
+			})
+		}
+		wg.Wait()
+		if failed.Load() {
+			s.scheduleRetry(ctx)
 		}
 	case target < current:
 		// Only idle runners go: one that is mid-job finishes, exits and is reaped.
@@ -181,6 +203,47 @@ func (s *Scaler) converge(ctx context.Context, assigned int) error {
 		}
 	}
 	return nil
+}
+
+// stopAsync frees a slot in the background: the guard's wipe and prune can take minutes and Scale shouldn't wait
+// for them. The slot counts as occupied until it is gone, so converge runs again once the stop has finished.
+func (s *Scaler) stopAsync(ctx context.Context, slot int) {
+	go func() {
+		if err := s.Guard.Stop(ctx, slot); err != nil {
+			s.Log.Warn("stop slot", "slot", slot, "err", err)
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.converge(ctx, s.lastAssigned); err != nil {
+			s.Log.Warn("converge after stop", "err", err) // the next poll hits the same error and stops the listener
+		}
+	}()
+}
+
+// scheduleRetry converges again after RetryDelay, so a failed start doesn't wait for the next message from GitHub
+// (which can be close to a minute when idle). Callers hold s.mu. At most one retry is pending.
+func (s *Scaler) scheduleRetry(ctx context.Context) {
+	if s.retry != nil {
+		return
+	}
+	d := s.RetryDelay
+	if d <= 0 {
+		d = 15 * time.Second
+	}
+	s.retry = time.AfterFunc(d, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.retry = nil
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.converge(ctx, s.lastAssigned); err != nil {
+			s.Log.Warn("retry after failed start", "err", err) // the next poll hits the same error and stops the listener
+		}
+	})
 }
 
 func (s *Scaler) startSlot(ctx context.Context, n int) error {

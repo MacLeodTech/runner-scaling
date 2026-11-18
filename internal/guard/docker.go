@@ -85,6 +85,8 @@ type ContainerState struct {
 	Status   string // created, running, exited, dead, ...
 	ExitCode int
 	Health   string // "" when there is no healthcheck, else starting / healthy / unhealthy
+	// MemoryLimit is the container's memory limit in bytes, 0 for none.
+	MemoryLimit int64
 }
 
 type ContainerSummary struct {
@@ -180,7 +182,22 @@ func (d *SocketDocker) ImagePull(ctx context.Context, ref string) error {
 }
 
 func (d *SocketDocker) NetworkEnsure(ctx context.Context, name, subnet string, labels map[string]string) error {
-	if _, err := d.do(ctx, http.MethodGet, "/networks/"+name, nil, nil, nil); err == nil {
+	var existing struct {
+		IPAM struct {
+			Config []struct{ Subnet string }
+		}
+	}
+	if _, err := d.do(ctx, http.MethodGet, "/networks/"+name, nil, nil, &existing); err == nil {
+		// A network with the right name but another subnet would sit outside
+		// the firewall fence, so refuse it rather than reuse it.
+		if subnet != "" {
+			for _, c := range existing.IPAM.Config {
+				if c.Subnet == subnet {
+					return nil
+				}
+			}
+			return fmt.Errorf("network %q exists but is not on subnet %s; remove it so it can be recreated", name, subnet)
+		}
 		return nil
 	} else if !errors.Is(err, ErrNotFound) {
 		return err
@@ -226,11 +243,12 @@ func (d *SocketDocker) ContainerInspect(ctx context.Context, id string) (*Contai
 			ExitCode int
 			Health   *struct{ Status string }
 		}
+		HostConfig struct{ Memory int64 }
 	}
 	if _, err := d.do(ctx, http.MethodGet, "/containers/"+id+"/json", nil, nil, &out); err != nil {
 		return nil, err
 	}
-	st := &ContainerState{Status: out.State.Status, ExitCode: out.State.ExitCode}
+	st := &ContainerState{Status: out.State.Status, ExitCode: out.State.ExitCode, MemoryLimit: out.HostConfig.Memory}
 	if out.State.Health != nil {
 		st.Health = out.State.Health.Status
 	}

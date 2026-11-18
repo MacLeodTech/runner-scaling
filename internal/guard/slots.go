@@ -45,10 +45,10 @@ type Guard struct {
 	d   Docker
 	log *slog.Logger
 
-	admitMu    sync.Mutex // held across the memory-budget check and marking a slot as starting
-	afterAdmit func()     // test seam: runs after the budget check passes, before the slot is claimed; nil in production
-	mu         sync.Mutex
-	starting   map[int]bool
+	admitMu    sync.Mutex     // held across the memory-budget check and marking a slot as starting
+	afterAdmit func()         // test seam: runs after the budget check passes, before the slot is claimed; nil in production
+	mu         sync.Mutex     // guards starting only; never held across Docker calls that can take long
+	starting   map[int]bool   // slots in transition: being started or being torn down (List shows both as Starting)
 	keepMu     sync.Mutex     // guards keepCache and cacheDirty
 	keepCache  map[int]string // slot -> runner whose caches the scaler vouched for; consumed at teardown
 	cacheDirty map[int]bool   // slots whose caches could not be emptied
@@ -242,7 +242,7 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 	if err := g.reserveSlot(ctx, slot); err != nil {
 		return err
 	}
-	defer func() { g.mu.Lock(); delete(g.starting, slot); g.mu.Unlock() }()
+	defer g.release(slot)
 
 	ctx, cancel := context.WithTimeout(ctx, g.cfg.StartTimeout.Duration)
 	defer cancel()
@@ -337,13 +337,16 @@ func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error
 	}
 
 	extraEnv := map[string]string{}
+	high := map[string]*Template{} // container id -> template, for memory_high
 	if g.cfg.Dind != nil {
 		spec := g.spec(g.cfg.Dind, slot, netName, work, map[string]string{"DOCKER_TLS_CERTDIR": ""})
 		spec.Hostname = dindName
 		spec.Labels = g.labels(slot, "dind", "")
-		if err := g.run(ctx, dindName, spec); err != nil {
+		id, err := g.run(ctx, dindName, spec)
+		if err != nil {
 			return fmt.Errorf("dind: %w", err)
 		}
+		high[id] = g.cfg.Dind
 		if err := g.waitHealthy(ctx, dindName); err != nil {
 			return fmt.Errorf("dind: %w", err)
 		}
@@ -363,9 +366,12 @@ func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error
 	spec.Labels = g.labels(slot, "runner", req.RunnerName)
 	spec.Entrypoint = []string{"/bin/sh", "-c", entrypointWrapper, "runner-scaling"}
 	spec.Cmd = g.cfg.Runner.Command
-	if err := g.run(ctx, runnerName, spec); err != nil {
+	id, err := g.run(ctx, runnerName, spec)
+	if err != nil {
 		return fmt.Errorf("runner: %w", err)
 	}
+	high[id] = &g.cfg.Runner
+	g.applyMemoryHigh(ctx, slot, high)
 	return nil
 }
 
@@ -417,7 +423,7 @@ func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) 
 		},
 	}
 	defer g.d.ContainerRemove(context.WithoutCancel(ctx), name)
-	if err := g.run(ctx, name, spec); err != nil {
+	if _, err := g.run(ctx, name, spec); err != nil {
 		return -1, err
 	}
 	for {
@@ -438,12 +444,61 @@ func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) 
 
 func (g *Guard) wiperName(slot int) string { return g.cfg.Prefix + "-wipe-" + strconv.Itoa(slot) }
 
-func (g *Guard) run(ctx context.Context, name string, spec ContainerSpec) error {
+// run creates and starts a container and returns its id.
+func (g *Guard) run(ctx context.Context, name string, spec ContainerSpec) (string, error) {
 	id, err := g.d.ContainerCreate(ctx, name, spec)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return g.d.ContainerStart(ctx, id)
+	return id, g.d.ContainerStart(ctx, id)
+}
+
+// memoryHighScript sets memory.high on the cgroup of each container given as id=bytes. The container's cgroup has
+// the id in its name (docker-<id>.scope with Docker's systemd cgroup driver, <id> with cgroupfs), wherever the
+// cgroup_parent puts it. It fails unless every container was found and written.
+const memoryHighScript = `rc=0
+for a in "$@"; do
+  id=${a%%=*}; v=${a#*=}; found=0
+  for d in $(find /cgroup -maxdepth 6 -type d \( -name "docker-$id.scope" -o -name "$id" \)); do
+    echo "$v" > "$d/memory.high" && found=1
+  done
+  [ "$found" = 1 ] || { echo "no writable cgroup for $id" >&2; rc=1; }
+done
+exit $rc`
+
+// cgroupSafeRE limits what reaches the script's find patterns: no glob characters.
+var cgroupSafeRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// applyMemoryHigh sets the soft memory limit (memory_high) of the given containers, in one one-shot container with
+// no network that has the host's cgroup tree mounted. This is best effort: Docker has no setting for it, and the
+// hard memory limit protects the host either way, so a failure is logged and the job runs without the throttle.
+// targets maps each container id to the template that created it.
+func (g *Guard) applyMemoryHigh(ctx context.Context, slot int, targets map[string]*Template) {
+	args := []string{"sh", "-c", memoryHighScript, "sh"}
+	for _, id := range slices.Sorted(maps.Keys(targets)) {
+		t := targets[id]
+		if t.MemoryHigh == "" {
+			continue
+		}
+		high, err := ParseBytes(t.MemoryHigh) // validated at load
+		if err != nil || !cgroupSafeRE.MatchString(id) {
+			g.log.Warn("memory_high skipped", "slot", slot, "container", id)
+			continue
+		}
+		args = append(args, id+"="+strconv.FormatInt(high, 10))
+	}
+	if len(args) == 4 {
+		return
+	}
+	code, err := g.wipeOneShot(ctx, slot, args, []string{"/sys/fs/cgroup:/cgroup"})
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	if err != nil {
+		g.log.Warn("memory_high not applied: the hard memory limit still holds", "slot", slot, "err", err)
+		return
+	}
+	g.log.Info("memory_high applied", "slot", slot)
 }
 
 func (g *Guard) waitHealthy(ctx context.Context, name string) error {
@@ -527,12 +582,29 @@ func (g *Guard) Stop(ctx context.Context, slot int) error {
 	if slot < 1 || slot > g.cfg.MaxSlots {
 		return fmt.Errorf("%w: slot %d outside 1..%d", ErrBadRequest, slot, g.cfg.MaxSlots)
 	}
+	if !g.claim(slot) {
+		return fmt.Errorf("%w: slot %d is starting or stopping", ErrConflict, slot)
+	}
+	defer g.release(slot)
+	return g.teardown(ctx, slot, true, !g.takeKeep(slot))
+}
+
+// claim marks a slot as in transition so nothing else starts, stops or reaps it, and reports whether it was free.
+// The slow work (wipes, prunes) then runs without g.mu, so it can't stall Start and List for the other slots.
+func (g *Guard) claim(slot int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.starting[slot] {
-		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
+		return false
 	}
-	return g.teardown(ctx, slot, true, !g.takeKeep(slot))
+	g.starting[slot] = true
+	return true
+}
+
+func (g *Guard) release(slot int) {
+	g.mu.Lock()
+	delete(g.starting, slot)
+	g.mu.Unlock()
 }
 
 // KeepCache records that the runner on slot is running a trusted job, so teardown leaves the slot's caches alone.
@@ -651,9 +723,11 @@ func (g *Guard) WipeStale(ctx context.Context) {
 		return
 	}
 	for slot := 1; slot <= g.cfg.MaxSlots; slot++ {
-		g.mu.Lock()
+		if !g.claim(slot) {
+			continue
+		}
 		busy, err := g.slotHasContainers(ctx, slot)
-		if err == nil && !busy && !g.starting[slot] {
+		if err == nil && !busy {
 			if g.cfg.WorkBind != "" {
 				wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 				var code int
@@ -672,7 +746,7 @@ func (g *Guard) WipeStale(ctx context.Context) {
 				g.log.Info("wiped caches at startup", "slot", slot)
 			}
 		}
-		g.mu.Unlock()
+		g.release(slot)
 		if err != nil {
 			g.log.Warn("startup wipe failed", "slot", slot, "err", err)
 		}
@@ -722,15 +796,14 @@ func (g *Guard) Reap(ctx context.Context) {
 			}
 			reason = "max_runtime"
 		}
-		g.mu.Lock()
-		if !g.starting[s.Slot] {
+		if g.claim(s.Slot) {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
 			reaped[s.Slot] = true
 			if err := g.teardown(ctx, s.Slot, true, !g.takeKeep(s.Slot)); err != nil {
 				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
 			}
+			g.release(s.Slot)
 		}
-		g.mu.Unlock()
 	}
 	g.memoryBackstop(ctx, slots, starts, reaped)
 }
@@ -755,37 +828,60 @@ type slotKey struct {
 	slot     int
 }
 
+// slotLoad is one slot's memory as the admission check sees it.
+type slotLoad struct {
+	used  int64 // measured working set of its running containers
+	young int64 // memory limits of its containers that are still inside the ramp window (see memory_ramp)
+}
+
 // memoryBySlot measures the working set of every running runner-scaling container on the host, all pools together
 // (the label filter is on the key only), summed per (instance, slot).
 func (g *Guard) memoryBySlot(ctx context.Context) (map[slotKey]int64, error) {
+	loads, err := g.slotLoads(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[slotKey]int64, len(loads))
+	for k, l := range loads {
+		out[k] = l.used
+	}
+	return out, nil
+}
+
+// slotLoads is memoryBySlot plus, for containers created less than memory_ramp ago, their memory limits.
+func (g *Guard) slotLoads(ctx context.Context) (map[slotKey]slotLoad, error) {
 	cs, err := g.d.ContainerList(ctx, labelInstance)
 	if err != nil {
 		return nil, err
 	}
-	out := map[slotKey]int64{}
+	out := map[slotKey]slotLoad{}
 	for _, c := range cs {
 		n, err := strconv.Atoi(c.Labels[labelSlot])
 		if err != nil {
 			continue
 		}
-		if c.State == "created" || c.State == "restarting" {
-			// Not running yet, so nothing to measure; the slot still exists and will count as at least the reserve.
-			if _, ok := out[slotKey{c.Labels[labelInstance], n}]; !ok {
-				out[slotKey{c.Labels[labelInstance], n}] = 0
+		k := slotKey{c.Labels[labelInstance], n}
+		if c.State != "created" && c.State != "restarting" && c.State != "running" {
+			continue
+		}
+		l := out[k] // the slot exists from here on, so it counts as at least the reserve
+		if g.cfg.memRamp > 0 && c.Created > 0 && time.Since(time.Unix(c.Created, 0)) < g.cfg.memRamp {
+			// A limit we can't read is left out: the slot then counts as measured, or as the reserve.
+			if st, err := g.d.ContainerInspect(ctx, c.ID); err == nil {
+				l.young += st.MemoryLimit
 			}
-			continue
 		}
-		if c.State != "running" {
-			continue
+		if c.State == "running" { // created or restarting: nothing to measure yet
+			m, err := g.d.ContainerMemory(ctx, c.ID)
+			if errors.Is(err, ErrNotFound) {
+				continue // gone since the list
+			}
+			if err != nil {
+				return nil, err
+			}
+			l.used += m
 		}
-		m, err := g.d.ContainerMemory(ctx, c.ID)
-		if errors.Is(err, ErrNotFound) {
-			continue // gone since the list
-		}
-		if err != nil {
-			return nil, err
-		}
-		out[slotKey{c.Labels[labelInstance], n}] += m
+		out[k] = l
 	}
 	return out, nil
 }
@@ -796,7 +892,7 @@ func (g *Guard) admit(ctx context.Context, slot int) error {
 	if g.cfg.memBudget <= 0 {
 		return nil
 	}
-	by, err := g.memoryBySlot(ctx)
+	by, err := g.slotLoads(ctx)
 	if err != nil {
 		g.log.Warn("memory budget: cannot read stats, admitting", "slot", slot, "err", err)
 		return nil
@@ -805,13 +901,15 @@ func (g *Guard) admit(ctx context.Context, slot int) error {
 	g.mu.Lock()
 	for n := range g.starting {
 		if _, ok := by[slotKey{g.cfg.Prefix, n}]; !ok && n != slot {
-			by[slotKey{g.cfg.Prefix, n}] = 0
+			by[slotKey{g.cfg.Prefix, n}] = slotLoad{}
 		}
 	}
 	g.mu.Unlock()
+	// A slot counts as its measured use, but at least the reserve, and while its containers are young at least a
+	// share of their limits: they look light now and will grow.
 	var total int64
-	for _, m := range by {
-		total += max(m, g.cfg.memReserve)
+	for _, l := range by {
+		total += max(l.used, g.cfg.memReserve, int64(float64(l.young)*g.cfg.memRampShare))
 	}
 	if total+g.cfg.memReserve > g.cfg.memBudget {
 		return fmt.Errorf("%w: memory budget: %s in use of %s, need %s reserve", ErrNotReady,
@@ -859,15 +957,14 @@ func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map
 			victim = s
 		}
 	}
-	g.mu.Lock()
-	if !g.starting[victim.Slot] {
+	if g.claim(victim.Slot) {
 		g.log.Info("reaping slot", "slot", victim.Slot, "runner", victim.RunnerName, "runner_state", victim.RunnerState,
 			"reason", "memory_budget", "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
 		if err := g.teardown(ctx, victim.Slot, true, true); err != nil {
 			g.log.Error("reap: teardown", "slot", victim.Slot, "err", err)
 		}
+		g.release(victim.Slot)
 	}
-	g.mu.Unlock()
 }
 
 // fmtBytes renders sizes like 6.1G, 512M.

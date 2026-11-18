@@ -12,6 +12,7 @@
 //   - the config decodes and stays under a size limit,
 //   - .runner's ServerUrl is under the pinned tenant URL,
 //   - every URL anywhere in the config is https and either under the tenant URL or on a shared host (the broker),
+//   - every file name is a plain name (no path separators), since the runner writes the files by name,
 //   - .runner names the runner the scaler asked for, and its work folder is the one the guard mounts.
 package jit
 
@@ -103,6 +104,10 @@ func decode(encoded string) (map[string]any, error) {
 	}
 	docs := make(map[string]any, len(files))
 	for name, b64 := range files {
+		// The names are files the runner writes into its directory: plain names only, never a path out of it.
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+			return nil, fmt.Errorf("jit file name %q is not a plain file name", name)
+		}
 		content, err := base64.StdEncoding.DecodeString(b64)
 		if err != nil {
 			return nil, fmt.Errorf("jit file %q is not base64: %w", name, err)

@@ -64,6 +64,14 @@ type Config struct {
 	// MemoryReserve is the assumed minimum footprint of one slot (runner and dind together) for admission, so slots
 	// that have just started and not ramped up are not counted as nearly empty. Default 1G with memory_budget.
 	MemoryReserve string `yaml:"memory_reserve"`
+	// MemoryRamp is how long after a container is created its slot counts at least MemoryRampShare of the
+	// container's memory limit, instead of the (smaller) measured use, when admitting new slots. A job that has just
+	// started looks light and then grows, so without this a burst of jobs is admitted against memory they have yet to
+	// use. Default 2m with memory_budget; 0 turns it off. Measured use takes over once the ramp is over, so settled
+	// light jobs pack tightly.
+	MemoryRamp *Duration `yaml:"memory_ramp"`
+	// MemoryRampShare is the fraction of a young container's memory limit to assume, 0 < share <= 1. Default 0.5.
+	MemoryRampShare float64 `yaml:"memory_ramp_share"`
 	// RequireFile, if set, must exist before the guard starts any slot: a gate for something that must happen first,
 	// such as a host firewall that fences the slot subnets. Put it on a tmpfs so it is gone after a reboot.
 	RequireFile string `yaml:"require_file"`
@@ -75,6 +83,8 @@ type Config struct {
 	ReapInterval Duration `yaml:"reap_interval"`
 
 	memBudget, memReserve int64 // parsed MemoryBudget and MemoryReserve
+	memRamp               time.Duration
+	memRampShare          float64
 
 	Runner Template  `yaml:"runner"`
 	Dind   *Template `yaml:"dind"` // optional: omit for runners without a private Docker daemon
@@ -92,13 +102,18 @@ type Template struct {
 	CapAdd      []string          `yaml:"cap_add"`
 	SecurityOpt []string          `yaml:"security_opt"`
 	DNS         []string          `yaml:"dns"`
-	Memory      string            `yaml:"memory"` // e.g. 3G
-	CPUs        float64           `yaml:"cpus"`
-	CPUShares   int64             `yaml:"cpu_shares"` // relative CPU weight against other host workloads (Docker default 1024), 2..262144
-	Pids        int64             `yaml:"pids"`
-	Health      *Health           `yaml:"healthcheck"`
-	Log         map[string]string `yaml:"log_opts"` // json-file options
-	Labels      map[string]string `yaml:"labels"`   // extra container labels; the guard's own io.github.runner-scaling.* labels win
+	Memory      string            `yaml:"memory"` // e.g. 3G; a hard limit: a container that passes it is OOM-killed
+	// MemoryHigh, if set (e.g. 2560M), is a soft limit below Memory (cgroup v2 memory.high): a container that passes it
+	// is slowed down by the kernel's reclaim instead of being killed. Docker has no setting for this, so the guard
+	// writes it after the container has started, from a one-shot container that mounts the host's /sys/fs/cgroup for
+	// that moment only. Optional; if the write fails the job runs with the hard limit alone.
+	MemoryHigh string            `yaml:"memory_high"`
+	CPUs       float64           `yaml:"cpus"`
+	CPUShares  int64             `yaml:"cpu_shares"` // relative CPU weight against other host workloads (Docker default 1024), 2..262144
+	Pids       int64             `yaml:"pids"`
+	Health     *Health           `yaml:"healthcheck"`
+	Log        map[string]string `yaml:"log_opts"` // json-file options
+	Labels     map[string]string `yaml:"labels"`   // extra container labels; the guard's own io.github.runner-scaling.* labels win
 	// PruneOnStop runs these commands in the container before it is removed (dind only), e.g. to trim build cache.
 	PruneOnStop [][]string `yaml:"prune_on_stop"`
 }
@@ -225,7 +240,7 @@ func (c *Config) Validate() error {
 	if c.MaxRuntime.Duration < 0 || (c.MaxRuntime.Duration > 0 && c.MaxRuntime.Duration < time.Minute) {
 		errs = append(errs, errors.New("max_runtime must be 0 (disabled) or at least 1m"))
 	}
-	c.memBudget, c.memReserve = 0, 0
+	c.memBudget, c.memReserve, c.memRamp, c.memRampShare = 0, 0, 0, 0
 	if c.MemoryBudget != "" {
 		b, err := ParseBytes(c.MemoryBudget)
 		if err != nil {
@@ -241,11 +256,24 @@ func (c *Config) Validate() error {
 			errs = append(errs, errors.New("memory_reserve must not exceed memory_budget"))
 		}
 		c.memBudget, c.memReserve = b, r
+		c.memRamp, c.memRampShare = 2*time.Minute, 0.5
+		if c.MemoryRamp != nil {
+			c.memRamp = c.MemoryRamp.Duration
+		}
+		if c.MemoryRampShare != 0 {
+			c.memRampShare = c.MemoryRampShare
+		}
+		if c.memRamp < 0 || c.memRamp > time.Hour {
+			errs = append(errs, errors.New("memory_ramp must be between 0 (off) and 1h"))
+		}
+		if c.memRampShare <= 0 || c.memRampShare > 1 {
+			errs = append(errs, errors.New("memory_ramp_share must be above 0 and at most 1"))
+		}
 		if b > 0 {
 			errs = append(errs, c.budgetFit(b)...)
 		}
-	} else if c.MemoryReserve != "" {
-		errs = append(errs, errors.New("memory_reserve needs memory_budget"))
+	} else if c.MemoryReserve != "" || c.MemoryRamp != nil || c.MemoryRampShare != 0 {
+		errs = append(errs, errors.New("memory_reserve, memory_ramp and memory_ramp_share need memory_budget"))
 	}
 	if c.CgroupParent != "" && !regexp.MustCompile(`^([A-Za-z0-9_-]+\.slice|/[A-Za-z0-9_./-]+)$`).MatchString(c.CgroupParent) {
 		errs = append(errs, errors.New("cgroup_parent must be a systemd slice (name.slice) or an absolute cgroup path"))
@@ -282,6 +310,18 @@ func (t *Template) validate(name string) []error {
 	if t.Memory != "" {
 		if _, err := ParseBytes(t.Memory); err != nil {
 			errs = append(errs, fmt.Errorf("%s: memory: %w", name, err))
+		}
+	}
+	if t.MemoryHigh != "" {
+		high, err := ParseBytes(t.MemoryHigh)
+		limit, lerr := ParseBytes(t.Memory)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: memory_high: %w", name, err))
+		case t.Memory == "" || lerr != nil:
+			errs = append(errs, fmt.Errorf("%s: memory_high needs a valid memory limit above it", name))
+		case high <= 0 || high >= limit:
+			errs = append(errs, fmt.Errorf("%s: memory_high (%s) must be above 0 and below memory (%s)", name, t.MemoryHigh, t.Memory))
 		}
 	}
 	if t.CPUShares != 0 && (t.CPUShares < 2 || t.CPUShares > 262144) {

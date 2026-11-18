@@ -119,7 +119,10 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	go g.ReapLoop(ctx)
 
 	_ = os.Remove(*socket)
+	// Create the socket closed to everyone but its owner; it is opened to its group below, after chown.
+	oldMask := syscall.Umask(0o177)
 	ln, err := net.Listen("unix", *socket)
+	syscall.Umask(oldMask)
 	if err != nil {
 		return err
 	}
@@ -135,7 +138,7 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	if err := os.Chmod(*socket, os.FileMode(m)); err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: g.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: g.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
 	log.Info("guard listening", "socket", *socket, "prefix", cfg.Prefix, "max_slots", cfg.MaxSlots, "version", version)
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {

@@ -27,20 +27,22 @@ import (
 
 // fakeDocker keeps containers in memory.
 type fakeDocker struct {
-	mu         sync.Mutex
-	containers map[string]*fakeContainer // by name
-	volumes    map[string]bool
-	networks   map[string]string
-	execs      [][]string
-	pulled     []string
-	dindHealth string
-	wipes      []ContainerSpec
-	wipeExit   int              // exit code of one-shot wipers
-	mem        map[string]int64 // by container name
-	memErr     error
-	memCalls   int
-	cpu        map[string]int64 // cumulative CPU ns by container name
-	statCalls  int
+	mu          sync.Mutex
+	containers  map[string]*fakeContainer // by name
+	volumes     map[string]bool
+	networks    map[string]string
+	execs       [][]string
+	pulled      []string
+	dindHealth  string
+	wipes       []ContainerSpec
+	wipeExit    int              // exit code of one-shot wipers
+	mem         map[string]int64 // by container name
+	memErr      error
+	memCalls    int
+	cpu         map[string]int64 // cumulative CPU ns by container name
+	statCalls   int
+	execGate    chan struct{} // if set, Exec blocks until it is closed (to hold a teardown mid-prune)
+	execEntered chan struct{} // if set, receives one value when Exec is reached
 }
 
 type fakeContainer struct {
@@ -105,7 +107,7 @@ func (f *fakeDocker) ContainerInspect(_ context.Context, id string) (*ContainerS
 	if c == nil {
 		return nil, ErrNotFound
 	}
-	st := &ContainerState{Status: c.state}
+	st := &ContainerState{Status: c.state, MemoryLimit: c.spec.HostConfig.Memory}
 	if c.spec.Labels[labelRole] == "wipe" {
 		st.ExitCode = f.wipeExit
 	}
@@ -149,6 +151,12 @@ func (f *fakeDocker) ContainerStats(_ context.Context, id string) (ContainerUsag
 	return ContainerUsage{MemBytes: f.mem[id], CPUNanos: f.cpu[id], PIDs: 3, NetRx: 10, NetTx: 20, BlkRead: 1, BlkWrite: 2}, nil
 }
 func (f *fakeDocker) Exec(_ context.Context, _ string, cmd []string) (int, error) {
+	if f.execEntered != nil {
+		f.execEntered <- struct{}{}
+	}
+	if f.execGate != nil {
+		<-f.execGate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.execs = append(f.execs, cmd)
@@ -381,9 +389,24 @@ func TestParseBytes(t *testing.T) {
 	}
 }
 
-func TestExampleConfigLoads(t *testing.T) {
-	if _, err := LoadConfig("../../examples/guard.yaml"); err != nil {
+func TestExampleConfigsLoad(t *testing.T) {
+	main, err := LoadConfig("../../examples/guard.yaml")
+	if err != nil {
 		t.Fatal(err)
+	}
+	lite, err := LoadConfig("../../examples/guard-lite.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.Dind == nil || lite.Dind != nil {
+		t.Errorf("main pool should have dind and lite should not: %v, %v", main.Dind != nil, lite.Dind != nil)
+	}
+	// Two pools on one host: they must not share names or overlap, and must share the memory budget.
+	if main.Prefix == lite.Prefix || main.Subnet == lite.Subnet {
+		t.Errorf("pools collide: %q/%q, %q/%q", main.Prefix, lite.Prefix, main.Subnet, lite.Subnet)
+	}
+	if main.MemoryBudget != lite.MemoryBudget || main.RequireFile != lite.RequireFile {
+		t.Errorf("pools disagree on the shared budget or gate")
 	}
 }
 
@@ -760,6 +783,13 @@ func TestMemoryAndCPUConfigValidation(t *testing.T) {
 		{"bad budget", "prefix: ci", "prefix: ci\nmemory_budget: lots", false},
 		{"bad reserve", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_reserve: x", false},
 		{"reserve without budget", "prefix: ci", "prefix: ci\nmemory_reserve: 1G", false},
+		{"ramp off", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: 0s", true},
+		{"ramp and share", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: 5m\nmemory_ramp_share: 0.75", true},
+		{"ramp negative", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: -1m", false},
+		{"ramp too long", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: 2h", false},
+		{"share over 1", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp_share: 1.5", false},
+		{"share negative", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp_share: -0.5", false},
+		{"ramp without budget", "prefix: ci", "prefix: ci\nmemory_ramp: 1m", false},
 		{"cpu_shares ok", "  cpus: 2", "  cpus: 2\n  cpu_shares: 512", true},
 		{"cpu_shares 1", "  cpus: 2", "  cpus: 2\n  cpu_shares: 1", false},
 		{"cpu_shares huge", "  cpus: 2", "  cpus: 2\n  cpu_shares: 262145", false},
@@ -1018,5 +1048,182 @@ func TestListWithStatsSumsContainersAndComputesCPU(t *testing.T) {
 	second, _ := g.ListWithStats(context.Background())
 	if c := second[0].Stats.CPUPercent; c <= 5 || c > 60 {
 		t.Errorf("cpu%% = %v", c)
+	}
+}
+
+func TestSlowStopDoesNotBlockOtherSlots(t *testing.T) {
+	g, f := newGuard(t)
+	ctx := context.Background()
+	org := "https://github.com/example-org"
+	for _, n := range []int{1, 2} {
+		name := fmt.Sprintf("ci-%d-abcd12", n)
+		if err := g.Start(ctx, n, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, org)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.execGate, f.execEntered = make(chan struct{}), make(chan struct{}, 1)
+	stopped := make(chan error, 1)
+	go func() { stopped <- g.Stop(ctx, 1) }()
+	<-f.execEntered // slot 1's teardown is now stuck in its prune
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		slots, err := g.List(ctx)
+		if err != nil || len(slots) != 2 || !slots[0].Starting || slots[1].Starting {
+			t.Errorf("List during stop: %+v, %v", slots, err)
+		}
+		name := "ci-3-abcd12"
+		if err := g.Start(ctx, 3, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, org)}); err != nil {
+			t.Errorf("Start of another slot during stop: %v", err)
+		}
+		if err := g.Stop(ctx, 1); !errors.Is(err, ErrConflict) {
+			t.Errorf("second Stop of a stopping slot: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("List/Start/Stop blocked behind a slow teardown")
+	}
+	close(f.execGate)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	if slots, _ := g.List(ctx); len(slots) != 2 || slots[0].Slot != 2 {
+		t.Errorf("after stop: %+v", slots)
+	}
+}
+
+func TestMemoryRampCountsYoungSlotsAtAShareOfTheirLimit(t *testing.T) {
+	// Two slots of another pool, each with an 8G limit but only 100M in use. Budget 8G, reserve 1G.
+	// Young: each counts max(100M, 1G, 8G*0.5) = 4G, 8G in all, so no room for another. Settled: 1G each, plenty.
+	cases := []struct {
+		name  string
+		age   time.Duration
+		extra string // appended to the config
+		ok    bool
+	}{
+		{"young slots reserve their ramp share", 10 * time.Second, "", false},
+		{"settled slots count as measured", 10 * time.Minute, "", true},
+		{"ramp off", 10 * time.Second, "memory_ramp: 0s", true},
+		{"small share", 10 * time.Second, "memory_ramp_share: 0.25", true}, // 2G each, 4G in all
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, f := newGuard(t)
+			g.cfg.MemoryBudget, g.cfg.MemoryReserve = "8G", "1G"
+			if strings.Contains(c.extra, "memory_ramp: 0s") {
+				g.cfg.MemoryRamp = &Duration{}
+			}
+			if strings.Contains(c.extra, "memory_ramp_share") {
+				g.cfg.MemoryRampShare = 0.25
+			}
+			if err := g.cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			f.mem = map[string]int64{}
+			for _, n := range []string{"1", "2"} {
+				name := "lite-runner-" + n
+				f.containers[name] = &fakeContainer{
+					state: "running", created: time.Now().Add(-c.age),
+					spec: ContainerSpec{
+						Labels:     map[string]string{labelInstance: "lite", labelSlot: n, labelRole: "runner"},
+						HostConfig: HostConfig{Memory: 8 * gib},
+					},
+				}
+				f.mem[name] = 100 << 20
+			}
+			err := startSlot(t, g, 1)
+			if (err == nil) != c.ok {
+				t.Fatalf("err=%v, want ok=%v", err, c.ok)
+			}
+			if err != nil && !errors.Is(err, ErrNotReady) {
+				t.Errorf("err: %v", err)
+			}
+		})
+	}
+}
+
+func TestMemoryRampDefaults(t *testing.T) {
+	g, _ := memGuard(t, "8G")
+	if g.cfg.memRamp != 2*time.Minute || g.cfg.memRampShare != 0.5 {
+		t.Errorf("defaults: ramp %v share %v", g.cfg.memRamp, g.cfg.memRampShare)
+	}
+}
+
+func TestMemoryHighIsAppliedFromAOneShotContainer(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.Runner.MemoryHigh, g.cfg.Dind.MemoryHigh = "2560M", "1G"
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wipes) != 1 {
+		t.Fatalf("want one one-shot container, got %d", len(f.wipes))
+	}
+	w := f.wipes[0]
+	if w.HostConfig.NetworkMode != "none" || !slices.Contains(w.HostConfig.Binds, "/sys/fs/cgroup:/cgroup") {
+		t.Errorf("one-shot should have no network and mount the cgroup tree: %+v", w.HostConfig)
+	}
+	args := strings.Join(w.Entrypoint, " ")
+	for _, want := range []string{"ci-runner-1=" + strconv.FormatInt(2560<<20, 10), "ci-dind-1=" + strconv.FormatInt(1<<30, 10)} {
+		if !strings.Contains(args, want) {
+			t.Errorf("entrypoint %q lacks %q", args, want)
+		}
+	}
+	if f.containers["ci-wipe-1"] != nil {
+		t.Error("one-shot container left behind")
+	}
+}
+
+func TestMemoryHighFailureDoesNotFailTheStart(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.Runner.MemoryHigh = "2G"
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f.wipeExit = 1 // the one-shot reports it could not write
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatalf("start failed because memory_high was not applied: %v", err)
+	}
+	if f.containers["ci-runner-1"] == nil {
+		t.Error("runner not started")
+	}
+}
+
+func TestNoMemoryHighNoOneShot(t *testing.T) {
+	g, f := newGuard(t)
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wipes) != 0 {
+		t.Errorf("one-shot container started without memory_high: %d", len(f.wipes))
+	}
+}
+
+func TestMemoryHighValidation(t *testing.T) {
+	cases := []struct {
+		name, old, new string
+		ok             bool
+	}{
+		{"below memory", "  memory: 3G", "  memory: 3G\n  memory_high: 2G", true},
+		{"equal to memory", "  memory: 3G", "  memory: 3G\n  memory_high: 3G", false},
+		{"above memory", "  memory: 3G", "  memory: 3G\n  memory_high: 4G", false},
+		{"not a size", "  memory: 3G", "  memory: 3G\n  memory_high: lots", false},
+		{"zero", "  memory: 3G", "  memory: 3G\n  memory_high: 0", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "guard.yaml")
+			if err := os.WriteFile(p, []byte(strings.Replace(testConfig, c.old, c.new, 1)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(p); (err == nil) != c.ok {
+				t.Fatalf("err = %v, want ok = %v", err, c.ok)
+			}
+		})
 	}
 }

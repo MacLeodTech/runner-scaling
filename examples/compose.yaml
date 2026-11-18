@@ -1,38 +1,90 @@
-# Example deployment: guard + scaler. Put GITHUB_TOKEN (or GITHUB_APP_*) in .env next to this file.
+# Example deployment: two pools on one host, each a guard + scaler pair, plus the firewall sidecar.
+#
+#   pool  runs-on labels              runner gets            guard config     slots
+#   main  [self-hosted, ci]           its own Docker daemon  guard.yaml       2
+#   lite  [self-hosted, ci-lite]      no Docker              guard-lite.yaml  4
+#
+# Put GITHUB_APP_* (or GITHUB_TOKEN) in .env next to this file. Both pools share one memory budget
+# (memory_budget in both guard configs). Start with `docker compose up -d`.
+name: runner-scaling
+
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+x-guard: &guard
+  <<: *hardened
+  image: ghcr.io/macleodtech/runner-scaling:0.1   # pin a digest
+  user: "0:65532"            # root for the Docker socket; group 65532 so the scaler (nonroot) can use the API socket
+  network_mode: none         # needs no network: it talks to Docker and the scaler over unix sockets
+  mem_limit: 64m
+  pids_limit: 64
+  healthcheck:
+    test: [CMD, /usr/local/bin/runner-scaling, health]
+    interval: 30s
+
+x-scaler: &scaler
+  <<: *hardened
+  image: ghcr.io/macleodtech/runner-scaling:0.1   # pin a digest
+  mem_limit: 128m
+  pids_limit: 64
+  env_file: [.env]
+
 services:
+  # Fences the runner networks and creates /gate/firewall-ok, which both guards wait for (require_file).
+  firewall:
+    <<: *hardened
+    image: docker:28-dind       # pin a digest; only used for its iptables
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    entrypoint: [/bin/sh, /fw/firewall.sh]
+    tmpfs: [/run]               # iptables' lock file
+    environment:
+      FENCE_SRC: 172.30.0.0/16  # must contain every guard's `subnet` range
+    volumes:
+      - ./firewall.sh:/fw/firewall.sh:ro
+      - gate:/gate
+    mem_limit: 32m
+    pids_limit: 32
+
   guard:
-    image: ghcr.io/macleodtech/runner-scaling:0.1   # pin a digest
+    <<: *guard
     command: [guard, --config, /etc/runner-scaling/guard.yaml]
-    restart: unless-stopped
-    user: "0:65532"            # root for the Docker socket; group 65532 so the scaler (nonroot) can use the API socket
-    network_mode: none         # needs no network: it talks to Docker and the scaler over unix sockets
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 64m
-    pids_limit: 64
     volumes:
       - ./guard.yaml:/etc/runner-scaling/guard.yaml:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - guard-api:/run/runner-scaling
-    healthcheck:
-      test: [CMD, /usr/local/bin/runner-scaling, health]
-      interval: 30s
+      - gate:/gate:ro
 
   scaler:
-    image: ghcr.io/macleodtech/runner-scaling:0.1
-    command: [scaler, --labels, "self-hosted,linux,x64,ci"]
-    restart: unless-stopped
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 128m
-    pids_limit: 64
-    env_file: [.env]
+    <<: *scaler
+    command: [scaler, --name, ci, --labels, "self-hosted,linux,x64,ci"]
     volumes:
       - guard-api:/run/runner-scaling
     depends_on:
       guard: {condition: service_healthy}
 
+  guard-lite:
+    <<: *guard
+    command: [guard, --config, /etc/runner-scaling/guard.yaml]
+    volumes:
+      - ./guard-lite.yaml:/etc/runner-scaling/guard.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - guard-lite-api:/run/runner-scaling
+      - gate:/gate:ro
+
+  scaler-lite:
+    <<: *scaler
+    command: [scaler, --name, ci-lite, --labels, "self-hosted,linux,x64,ci-lite"]
+    volumes:
+      - guard-lite-api:/run/runner-scaling
+    depends_on:
+      guard-lite: {condition: service_healthy}
+
 volumes:
   guard-api:
+  guard-lite-api:
+  gate:     # a tmpfs: empty after every reboot, so no runner starts before the fence is back
+    driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0755"}
