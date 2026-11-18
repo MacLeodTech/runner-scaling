@@ -158,6 +158,9 @@ func LoadConfig(file string) (*Config, error) {
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", file, err)
 	}
+	for _, n := range c.Notices() {
+		fmt.Fprintf(os.Stderr, "notice: %s\n", n)
+	}
 	return &c, nil
 }
 
@@ -227,6 +230,9 @@ func (c *Config) Validate() error {
 			errs = append(errs, errors.New("memory_reserve must not exceed memory_budget"))
 		}
 		c.memBudget, c.memReserve = b, r
+		if b > 0 {
+			errs = append(errs, c.budgetFit(b)...)
+		}
 	} else if c.MemoryReserve != "" {
 		errs = append(errs, errors.New("memory_reserve needs memory_budget"))
 	}
@@ -309,4 +315,46 @@ func ParseBytes(s string) (int64, error) {
 		return 0, fmt.Errorf("bad size")
 	}
 	return int64(f * mult), nil
+}
+
+// slotLimit is the most memory one slot's containers may use together, from their memory limits (0 if unlimited).
+func (c *Config) slotLimit() (limit int64, unlimited bool) {
+	ts := []*Template{&c.Runner}
+	if c.Dind != nil {
+		ts = append(ts, c.Dind)
+	}
+	for _, t := range ts {
+		if t.Memory == "" {
+			return 0, true
+		}
+		n, _ := ParseBytes(t.Memory) // validated by Template.validate
+		limit += n
+	}
+	return limit, false
+}
+
+// budgetFit checks the per-container memory limits against memory_budget. One slot that may outgrow the whole
+// budget could never run to completion (the backstop would reap it), so that is an error.
+func (c *Config) budgetFit(budget int64) []error {
+	if limit, unlimited := c.slotLimit(); !unlimited && limit > budget {
+		return []error{fmt.Errorf("memory limits of one slot add up to %s, more than memory_budget %s: that slot could never finish", fmtBytes(limit), fmtBytes(budget))}
+	}
+	return nil
+}
+
+// Notices returns advice about a valid config, for the guard to print at startup. All slots together may exceed
+// memory_budget: that is the point of sharing it, with the backstop as the safety net, so it is only a notice.
+func (c *Config) Notices() []string {
+	if c.memBudget <= 0 {
+		return nil
+	}
+	limit, unlimited := c.slotLimit()
+	switch {
+	case unlimited:
+		return []string{"memory_budget is set but a container has no memory limit: one runaway job can use the whole budget before the guard reacts"}
+	case limit*int64(c.MaxSlots) > c.memBudget:
+		return []string{fmt.Sprintf("%d slots may use up to %s together against memory_budget %s: the guard holds back new slots and reaps the newest runner if use stays over the budget",
+			c.MaxSlots, fmtBytes(limit*int64(c.MaxSlots)), fmtBytes(c.memBudget))}
+	}
+	return nil
 }

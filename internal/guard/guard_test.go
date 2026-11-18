@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -739,7 +740,8 @@ func TestMemoryAndCPUConfigValidation(t *testing.T) {
 	}{
 		{"budget only", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G", true},
 		{"budget and reserve", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: 2G", true},
-		{"reserve equals budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 2G\nmemory_reserve: 2G", true},
+		{"reserve equals budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 8G\nmemory_reserve: 8G", true},
+		{"one slot over budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 4G", false},
 		{"reserve over budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 1G\nmemory_reserve: 2G", false},
 		{"default reserve over small budget", "prefix: homelab", "prefix: homelab\nmemory_budget: 512M", false},
 		{"bad budget", "prefix: homelab", "prefix: homelab\nmemory_budget: lots", false},
@@ -783,5 +785,60 @@ func TestCPUSharesInHostConfig(t *testing.T) {
 	b, _ := json.Marshal(f.containers["homelab-runner-1"].spec.HostConfig)
 	if !strings.Contains(string(b), `"CpuShares":512`) {
 		t.Errorf("json: %s", b)
+	}
+}
+
+// Two starts racing on one guard must not both be admitted against the same free memory.
+func TestMemoryAdmissionConcurrentStarts(t *testing.T) {
+	// 1.5G budget, 1G reserve, nothing running: three concurrent starts. Once the first is marked starting it counts
+	// as at least the reserve (1G), so the next would need 1G + 1G > 1.5G and must wait. Without admitMu all three
+	// would see an empty host and be admitted.
+	g, _ := memGuard(t, "8G")
+	g.cfg.memBudget = 3 * gib / 2
+	// Hold each start at a barrier placed between the budget check and claiming the slot, until all three have reached
+	// it (or 300ms pass, which is what happens when admitMu correctly lets only one in at a time). Without the lock all
+	// three would have passed the check against the same empty host and would all be admitted.
+	var arrived atomic.Int32
+	g.afterAdmit = func() {
+		arrived.Add(1)
+		for deadline := time.Now().Add(300 * time.Millisecond); arrived.Load() < 3 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(n int) { defer wg.Done(); errs[n] = startSlot(t, g, n+1) }(i)
+	}
+	wg.Wait()
+	ok, denied := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrNotReady):
+			denied++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 || denied != 2 {
+		t.Fatalf("admitted %d, denied %d; want 1 and 2 (errs=%v)", ok, denied, errs)
+	}
+}
+
+// Another pool's slot that has containers but none running yet (it is mid-start) still counts as the reserve.
+func TestMemoryAdmissionCountsCreatedContainers(t *testing.T) {
+	g, f := memGuard(t, "8G")
+	g.cfg.memBudget = 2 * gib
+	f.containers["lite-dind-1"] = &fakeContainer{state: "created", spec: ContainerSpec{Labels: map[string]string{labelInstance: "lite", labelSlot: "1", labelRole: "dind"}}}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatalf("1G in use of 2G, 1G reserve fits: %v", err)
+	}
+	g.Stop(context.Background(), 1)
+	f.containers["lite-dind-2"] = &fakeContainer{state: "created", spec: ContainerSpec{Labels: map[string]string{labelInstance: "lite", labelSlot: "2", labelRole: "dind"}}}
+	if err := startSlot(t, g, 1); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("two mid-start slots (2G) must deny: %v", err)
 	}
 }

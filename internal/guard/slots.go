@@ -45,10 +45,12 @@ type Guard struct {
 	d   Docker
 	log *slog.Logger
 
-	mu       sync.Mutex
-	starting map[int]bool
-	overMem  int // consecutive reap ticks over memory_budget; only touched by Reap
-	nameRE   *regexp.Regexp
+	admitMu    sync.Mutex // held across the memory-budget check and marking a slot as starting
+	afterAdmit func()     // test seam: runs after the budget check passes, before the slot is claimed; nil in production
+	mu         sync.Mutex
+	starting   map[int]bool
+	overMem    int // consecutive reap ticks over memory_budget; only touched by Reap
+	nameRE     *regexp.Regexp
 }
 
 func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
@@ -149,25 +151,9 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 			return fmt.Errorf("%w: %s is missing (is the firewall up?)", ErrNotReady, g.cfg.RequireFile)
 		}
 	}
-	if err := g.admit(ctx, slot); err != nil {
+	if err := g.reserveSlot(ctx, slot); err != nil {
 		return err
 	}
-	g.mu.Lock()
-	if g.starting[slot] {
-		g.mu.Unlock()
-		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
-	}
-	busy, err := g.slotHasContainers(ctx, slot)
-	if err != nil {
-		g.mu.Unlock()
-		return err
-	}
-	if busy {
-		g.mu.Unlock()
-		return fmt.Errorf("%w: slot %d is in use", ErrConflict, slot)
-	}
-	g.starting[slot] = true
-	g.mu.Unlock()
 	defer func() { g.mu.Lock(); delete(g.starting, slot); g.mu.Unlock() }()
 
 	ctx, cancel := context.WithTimeout(ctx, g.cfg.StartTimeout.Duration)
@@ -178,6 +164,34 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 		return err
 	}
 	g.log.Info("slot started", "slot", slot, "runner", req.RunnerName)
+	return nil
+}
+
+// reserveSlot checks the memory budget and marks the slot as starting in one step. admitMu serialises it, so two
+// concurrent starts on this guard can't both be admitted against the same free memory: the second one's admit sees
+// the first one's slot as starting. (Two separate guards are covered by memoryBySlot counting created containers.)
+func (g *Guard) reserveSlot(ctx context.Context, slot int) error {
+	g.admitMu.Lock()
+	defer g.admitMu.Unlock()
+	if err := g.admit(ctx, slot); err != nil {
+		return err
+	}
+	if g.afterAdmit != nil {
+		g.afterAdmit()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.starting[slot] {
+		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
+	}
+	busy, err := g.slotHasContainers(ctx, slot)
+	if err != nil {
+		return err
+	}
+	if busy {
+		return fmt.Errorf("%w: slot %d is in use", ErrConflict, slot)
+	}
+	g.starting[slot] = true
 	return nil
 }
 
@@ -583,7 +597,17 @@ func (g *Guard) memoryBySlot(ctx context.Context) (map[slotKey]int64, error) {
 	out := map[slotKey]int64{}
 	for _, c := range cs {
 		n, err := strconv.Atoi(c.Labels[labelSlot])
-		if err != nil || c.State != "running" {
+		if err != nil {
+			continue
+		}
+		if c.State == "created" || c.State == "restarting" {
+			// Not running yet, so nothing to measure; the slot still exists and will count as at least the reserve.
+			if _, ok := out[slotKey{c.Labels[labelInstance], n}]; !ok {
+				out[slotKey{c.Labels[labelInstance], n}] = 0
+			}
+			continue
+		}
+		if c.State != "running" {
 			continue
 		}
 		m, err := g.d.ContainerMemory(ctx, c.ID)
