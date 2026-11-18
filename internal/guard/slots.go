@@ -505,6 +505,42 @@ func (g *Guard) applyMemoryHigh(ctx context.Context, slot int, targets map[strin
 	g.log.Info("memory_high applied", "slot", slot)
 }
 
+// modprobeScript writes the host's modprobe rules file from the one-shot container: $1 is the file name, the rest are
+// module names. With no modules it removes the file, but only if it carries the guard's marker line. The file is
+// replaced atomically and left alone when it already says the same.
+const modprobeScript = `f="/modprobe.d/$1"; shift
+marker="# managed by the runner-scaling guard: do not edit"
+if [ "$#" = 0 ]; then
+  if [ -f "$f" ] && [ "$(head -n1 "$f")" = "$marker" ]; then rm -f "$f" && echo removed; else echo nothing; fi
+  exit 0
+fi
+tmp="$f.tmp"
+{ echo "$marker"; for m in "$@"; do echo "install $m /bin/false"; done; } > "$tmp" || exit 1
+if [ -f "$f" ] && cmp -s "$tmp" "$f"; then rm -f "$tmp"; echo unchanged; else mv "$tmp" "$f" && echo written; fi`
+
+// ApplyModuleBlocklist makes the host's modprobe rules match module_blocklist (see Config.ModuleBlocklist). It runs at
+// startup, in a one-shot container with no network that has the host's /etc/modprobe.d mounted. A failure is logged
+// and counted, not fatal: the pool still works, it just doesn't have this protection. It does not unload modules that
+// are already loaded. With the option omitted it does nothing; with an explicit empty list it removes the guard's own file.
+func (g *Guard) ApplyModuleBlocklist(ctx context.Context) error {
+	if g.cfg.ModuleBlocklist == nil {
+		return nil // not configured: the host is not touched at all
+	}
+	file := "50-runner-scaling-" + g.cfg.Prefix + ".conf"
+	args := append([]string{"sh", "-c", modprobeScript, "sh", file}, g.cfg.ModuleBlocklist...)
+	code, err := g.wipeOneShot(ctx, 0, args, []string{"/etc/modprobe.d:/modprobe.d"})
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	if err != nil {
+		g.count.add(CounterModuleBlocklistFailures)
+		g.log.Error("module_blocklist NOT applied: jobs can make the host kernel load these modules", "file", "/etc/modprobe.d/"+file, "err", err)
+		return err
+	}
+	g.log.Info("module_blocklist applied", "file", "/etc/modprobe.d/"+file, "modules", len(g.cfg.ModuleBlocklist))
+	return nil
+}
+
 func (g *Guard) waitHealthy(ctx context.Context, name string) error {
 	for {
 		st, err := g.d.ContainerInspect(ctx, name)

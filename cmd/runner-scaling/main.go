@@ -116,6 +116,9 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	wctx, wcancel := context.WithTimeout(ctx, 15*time.Minute)
 	g.WipeStale(wctx)
 	wcancel()
+	mctx, mcancel := context.WithTimeout(ctx, 2*time.Minute)
+	_ = g.ApplyModuleBlocklist(mctx) // logs and counts its own failure; the pool still runs without it
+	mcancel()
 	go g.ReapLoop(ctx)
 
 	_ = os.Remove(*socket)

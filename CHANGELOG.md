@@ -3,12 +3,23 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
-## [Unreleased]
+## [0.5.0] - 2026-11-18
+
+### Added
+
+- **`module_blocklist`.** The guard can now stop jobs from making the host kernel load modules. A container with
+  `NET_ADMIN` that creates a link of an unloaded type (`ip link add type ifb`) makes the kernel autoload that module on
+  the host, with plain runc and under Sysbox alike. At startup the guard writes `install <module> /bin/false` rules to
+  `/etc/modprobe.d/50-runner-scaling-<prefix>.conf` from a one-shot container with no network and only that directory
+  mounted. Opt-in (omitted: the host is not touched; `[]` removes the guard's own file), idempotent, and it never touches a
+  file it did not write. A failed write is logged and counted (`module_blocklist_failures_total`); the pool keeps running.
+  Checked on a real host: a listed module was refused (`Unknown device type`), an unlisted one still loaded.
 
 ### Changed
 
-- Docs: the Sysbox section now says what was verified about kernel module autoload (it happens under Sysbox too, so block
-  unused link types on the host) and about `/proc/sys` writes (refused under Sysbox, effective under plain privileged).
+- Docs: the Sysbox section records two verified results. Writes to `/proc/sys` and `/proc/sysrq-trigger` from a
+  privileged inner container are refused under Sysbox (and change the host under a plain privileged container), and module
+  autoload happens under Sysbox too, which `module_blocklist` now covers.
 
 ## [0.4.0] - 2026-11-18
 
@@ -107,6 +118,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.5.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.5.0
 [0.4.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.4.0
 [0.3.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.3.0
 [0.2.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.2.0

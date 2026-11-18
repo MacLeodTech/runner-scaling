@@ -72,6 +72,14 @@ type Config struct {
 	MemoryRamp *Duration `yaml:"memory_ramp"`
 	// MemoryRampShare is the fraction of a young container's memory limit to assume, 0 < share <= 1. Default 0.5.
 	MemoryRampShare float64 `yaml:"memory_ramp_share"`
+	// ModuleBlocklist lists kernel modules the host must not autoload on a job's behalf. A container with CAP_NET_ADMIN
+	// (which any job with a dind can start) that creates a link of a type the host hasn't loaded, e.g. `ip link add type
+	// ifb`, makes the kernel load that module on the HOST, with plain runc and under Sysbox alike. At startup the guard
+	// writes `install <module> /bin/false` for each entry to /etc/modprobe.d/50-runner-scaling-<prefix>.conf on the host,
+	// from a one-shot container with no network, so the autoload fails instead. Only name modules the host never uses.
+	// Omitted: the host is not touched. An explicit empty list (`module_blocklist: []`) removes the guard's own file (it
+	// never touches files it did not write).
+	ModuleBlocklist []string `yaml:"module_blocklist"`
 	// RequireFile, if set, must exist before the guard starts any slot: a gate for something that must happen first,
 	// such as a host firewall that fences the slot subnets. Put it on a tmpfs so it is gone after a reboot.
 	RequireFile string `yaml:"require_file"`
@@ -142,6 +150,9 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 }
 
 var runtimeRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// moduleRE is what a kernel module name may look like; it also keeps shell and config syntax out of the host file.
+var moduleRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 var prefixRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
 
@@ -279,6 +290,17 @@ func (c *Config) Validate() error {
 		}
 	} else if c.MemoryReserve != "" || c.MemoryRamp != nil || c.MemoryRampShare != 0 {
 		errs = append(errs, errors.New("memory_reserve, memory_ramp and memory_ramp_share need memory_budget"))
+	}
+	seenMod := map[string]bool{}
+	for _, m := range c.ModuleBlocklist {
+		switch {
+		case !moduleRE.MatchString(m):
+			errs = append(errs, fmt.Errorf("module_blocklist: %q is not a module name (lowercase letters, digits, _ and -)", m))
+		case seenMod[strings.ReplaceAll(m, "-", "_")]:
+			errs = append(errs, fmt.Errorf("module_blocklist: %q listed twice (the kernel treats - and _ alike)", m))
+		default:
+			seenMod[strings.ReplaceAll(m, "-", "_")] = true
+		}
 	}
 	if c.CgroupParent != "" && !regexp.MustCompile(`^([A-Za-z0-9_-]+\.slice|/[A-Za-z0-9_./-]+)$`).MatchString(c.CgroupParent) {
 		errs = append(errs, errors.New("cgroup_parent must be a systemd slice (name.slice) or an absolute cgroup path"))
