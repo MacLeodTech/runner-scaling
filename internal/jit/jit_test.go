@@ -11,7 +11,7 @@ import (
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 // build makes an encoded JIT config from file name -> JSON content.
-func build(t *testing.T, files map[string]string) string {
+func build(t testing.TB, files map[string]string) string {
 	t.Helper()
 	m := map[string]string{}
 	for k, v := range files {
@@ -39,7 +39,7 @@ const goodRSA = `{"d":"AA==","dp":"AA==","dq":"AA==","exponent":"AQAB","inverseQ
 
 var expect = Expect{TenantURL: tenant, RunnerName: "ci-1-ab12cd", WorkFolder: "/tmp/runner"}
 
-func good(t *testing.T) map[string]string {
+func good(t testing.TB) map[string]string {
 	return map[string]string{".runner": goodRunner, ".credentials": goodCreds, ".credentials_rsaparams": goodRSA}
 }
 
@@ -96,6 +96,8 @@ func TestValidateRejects(t *testing.T) {
 		"no name":           with(".runner", `"AgentName":"ci-1-ab12cd",`, ""),
 		"workfolder":        with(".runner", `"/tmp/runner"`, `"/"`),
 		"url in rsa params": with(".credentials_rsaparams", `"AA=="`, `"https://evil.example/"`),
+		"path in file name": build(t, map[string]string{".runner": goodRunner, "../.credentials": goodCreds}),
+		"slash in name":     build(t, map[string]string{".runner": goodRunner, "sub/.credentials": goodCreds}),
 		"non-json file":     build(t, map[string]string{".runner": goodRunner, "extra": "plain text"}),
 		"too big":           strings.Repeat("A", MaxEncodedSize+4),
 	}
@@ -141,4 +143,29 @@ func TestHostAllowed(t *testing.T) {
 			t.Errorf("HostAllowed(%q) = %v, want %v", host, got, want)
 		}
 	}
+}
+
+// FuzzValidate: whatever bytes arrive as a JIT config, Validate and Shape must not panic, and anything Validate
+// accepts must really sit under the pinned tenant.
+func FuzzValidate(f *testing.F) {
+	f.Add(build(f, good(f)))
+	f.Add(b64(`{".runner":"` + b64(`{"ServerUrl":"https://x/","AgentName":"a"}`) + `"}`))
+	f.Add("")
+	f.Add("!!!")
+	e := expect
+	f.Fuzz(func(t *testing.T, enc string) {
+		_ = Shape(enc)
+		if Validate(enc, e) != nil {
+			return
+		}
+		docs, err := decode(enc)
+		if err != nil {
+			t.Fatalf("accepted a config that does not decode: %v", err)
+		}
+		tn, _ := parseTenant(tenant)
+		runner, _ := docs[".runner"].(map[string]any)
+		if s, _ := lookup(runner, "ServerUrl").(string); !tn.contains(s) {
+			t.Fatalf("accepted ServerUrl %q outside the tenant", s)
+		}
+	})
 }

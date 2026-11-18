@@ -389,9 +389,24 @@ func TestParseBytes(t *testing.T) {
 	}
 }
 
-func TestExampleConfigLoads(t *testing.T) {
-	if _, err := LoadConfig("../../examples/guard.yaml"); err != nil {
+func TestExampleConfigsLoad(t *testing.T) {
+	main, err := LoadConfig("../../examples/guard.yaml")
+	if err != nil {
 		t.Fatal(err)
+	}
+	lite, err := LoadConfig("../../examples/guard-lite.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.Dind == nil || lite.Dind != nil {
+		t.Errorf("main pool should have dind and lite should not: %v, %v", main.Dind != nil, lite.Dind != nil)
+	}
+	// Two pools on one host: they must not share names or overlap, and must share the memory budget.
+	if main.Prefix == lite.Prefix || main.Subnet == lite.Subnet {
+		t.Errorf("pools collide: %q/%q, %q/%q", main.Prefix, lite.Prefix, main.Subnet, lite.Subnet)
+	}
+	if main.MemoryBudget != lite.MemoryBudget || main.RequireFile != lite.RequireFile {
+		t.Errorf("pools disagree on the shared budget or gate")
 	}
 }
 
