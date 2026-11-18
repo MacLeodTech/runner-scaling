@@ -187,6 +187,7 @@ names. The guard decodes it and requires that:
 | `--delete-scale-set` | | | delete the scale set and exit |
 | `--socket` | `GUARD_SOCKET` | `/run/runner-scaling/guard.sock` | guard API socket |
 | | `DASHBOARD_ADDR` | off | e.g. `127.0.0.1:8080`: serve the [dashboard](#dashboard) |
+| | `DASHBOARD_PEERS` | none | `name=http://host:port,...`: fold other scalers (pools) into this dashboard; they must share the token |
 | | `DASHBOARD_TOKEN[_FILE]` | none | if set, the dashboard requires it (bearer, `?token=`, or basic-auth password) |
 | | `CACHE_TRUSTED_REFS` | `refs/heads/main` | refs whose push/schedule/dispatch/release jobs keep their caches; `none` wipes always |
 | | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -225,6 +226,8 @@ Set `DASHBOARD_ADDR` and the scaler serves a read-only status page, a bit like t
 their state, running jobs with elapsed time, queued jobs with wait time, and the last 100 finished jobs (repo,
 workflow, event, branch, result, duration). It refreshes every few seconds from `/api/state` (JSON).
 
+- Running several pools? Give each scaler a dashboard and list the others in `DASHBOARD_PEERS` on the one you open:
+  its page then shows every pool, tagged by name. Peers need the same token and a network path between the scalers.
 - It is read-only (GET only) and has no controls. History lives in memory, so a scaler restart empties it.
 - Job names and repos can be sensitive for private repos. Bind it to loopback or a private network, and put a reverse
   proxy with TLS in front if it leaves the host. `DASHBOARD_TOKEN` adds a shared-secret check but sends it in clear
