@@ -32,6 +32,9 @@ func (g *Guard) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, s)
 	})
+	mux.HandleFunc("GET /v1/counters", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, g.Counters())
+	})
 	mux.HandleFunc("PUT /v1/slots/{n}", func(w http.ResponseWriter, r *http.Request) {
 		n, ok := g.slotArg(w, r)
 		if !ok {
@@ -80,6 +83,7 @@ func (g *Guard) Handler() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		g.count.add(CounterDenied)
 		g.log.Warn("DENY", "method", r.Method, "path", r.URL.Path, "reason", "no such endpoint")
 		writeJSON(w, http.StatusNotFound, api.Error{Error: "no such endpoint"})
 	})
@@ -109,6 +113,14 @@ func (g *Guard) fail(w http.ResponseWriter, r *http.Request, err error) {
 	lvl, msg := slog.LevelError, "error"
 	if code < 500 || code == http.StatusServiceUnavailable {
 		lvl, msg = slog.LevelWarn, "DENY"
+		switch code {
+		case http.StatusServiceUnavailable:
+			g.count.add(CounterNotReady) // busy memory budget or the firewall gate: normal, but worth watching
+		case http.StatusConflict:
+			g.count.add(CounterConflicts) // a slot already in use or in transition: a race, not an attack
+		default:
+			g.count.add(CounterDenied) // a malformed or refused request: the guard's API was misused
+		}
 	}
 	g.log.Log(r.Context(), lvl, msg, "method", r.Method, "path", r.URL.Path, "status", code, "reason", err.Error())
 	writeJSON(w, code, api.Error{Error: err.Error()})

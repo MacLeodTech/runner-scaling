@@ -222,7 +222,8 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
 
 ### Operations
 
-- **Logs.** `docker logs <guard> 2>&1 | grep DENY` shows every refusal. When the guard refuses a JIT config, it
+- **Logs.** `docker logs <guard> 2>&1 | grep DENY` shows every refusal; the same events are counted in
+  [metrics](#metrics). When the guard refuses a JIT config, it
   also logs the config's shape: keys and URL hosts only, never values.
 - **Restarts.** Restarting the scaler or guard doesn't kill running jobs. The scale set stays registered, and
   queued jobs wait for it. If the old message session hasn't expired yet, the scaler retries until it has.
@@ -255,6 +256,59 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   the first container exists; the backstop covers that. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
+
+### Metrics
+
+With the [dashboard](#dashboard) on (`DASHBOARD_ADDR`), the scaler also serves `GET /metrics` in Prometheus text
+format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so scrape each
+pool's scaler. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `runner_scaling_jobs{state}` | gauge | jobs queued and running, as the scaler knows them |
+| `runner_scaling_scale_set{stat}` | gauge | GitHub's own scale set counters (available, acquired, assigned, running, busy and idle runners) |
+| `runner_scaling_slots{state}` | gauge | slots by runner state (`running`, `starting`, `exited`, ...) |
+| `runner_scaling_max_slots` | gauge | the guard's `max_slots` |
+| `runner_scaling_memory_used_bytes` | gauge | working set of this pool's runners |
+| `runner_scaling_memory_budget_bytes` | gauge | `memory_budget` (shared by every pool on the host) |
+| `runner_scaling_slot_memory_bytes{slot}` | gauge | working set per slot |
+| `runner_scaling_job_start_latency_seconds` | histogram | from a job being queued to a runner starting it |
+| `runner_scaling_job_duration_seconds` | histogram | how long jobs ran |
+| `runner_scaling_slot_start_seconds` | histogram | time to bring one slot up |
+| `runner_scaling_slot_starts_total{outcome}` | counter | slot starts, `ok` or `error` |
+| `runner_scaling_jobs_completed_total{result}` | counter | finished jobs by result |
+| `runner_scaling_guard_up` | gauge | 1 if the guard answered |
+| `runner_scaling_guard_*_total` | counters | the guard's own counters, below |
+
+The guard counts what it does, since it started, and the scaler re-exports it (the guard has no network, so it can't
+serve metrics itself; its read-only `GET /v1/counters` is what the scaler reads):
+
+| Counter | Meaning |
+|---|---|
+| `denied_total` | a bad or refused request, or an unknown endpoint: the guard's API was misused. **Alert on any.** |
+| `not_ready_total` | a start refused with 503: the memory budget was full, or the firewall gate was missing |
+| `admission_refused_total` | starts held back by the memory budget (normal under load; a steady climb with idle memory means the reserve or ramp is too cautious) |
+| `conflicts_total` | a start or stop refused because the slot was in use or in transition |
+| `starts_total`, `start_failures_total` | slots started, and starts that failed after being admitted |
+| `reaped_runner_exited_total`, `reaped_max_runtime_total`, `reaped_memory_budget_total` | slots torn down, by reason. `memory_budget` means the backstop killed a running job. |
+
+Alerts worth having:
+
+```yaml
+- alert: RunnerScalingGuardDenied   # the guard's API was misused: look at the guard's DENY log lines
+  expr: increase(runner_scaling_guard_denied_total[10m]) > 0
+- alert: RunnerScalingJobKilledForMemory   # the memory backstop removed a running job
+  expr: increase(runner_scaling_guard_reaped_memory_budget_total[1h]) > 0
+- alert: RunnerScalingGuardDown
+  expr: runner_scaling_guard_up == 0
+  for: 2m
+- alert: RunnerScalingJobsWaiting   # jobs queued while no slot is free and memory isn't the reason: check start errors
+  expr: runner_scaling_jobs{state="queued"} > 0 and runner_scaling_slots{state="running"} == 0
+  for: 10m
+- alert: RunnerScalingNearBudget
+  expr: sum(runner_scaling_memory_used_bytes) > 0.9 * max(runner_scaling_memory_budget_bytes)
+  for: 10m
+```
 
 ### Slow a job down instead of killing it (`memory_high`)
 

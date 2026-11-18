@@ -58,6 +58,7 @@ func (s *Server) Handler() http.Handler {
 		w.Write(page)
 	})
 	mux.HandleFunc("GET /api/state", s.state)
+	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	return s.secure(mux)
 }

@@ -3,6 +3,16 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
+## [0.2.0] - 2026-11-18
+
+### Added
+
+- **Metrics.** `GET /metrics` on the scaler's dashboard listener, in Prometheus text format and behind the dashboard
+  token: jobs queued and running, slots by state, memory use against the budget, histograms of job start latency,
+  job duration and slot start time, and the guard's counters (denials, refusals, reaps by reason, starts).
+- **Guard counters.** The guard counts what it does and serves it on a new read-only `GET /v1/counters`, and `GET
+  /v1/info` now reports `memory_budget`. The scaler re-exports the counters, since the guard has no network.
+
 ## [0.1.0] - 2026-11-18
 
 First release. It depends on `github.com/actions/scaleset` v0.5.0 and the runner scale set API, both in public
@@ -47,4 +57,5 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.2.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.2.0
 [0.1.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.1.0
