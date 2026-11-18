@@ -68,10 +68,23 @@ names. The guard decodes it and requires that:
 **Not solved by this tool. Know these before you use it:**
 - **The guard itself is root-equivalent**, because it holds the Docker socket. It is kept small: no network, no
   credentials, a fixed four-call API, read-only filesystem, all capabilities dropped.
-- **The dind sidecar is privileged.** A job that breaks out of its container is root on the host. That's the
-  cost of letting jobs run `docker build`. Drop the `dind:` section if your jobs don't need Docker. Either way,
-  only run jobs from repos you trust: on GitHub, limit the runner group to private repos, require approval for
-  fork PRs, and fence the per-slot subnets with a host firewall so jobs reach only the internet.
+- **With the dind sidecar, any job is root on the host.** The sidecar is privileged, so a job can start a
+  `--privileged` container against it and mount the host's disk. The guard's API limits what a taken-over *scaler*
+  can ask for; it does not limit what a *job* can do. Anyone who can get a workflow onto a repo that uses these
+  runners (a push to any branch, a bot such as Dependabot, a stolen token) can run code as root on the host, and so
+  can anyone who holds the scaler's GitHub credential (they can create a repo and a workflow of their own). That is
+  the cost of letting jobs run `docker build`. Drop the `dind:` section if your jobs don't need Docker, and use a
+  Docker-less pool for everything else.
+- **Only run jobs from repos you trust.** On GitHub, limit the runner group to private repos, disable fork PR
+  workflows (or require approval), keep bot PRs off the Docker pool, and fence the per-slot subnets with a host
+  firewall so jobs reach only the internet. On plans without branch protection, any branch can change a workflow.
+- **Caches carry over between jobs.** Runners are thrown away, but per-slot cache directories (`binds`, including a
+  dind `/var/lib/docker`) are not. A job that can write to them can plant code (a toolchain binary, a retagged
+  image) that the next job on that slot runs, whatever repo it comes from. Share caches only between repos that
+  trust each other, or leave them out.
+- **Without dind, jobs are still root in their container** unless the runner image says otherwise, and containers
+  share the host kernel: a kernel escape is root on the host. Add a stronger runtime (gVisor, Sysbox, user
+  namespaces) if the jobs aren't fully trusted.
 - **Jobs can read their runner's credentials.** A job runs as the same user as its runner, so it can read the
   runner's session credentials. This is true of every self-hosted runner. The JIT config is kept out of the job
   environment, but it is on the runner process's command line.

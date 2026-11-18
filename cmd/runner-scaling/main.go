@@ -112,6 +112,9 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	if err != nil {
 		return err
 	}
+	wctx, wcancel := context.WithTimeout(ctx, 15*time.Minute)
+	g.WipeStale(wctx)
+	wcancel()
 	go g.ReapLoop(ctx)
 
 	_ = os.Remove(*socket)

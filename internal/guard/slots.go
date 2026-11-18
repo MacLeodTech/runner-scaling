@@ -463,20 +463,79 @@ func (g *Guard) teardown(ctx context.Context, slot int, prune bool) error {
 	return errors.Join(errs...)
 }
 
-// Reap tears down slots whose runner has exited (ephemeral runners exit after their one job) or is missing.
+// WipeStale empties the work_bind directory of every slot that has no containers, so a crash can't leave job data
+// behind. Call it at startup, before serving. Failures are logged and skipped.
+func (g *Guard) WipeStale(ctx context.Context) {
+	if g.cfg.WorkBind == "" {
+		return
+	}
+	for slot := 1; slot <= g.cfg.MaxSlots; slot++ {
+		g.mu.Lock()
+		busy, err := g.slotHasContainers(ctx, slot)
+		if err == nil && !busy && !g.starting[slot] {
+			wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			code, werr := g.wipeOneShot(wctx, slot, append(slices.Clone(wipeCmd), g.cfg.WorkDir))
+			cancel()
+			if werr == nil && code != 0 {
+				werr = fmt.Errorf("exit %d", code)
+			}
+			err = werr
+			if err == nil {
+				g.log.Info("wiped stale work dir", "slot", slot)
+			}
+		}
+		g.mu.Unlock()
+		if err != nil {
+			g.log.Warn("startup wipe failed", "slot", slot, "err", err)
+		}
+	}
+}
+
+// runnerStarts maps slot to the creation time of its runner container.
+func (g *Guard) runnerStarts(ctx context.Context) (map[int]time.Time, error) {
+	cs, err := g.d.ContainerList(ctx, labelInstance+"="+g.cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int]time.Time{}
+	for _, c := range cs {
+		if n, err := strconv.Atoi(c.Labels[labelSlot]); err == nil && c.Labels[labelRole] == "runner" && c.Created > 0 {
+			out[n] = time.Unix(c.Created, 0)
+		}
+	}
+	return out, nil
+}
+
+// Reap tears down slots whose runner has exited (ephemeral runners exit after their one job) or is missing, and
+// slots whose runner has outlived max_runtime. Slots that are starting are never touched.
 func (g *Guard) Reap(ctx context.Context) {
 	slots, err := g.List(ctx)
 	if err != nil {
 		g.log.Error("reap: list", "err", err)
 		return
 	}
+	var starts map[int]time.Time
+	if g.cfg.MaxRuntime.Duration > 0 {
+		if starts, err = g.runnerStarts(ctx); err != nil {
+			g.log.Error("reap: list", "err", err)
+			starts = nil
+		}
+	}
 	for _, s := range slots {
-		if s.Starting || s.RunnerState == "running" || s.RunnerState == "created" || s.RunnerState == "restarting" {
+		if s.Starting {
 			continue
+		}
+		reason := "runner_exited"
+		if s.RunnerState == "running" || s.RunnerState == "created" || s.RunnerState == "restarting" {
+			t, ok := starts[s.Slot]
+			if !ok || time.Since(t) <= g.cfg.MaxRuntime.Duration {
+				continue
+			}
+			reason = "max_runtime"
 		}
 		g.mu.Lock()
 		if !g.starting[s.Slot] {
-			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState)
+			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
 			if err := g.teardown(ctx, s.Slot, true); err != nil {
 				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
 			}
