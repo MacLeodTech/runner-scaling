@@ -3,6 +3,17 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
+## [0.6.0] - 2026-11-18
+
+### Added
+
+- **Dashboard accounts** (`DASHBOARD_USERS_FILE`, opt-in). A login page instead of the shared token for browsers. The
+  first start creates `admin`/`admin`, which must choose a new password at first login. Admins add users in the dashboard;
+  each gets a generated one-time password they must change at first login (also for resets). Roles `admin` and `user`
+  (view only), PBKDF2-HMAC-SHA256 hashes in a 0600 file, 12 h in-memory sessions (HttpOnly, SameSite=Strict), a lockout
+  after five failures, JSON-only and same-origin state changes. The token keeps working for peers, the `runners` CLI and
+  Prometheus. See README, "Dashboard accounts".
+
 ## [0.5.0] - 2026-11-18
 
 ### Added
@@ -118,6 +129,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.6.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.6.0
 [0.5.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.5.0
 [0.4.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.4.0
 [0.3.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.3.0

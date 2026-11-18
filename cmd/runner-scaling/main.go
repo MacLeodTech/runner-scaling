@@ -244,10 +244,18 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 			return err
 		}
 		s.Dash = dashboard.NewTracker()
-		ds := &http.Server{
-			Addr: addr, ReadHeaderTimeout: 10 * time.Second,
-			Handler: (&dashboard.Server{Name: ss.Name, Version: version, Info: info, Guard: gc, Tracker: s.Dash, Token: token, Peers: dashboardPeers()}).Handler(),
+		dash := &dashboard.Server{Name: ss.Name, Version: version, Info: info, Guard: gc, Tracker: s.Dash, Token: token, Peers: dashboardPeers()}
+		if uf := env("DASHBOARD_USERS_FILE", ""); uf != "" { // opt-in accounts: login for browsers, the token stays for machines
+			accts, fresh, err := dashboard.OpenAccounts(uf)
+			if err != nil {
+				return fmt.Errorf("DASHBOARD_USERS_FILE: %w", err)
+			}
+			if fresh {
+				log.Warn("dashboard accounts created with the default login admin:admin; it must change its password at first login", "file", uf)
+			}
+			dash.Auth = dashboard.NewAuth(accts, log.WithGroup("auth"))
 		}
+		ds := &http.Server{Addr: addr, ReadHeaderTimeout: 10 * time.Second, Handler: dash.Handler()}
 		go func() {
 			if err := ds.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				log.Error("dashboard", "err", err)

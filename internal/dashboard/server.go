@@ -41,7 +41,9 @@ type State struct {
 // Peer is another scaler's dashboard, e.g. {"lite", "http://scaler-lite:8080"}.
 type Peer struct{ Name, URL string }
 
-// Server serves the page and its JSON. It is read-only: GET and HEAD only, and nothing on it changes anything.
+// Server serves the page and its JSON. The dashboard itself is read-only. The only thing that can change is the account
+// list, and only when Auth is set (see auth.go): then a browser needs a login, while Token stays valid as the credential
+// for machines (peer scalers, the runners CLI, Prometheus).
 type Server struct {
 	Name, Version string
 	Info          api.Info
@@ -49,6 +51,7 @@ type Server struct {
 	Tracker       *Tracker
 	Peers         []Peer // other pools to fold into this page; they must share Token
 	Token         string // if set, required as a bearer token, ?token= or the password of basic auth
+	Auth          *Auth  // if set, a login session is accepted instead of the token, and the account API is served
 }
 
 func (s *Server) Handler() http.Handler {
@@ -59,6 +62,9 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /api/state", s.state)
 	mux.HandleFunc("GET /metrics", s.metrics)
+	if s.Auth != nil {
+		s.Auth.routes(mux)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
 	return s.secure(mux)
 }
@@ -124,7 +130,12 @@ func (s *Server) secure(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
-		if s.Token != "" && r.URL.Path != "/healthz" && !s.authorised(r) {
+		if s.Auth != nil {
+			if !s.openPath(r.URL.Path) && !s.sessionOK(r) && !s.authorised(r) {
+				writeJSON(w, http.StatusUnauthorized, apiErr{"login required"}) // no Basic challenge: the page has its own form
+				return
+			}
+		} else if s.Token != "" && r.URL.Path != "/healthz" && !s.authorised(r) {
 			h.Set("WWW-Authenticate", `Basic realm="runner-scaling"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -133,7 +144,26 @@ func (s *Server) secure(next http.Handler) http.Handler {
 	})
 }
 
+// openPath lists what needs no credential when accounts are on: the static page (which holds no data), the login
+// endpoints, and the account endpoints that check the session themselves. Everything else is denied by default.
+func (s *Server) openPath(p string) bool {
+	switch p {
+	case "/", "/healthz", "/api/me", "/api/login", "/api/logout", "/api/password":
+		return true
+	}
+	return strings.HasPrefix(p, "/api/users")
+}
+
+// sessionOK is a login session that is past its forced password change.
+func (s *Server) sessionOK(r *http.Request) bool {
+	u, ok := s.Auth.current(r)
+	return ok && !u.MustChange
+}
+
 func (s *Server) authorised(r *http.Request) bool {
+	if s.Token == "" {
+		return false
+	}
 	got := r.URL.Query().Get("token")
 	if _, pw, ok := r.BasicAuth(); ok {
 		got = pw

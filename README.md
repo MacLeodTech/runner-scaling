@@ -226,6 +226,7 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
 | | `DASHBOARD_ADDR` | off | e.g. `127.0.0.1:8080`: serve the [dashboard](#dashboard) |
 | | `DASHBOARD_PEERS` | none | `name=http://host:port,...`: fold other scalers (pools) into this dashboard; they must share the token |
 | | `DASHBOARD_TOKEN[_FILE]` | none | if set, the dashboard requires it (bearer, `?token=`, or basic-auth password) |
+| | `DASHBOARD_USERS_FILE` | none | turns on [accounts](#dashboard-accounts): a login page instead of the token for browsers. The file is created on first start; its directory must be writable |
 | | `CACHE_TRUSTED_REFS` | `refs/heads/main` | refs whose push/schedule/dispatch/release jobs keep their caches; `none` wipes always |
 | | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
@@ -373,12 +374,35 @@ workflow, event, branch, result, duration). It refreshes every few seconds from 
 
 - Running several pools? Give each scaler a dashboard and list the others in `DASHBOARD_PEERS` on the one you open:
   its page then shows every pool, tagged by name. Peers need the same token and a network path between the scalers.
-- It is read-only (GET only) and has no controls. History lives in memory, so a scaler restart empties it.
+- The dashboard has no controls: it only shows. (With accounts on, the one thing that can change is the account list.) History lives in memory, so a scaler restart empties it.
 - Job names and repos can be sensitive for private repos. Bind it to loopback or a private network, and put a reverse
   proxy with TLS in front if it leaves the host. `DASHBOARD_TOKEN` adds a shared-secret check but sends it in clear
   without TLS.
 - In a container, listen on `0.0.0.0:8080` and publish the port on loopback only (`ports: ["127.0.0.1:8080:8080"]`).
   `/healthz` is always open.
+
+### Dashboard accounts
+
+Set `DASHBOARD_USERS_FILE` (for example `/data/users.json`, on a writable volume) and browsers get a login page instead of
+the token. Meant for a dashboard on a private network that a few people look at.
+
+- **First start** creates the file with one account, `admin` / `admin`. The first login is forced to choose a new password
+  before anything else works, and the guard logs a warning until then.
+- **Adding people:** an admin opens **Users**, types a username and picks `user` (view only) or `admin`. The dashboard
+  generates a random 16-character password and shows it once, to hand over. At their first login they must change it.
+  **Reset password** generates a new temporary one the same way (and logs that user out); **Delete** removes the account.
+  The last admin cannot be deleted, and nobody can delete their own account.
+- **Storage:** passwords are stored as salted PBKDF2-HMAC-SHA256 hashes (600,000 iterations) in the file, mode 0600. Lost
+  admin password: stop the scaler, delete the file, start again, and you are back to `admin`/`admin`.
+- **Sessions:** a random cookie (HttpOnly, SameSite=Strict, `Secure` behind an HTTPS proxy), 12 hours, kept in memory so a
+  restart logs everyone out. Changing a password logs the account out of its other sessions.
+- **Abuse limits:** five wrong passwords for a name lock that name for five minutes (the change-password form counts too).
+  State-changing requests must be JSON and, when the browser sends an `Origin`, from the same host.
+- **Machines still use the token.** Peer scalers, the `runners` CLI and Prometheus send `DASHBOARD_TOKEN` as a bearer
+  token, which is accepted alongside a login session. Peers need no accounts of their own: put `DASHBOARD_USERS_FILE` on
+  the scaler whose page you open. Without it nothing changes.
+- Without TLS the password crosses the network in clear, like the token did. Keep it on a private network or behind a
+  TLS proxy.
 
 ### Caches
 
