@@ -269,6 +269,14 @@ func TestStartBuildsSpecFromTemplate(t *testing.T) {
 	if got := r.spec.Cmd; len(got) != 1 || got[0] != "/actions-runner/run.sh" {
 		t.Errorf("cmd: %v", got)
 	}
+	// The JIT config goes in the environment, never in argv (/proc/<pid>/cmdline is world-readable on the host).
+	jit := jitFor("ci-2-abcd12", "https://github.com/example-org")
+	if !slices.Contains(r.spec.Env, jitEnv+"="+jit) {
+		t.Errorf("runner env lacks the jit config: %v", r.spec.Env)
+	}
+	if strings.Contains(strings.Join(r.spec.Entrypoint, " ")+" "+strings.Join(r.spec.Cmd, " "), jit) {
+		t.Errorf("jit config is on the command line: %v %v", r.spec.Entrypoint, r.spec.Cmd)
+	}
 
 	// Same slot again: conflict. Then stop, which prunes and removes everything.
 	rec = do(t, h, "PUT", "/v1/slots/2", api.StartRequest{RunnerName: "ci-2-zzzz99", JITConfig: jitFor("ci-2-zzzz99", "https://github.com/example-org")})
