@@ -55,6 +55,8 @@ type Config struct {
 	RequireFile string `yaml:"require_file"`
 	// StartTimeout bounds how long a slot may take to come up (dind health included).
 	StartTimeout Duration `yaml:"start_timeout"`
+	// MaxRuntime, if set, is how long a runner container may run before the reaper removes it (0 = no limit).
+	MaxRuntime Duration `yaml:"max_runtime"`
 	// ReapInterval is how often exited runners are cleaned up.
 	ReapInterval Duration `yaml:"reap_interval"`
 
@@ -194,6 +196,9 @@ func (c *Config) Validate() error {
 		if h := c.Expand(c.WorkBind, 1); !path.IsAbs(h) || path.Clean(h) == "/" || strings.Contains(h, ":") || !strings.Contains(c.WorkBind, "{slot}") {
 			errs = append(errs, errors.New("work_bind must be an absolute host path containing {slot}"))
 		}
+	}
+	if c.MaxRuntime.Duration < 0 || (c.MaxRuntime.Duration > 0 && c.MaxRuntime.Duration < time.Minute) {
+		errs = append(errs, errors.New("max_runtime must be 0 (disabled) or at least 1m"))
 	}
 	if c.CgroupParent != "" && !regexp.MustCompile(`^([A-Za-z0-9_-]+\.slice|/[A-Za-z0-9_./-]+)$`).MatchString(c.CgroupParent) {
 		errs = append(errs, errors.New("cgroup_parent must be a systemd slice (name.slice) or an absolute cgroup path"))

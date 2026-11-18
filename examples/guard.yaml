@@ -10,6 +10,7 @@ github_url: https://github.com/YOUR-ORG          # or https://github.com/OWNER/R
 prefix: ci                    # names containers ci-runner-N, ci-dind-N, networks ci-slot-N, runners ci-N-xxxxxx
 max_slots: 2
 subnet: 172.30.{slot}.0/24    # optional: fixed per-slot subnets, so a host firewall can fence them
+# max_runtime: 6h             # optional: the reaper removes a runner that has run longer than this (min 1m, default off)
 work_dir: /home/runner/_work  # fresh Docker volume per runner, mounted here in the runner and in dind
 
 runner:

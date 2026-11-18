@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
 )
@@ -33,8 +34,9 @@ type fakeDocker struct {
 }
 
 type fakeContainer struct {
-	spec  ContainerSpec
-	state string
+	spec    ContainerSpec
+	state   string
+	created time.Time
 }
 
 func newFake() *fakeDocker {
@@ -72,7 +74,7 @@ func (f *fakeDocker) ContainerCreate(_ context.Context, n string, s ContainerSpe
 	if f.containers[n] != nil {
 		return "", fmt.Errorf("name %s in use", n)
 	}
-	f.containers[n] = &fakeContainer{spec: s, state: "created"}
+	f.containers[n] = &fakeContainer{spec: s, state: "created", created: time.Now()}
 	return n, nil
 }
 func (f *fakeDocker) ContainerStart(_ context.Context, id string) error {
@@ -112,7 +114,7 @@ func (f *fakeDocker) ContainerList(_ context.Context, label string) ([]Container
 	var out []ContainerSummary
 	for n, c := range f.containers {
 		if c.spec.Labels[k] == v {
-			out = append(out, ContainerSummary{ID: n, Names: []string{"/" + n}, State: c.state, Labels: c.spec.Labels})
+			out = append(out, ContainerSummary{ID: n, Names: []string{"/" + n}, State: c.state, Created: c.created.Unix(), Labels: c.spec.Labels})
 		}
 	}
 	return out, nil
@@ -448,5 +450,89 @@ func TestNoDindPoolWipesInOneShotContainer(t *testing.T) {
 	g.Stop(ctx, 2)
 	if len(f.wipes) != 2 || len(f.containers) != 0 {
 		t.Errorf("after stop: wipes %d containers %v", len(f.wipes), f.containers)
+	}
+}
+
+func TestWipeStaleAtStartup(t *testing.T) {
+	for _, dind := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dind=%v", dind), func(t *testing.T) {
+			g, f := newGuard(t)
+			if !dind {
+				g.cfg.Dind = nil
+			}
+			g.cfg.WorkBind = "/big/runners/{slot}/work"
+			ctx := context.Background()
+			// slot 2 is in use and must be left alone.
+			f.containers["homelab-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: g.labels(2, "runner", "homelab-2-abcd12")}}
+			g.WipeStale(ctx)
+			var got []string
+			for _, w := range f.wipes {
+				got = append(got, w.HostConfig.Binds[0])
+				if w.HostConfig.NetworkMode != "none" || w.HostConfig.Privileged {
+					t.Errorf("wiper spec: %+v", w.HostConfig)
+				}
+			}
+			slices.Sort(got)
+			want := []string{"/big/runners/1/work:/runner/work", "/big/runners/3/work:/runner/work"}
+			if !slices.Equal(got, want) {
+				t.Errorf("wiped %v, want %v", got, want)
+			}
+			if len(f.containers) != 1 {
+				t.Errorf("wipers left behind: %v", f.containers)
+			}
+		})
+	}
+	t.Run("no work_bind", func(t *testing.T) {
+		g, f := newGuard(t)
+		g.WipeStale(context.Background())
+		if len(f.wipes) != 0 {
+			t.Errorf("wipes: %d", len(f.wipes))
+		}
+	})
+}
+
+func TestReapMaxRuntime(t *testing.T) {
+	cases := []struct {
+		name     string
+		max      time.Duration
+		age      time.Duration
+		starting bool
+		reaped   bool
+	}{
+		{"disabled", 0, 100 * time.Hour, false, false},
+		{"within limit", time.Hour, 10 * time.Minute, false, false},
+		{"over limit", time.Hour, 2 * time.Hour, false, true},
+		{"over limit but starting", time.Hour, 2 * time.Hour, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, f := newGuard(t)
+			g.cfg.MaxRuntime.Duration = c.max
+			ctx := context.Background()
+			name := "homelab-1-abcd12"
+			if err := g.Start(ctx, 1, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/MacLeodTech")}); err != nil {
+				t.Fatal(err)
+			}
+			f.containers["homelab-runner-1"].created = time.Now().Add(-c.age)
+			if c.starting {
+				g.mu.Lock()
+				g.starting[1] = true
+				g.mu.Unlock()
+			}
+			g.Reap(ctx)
+			if gone := f.containers["homelab-runner-1"] == nil; gone != c.reaped {
+				t.Errorf("reaped=%v, want %v", gone, c.reaped)
+			}
+		})
+	}
+}
+
+func TestMaxRuntimeValidation(t *testing.T) {
+	for in, ok := range map[string]bool{"max_runtime: 0s": true, "max_runtime: 6h": true, "max_runtime: 1m": true, "max_runtime: 30s": false, "max_runtime: -1h": false} {
+		p := filepath.Join(t.TempDir(), "guard.yaml")
+		os.WriteFile(p, []byte(strings.Replace(testConfig, "prefix: homelab", "prefix: homelab\n"+in, 1)), 0o600)
+		if _, err := LoadConfig(p); (err == nil) != ok {
+			t.Errorf("%s: err=%v, want ok=%v", in, err, ok)
+		}
 	}
 }

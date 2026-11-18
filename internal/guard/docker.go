@@ -83,10 +83,11 @@ type ContainerState struct {
 }
 
 type ContainerSummary struct {
-	ID     string            `json:"Id"`
-	Names  []string          `json:"Names"`
-	State  string            `json:"State"`
-	Labels map[string]string `json:"Labels"`
+	ID      string            `json:"Id"`
+	Names   []string          `json:"Names"`
+	State   string            `json:"State"`
+	Created int64             `json:"Created"` // unix seconds
+	Labels  map[string]string `json:"Labels"`
 }
 
 // ErrNotFound is returned for 404s.
