@@ -138,7 +138,11 @@ names. The guard decodes it and requires that:
   otherwise the scaler is told to retry on its next poll. If measured use stays over the budget for three checks in a
   row, the guard removes its newest runner. This is enforced in the guard, so it needs no host or systemd setup, but it
   is a polling limit: a sudden spike can briefly overshoot, so keep the per-container `memory` limits as the hard
-  stop. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
+  stop. The guard rejects a config where one slot's `memory` limits add up to more than the budget (that slot could never
+  finish) and prints a notice at startup when all slots together may exceed it, which is normal for a shared budget.
+  Concurrent starts on one guard are serialised, and a slot whose containers exist but are not running yet counts as
+  the reserve, so two guards starting slots at the same moment can only both be admitted in the few milliseconds before
+  the first container exists; the backstop covers that. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
 - **Caches.** Bind per-slot cache directories (`{slot}` in a path is replaced with the slot number) so warm jobs
