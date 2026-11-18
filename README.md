@@ -171,7 +171,8 @@ names. The guard decodes it and requires that:
    installation ID is the number at the end of the installation's settings URL
    (`.../settings/installations/<id>`). The App can only manage runners: unlike the PAT it can't touch repos or
    members, and its tokens expire after an hour.
-2. **`guard.yaml`.** Start from [examples/guard.yaml](examples/guard.yaml). Pin image digests.
+2. **`guard.yaml`.** Start from [examples/guard.yaml](examples/guard.yaml). Pin image digests. (The `:latest` tag is fine if you are the only operator and update by hand with `docker compose pull`,
+   but you give up the digest check: a bad release would reach the guard, which holds the Docker socket.)
 3. **Compose.** See [examples/compose.yaml](examples/compose.yaml). Start it and watch the guard:
    `docker compose logs -f guard`.
 4. **Pin the tenant.** The first runner request is refused with
@@ -403,6 +404,24 @@ the token. Meant for a dashboard on a private network that a few people look at.
   the scaler whose page you open. Without it nothing changes.
 - Without TLS the password crosses the network in clear, like the token did. Keep it on a private network or behind a
   TLS proxy.
+
+Behind a reverse proxy, forward to the scaler's port and send `X-Forwarded-Proto` so the session cookie is marked
+`Secure`. Do not add a second login in front: machines send the bearer token and cannot answer one. Example (Caddy,
+LAN only, upstream is the published host port so the proxy need not join the stack's network):
+
+```
+runner.example.com {
+	@tunnelled header Cf-Connecting-Ip *
+	@not_lan not remote_ip private_ranges
+	respond @tunnelled "Home network only." 403
+	respond @not_lan "Home network only." 403
+	reverse_proxy 172.17.0.1:8787 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+```
+
+The dashboard controls your runners: keep it off the public internet unless you have changed every default password.
 
 ### Caches
 
