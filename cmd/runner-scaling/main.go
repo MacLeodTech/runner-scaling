@@ -229,6 +229,7 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 	}
 	s := &scaler.Scaler{
 		Log: log, Guard: gc, GitHub: gh, Session: session, ScaleSetID: ss.ID, Info: info, Min: *minR, Max: *maxR,
+		TrustedRefs: trustedRefs(),
 	}
 	// Deliberately no scale set deletion on exit: queued jobs keep waiting for it while the scaler restarts.
 	return l.Run(ctx, s)
@@ -356,4 +357,20 @@ func sameLabels(a, b []scaleset.Label) bool {
 		}
 	}
 	return true
+}
+
+// trustedRefs reads CACHE_TRUSTED_REFS: comma-separated git refs whose jobs may keep the slot's warm caches. Default
+// refs/heads/main; "none" (or any list without a ref) makes the guard wipe caches after every job.
+func trustedRefs() []string {
+	v, ok := os.LookupEnv("CACHE_TRUSTED_REFS")
+	if !ok {
+		v = "refs/heads/main"
+	}
+	var out []string
+	for _, r := range strings.Split(v, ",") {
+		if r = strings.TrimSpace(r); r != "" && r != "none" {
+			out = append(out, r)
+		}
+	}
+	return out
 }
