@@ -73,6 +73,12 @@ func (g *GuardClient) Slots(ctx context.Context) ([]api.Slot, error) {
 	return s, g.do(ctx, http.MethodGet, "/v1/slots", nil, &s, http.StatusOK)
 }
 
+// SlotStats is Slots with each slot's resource use (CPU, memory, pids, network and disk I/O).
+func (g *GuardClient) SlotStats(ctx context.Context) ([]api.Slot, error) {
+	var s []api.Slot
+	return s, g.do(ctx, http.MethodGet, "/v1/slots?stats=1", nil, &s, http.StatusOK)
+}
+
 func (g *GuardClient) Start(ctx context.Context, slot int, req api.StartRequest) error {
 	return g.do(ctx, http.MethodPut, "/v1/slots/"+strconv.Itoa(slot), req, nil, http.StatusCreated)
 }

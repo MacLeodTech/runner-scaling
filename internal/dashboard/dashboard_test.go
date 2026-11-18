@@ -54,7 +54,7 @@ func TestNilTrackerIsSafe(t *testing.T) {
 
 type fakeSlots struct{ err error }
 
-func (f fakeSlots) Slots(context.Context) ([]api.Slot, error) {
+func (f fakeSlots) SlotStats(context.Context) ([]api.Slot, error) {
 	return []api.Slot{{Slot: 1, RunnerName: "ci-1-x", RunnerState: "running"}}, f.err
 }
 

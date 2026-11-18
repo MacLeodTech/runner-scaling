@@ -52,7 +52,9 @@ type Guard struct {
 	keepMu     sync.Mutex     // guards keepCache and cacheDirty
 	keepCache  map[int]string // slot -> runner whose caches the scaler vouched for; consumed at teardown
 	cacheDirty map[int]bool   // slots whose caches could not be emptied
-	overMem    int            // consecutive reap ticks over memory_budget; only touched by Reap
+	cpuMu      sync.Mutex
+	cpuPrev    map[string]cpuSample // container id -> last CPU reading, for the dashboard's CPU %
+	overMem    int                  // consecutive reap ticks over memory_budget; only touched by Reap
 	nameRE     *regexp.Regexp
 }
 
@@ -131,6 +133,89 @@ func (g *Guard) List(ctx context.Context) ([]api.Slot, error) {
 		out = append(out, *by[k])
 	}
 	return out, nil
+}
+
+type cpuSample struct {
+	nanos int64
+	at    time.Time
+}
+
+// ListWithStats is List plus each slot's resource use, summed over its containers. CPU % is the change since the
+// previous call, so the first sample of a container reads 0. A container that can't be sampled is left out.
+func (g *Guard) ListWithStats(ctx context.Context) ([]api.Slot, error) {
+	slots, err := g.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cs, err := g.d.ContainerList(ctx, labelInstance+"="+g.cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	idx := map[int]int{}
+	for i := range slots {
+		idx[slots[i].Slot] = i
+	}
+	type res struct {
+		slot int
+		id   string
+		u    ContainerUsage
+		at   time.Time
+	}
+	var mu sync.Mutex
+	var got []res
+	var wg sync.WaitGroup
+	for _, c := range cs {
+		n, err := strconv.Atoi(c.Labels[labelSlot])
+		if err != nil || c.State != "running" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			u, err := g.d.ContainerStats(ctx, c.ID)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			got = append(got, res{n, c.ID, u, time.Now()})
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	g.cpuMu.Lock()
+	defer g.cpuMu.Unlock()
+	if g.cpuPrev == nil {
+		g.cpuPrev = map[string]cpuSample{}
+	}
+	seen := map[string]bool{}
+	for _, r := range got {
+		i, ok := idx[r.slot]
+		if !ok {
+			continue
+		}
+		st := slots[i].Stats
+		if st == nil {
+			st = &api.SlotStats{}
+			slots[i].Stats = st
+		}
+		st.MemBytes += r.u.MemBytes
+		st.PIDs += r.u.PIDs
+		st.NetRxBytes += r.u.NetRx
+		st.NetTxBytes += r.u.NetTx
+		st.BlkReadBytes += r.u.BlkRead
+		st.BlkWriteBytes += r.u.BlkWrite
+		if p, ok := g.cpuPrev[r.id]; ok && r.at.After(p.at) && r.u.CPUNanos >= p.nanos {
+			st.CPUPercent += float64(r.u.CPUNanos-p.nanos) / float64(r.at.Sub(p.at).Nanoseconds()) * 100
+		}
+		g.cpuPrev[r.id] = cpuSample{r.u.CPUNanos, r.at}
+		seen[r.id] = true
+	}
+	for id := range g.cpuPrev { // forget containers that are gone
+		if !seen[id] {
+			delete(g.cpuPrev, id)
+		}
+	}
+	return slots, nil
 }
 
 // Start brings a slot up: network, fresh work volume, dind (waited on until healthy), then the runner.

@@ -29,6 +29,8 @@ type Docker interface {
 	Exec(ctx context.Context, id string, cmd []string) (int, error)
 	// ContainerMemory returns a container's memory working set in bytes (usage minus inactive file cache).
 	ContainerMemory(ctx context.Context, id string) (int64, error)
+	// ContainerStats returns one sample of a container's resource use, for the dashboard.
+	ContainerStats(ctx context.Context, id string) (ContainerUsage, error)
 }
 
 // ContainerSpec is the body of POST /containers/create. Only fields the guard sets are listed.
@@ -270,6 +272,63 @@ func (d *SocketDocker) ContainerMemory(ctx context.Context, id string) (int64, e
 		use -= v
 	}
 	return max(use, 0), nil
+}
+
+// ContainerUsage is one stats sample. CPUNanos is cumulative CPU time, so a rate needs two samples.
+type ContainerUsage struct {
+	MemBytes, CPUNanos, PIDs, NetRx, NetTx, BlkRead, BlkWrite int64
+}
+
+// ContainerStats reads one stats sample (memory as in ContainerMemory).
+func (d *SocketDocker) ContainerStats(ctx context.Context, id string) (ContainerUsage, error) {
+	var out struct {
+		MemoryStats struct {
+			Usage int64            `json:"usage"`
+			Stats map[string]int64 `json:"stats"`
+		} `json:"memory_stats"`
+		CPUStats struct {
+			CPUUsage struct {
+				Total int64 `json:"total_usage"`
+			} `json:"cpu_usage"`
+		} `json:"cpu_stats"`
+		PidsStats struct {
+			Current int64 `json:"current"`
+		} `json:"pids_stats"`
+		Networks map[string]struct {
+			Rx int64 `json:"rx_bytes"`
+			Tx int64 `json:"tx_bytes"`
+		} `json:"networks"`
+		BlkioStats struct {
+			IO []struct {
+				Op    string `json:"op"`
+				Value int64  `json:"value"`
+			} `json:"io_service_bytes_recursive"`
+		} `json:"blkio_stats"`
+	}
+	q := url.Values{"stream": {"false"}, "one-shot": {"true"}}
+	if _, err := d.do(ctx, http.MethodGet, "/containers/"+id+"/stats", q, nil, &out); err != nil {
+		return ContainerUsage{}, err
+	}
+	u := ContainerUsage{MemBytes: out.MemoryStats.Usage, CPUNanos: out.CPUStats.CPUUsage.Total, PIDs: out.PidsStats.Current}
+	if v, ok := out.MemoryStats.Stats["inactive_file"]; ok {
+		u.MemBytes -= v
+	} else if v, ok := out.MemoryStats.Stats["total_inactive_file"]; ok {
+		u.MemBytes -= v
+	}
+	u.MemBytes = max(u.MemBytes, 0)
+	for _, n := range out.Networks {
+		u.NetRx += n.Rx
+		u.NetTx += n.Tx
+	}
+	for _, b := range out.BlkioStats.IO {
+		switch strings.ToLower(b.Op) {
+		case "read":
+			u.BlkRead += b.Value
+		case "write":
+			u.BlkWrite += b.Value
+		}
+	}
+	return u, nil
 }
 
 // Exec runs cmd detached and polls until it finishes, returning its exit code.
