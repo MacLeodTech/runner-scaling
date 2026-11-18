@@ -5,7 +5,11 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
@@ -28,7 +32,14 @@ type State struct {
 	Slots    []api.Slot `json:"slots"`
 	GuardErr string     `json:"guard_error,omitempty"`
 	Snapshot
+	// Peers are the other scalers' own states (one per pool), so one page can show every pool.
+	Peers []State `json:"peers,omitempty"`
+	// PeerErr is set on a peer entry that could not be fetched.
+	PeerErr string `json:"peer_error,omitempty"`
 }
+
+// Peer is another scaler's dashboard, e.g. {"lite", "http://scaler-lite:8080"}.
+type Peer struct{ Name, URL string }
 
 // Server serves the page and its JSON. It is read-only: GET and HEAD only, and nothing on it changes anything.
 type Server struct {
@@ -36,6 +47,7 @@ type Server struct {
 	Info          api.Info
 	Guard         Slots
 	Tracker       *Tracker
+	Peers         []Peer // other pools to fold into this page; they must share Token
 	Token         string // if set, required as a bearer token, ?token= or the password of basic auth
 }
 
@@ -59,9 +71,48 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	} else if slots != nil {
 		st.Slots = slots
 	}
+	if r.URL.Query().Get("local") == "" { // peers answer with local=1, so peers never chain
+		st.Peers = s.peerStates(ctx)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(st)
+}
+
+func (s *Server) peerStates(ctx context.Context) []State {
+	out := make([]State, len(s.Peers))
+	var wg sync.WaitGroup
+	for i, p := range s.Peers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out[i] = State{Name: p.Name, Slots: []api.Slot{}, Snapshot: Snapshot{Queued: []Job{}, Running: []Job{}, Recent: []Job{}}}
+			req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(p.URL, "/")+"/api/state?local=1", nil)
+			if err == nil {
+				if s.Token != "" {
+					req.Header.Set("Authorization", "Bearer "+s.Token)
+				}
+				var resp *http.Response
+				if resp, err = http.DefaultClient.Do(req); err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode != 200 {
+						err = fmt.Errorf("status %d", resp.StatusCode)
+					} else {
+						var got State
+						if err = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&got); err == nil {
+							got.Name, got.Peers = p.Name, nil
+							out[i] = got
+						}
+					}
+				}
+			}
+			if err != nil {
+				out[i].PeerErr = p.Name + " unreachable"
+			}
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // secure adds the headers every response gets and, when a token is set, the check. /healthz is open.
