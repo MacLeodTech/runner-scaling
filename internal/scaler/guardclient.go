@@ -20,6 +20,7 @@ type Guard interface {
 	Slots(ctx context.Context) ([]api.Slot, error)
 	Start(ctx context.Context, slot int, req api.StartRequest) error
 	Stop(ctx context.Context, slot int) error
+	KeepCache(ctx context.Context, slot int, runner string) error
 }
 
 // GuardClient talks to the guard over its unix socket.
@@ -78,4 +79,8 @@ func (g *GuardClient) Start(ctx context.Context, slot int, req api.StartRequest)
 
 func (g *GuardClient) Stop(ctx context.Context, slot int) error {
 	return g.do(ctx, http.MethodDelete, "/v1/slots/"+strconv.Itoa(slot), nil, nil, http.StatusNoContent)
+}
+
+func (g *GuardClient) KeepCache(ctx context.Context, slot int, runner string) error {
+	return g.do(ctx, http.MethodPost, "/v1/slots/"+strconv.Itoa(slot)+"/keep-cache", api.KeepCacheRequest{RunnerName: runner}, nil, http.StatusNoContent)
 }

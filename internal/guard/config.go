@@ -46,6 +46,12 @@ type Config struct {
 	// Docker's own disk is small. The guard empties it before each runner starts and again when the slot is torn
 	// down: through the slot's dind, or without dind in a one-shot container (runner image, no network).
 	WorkBind string `yaml:"work_bind"`
+	// CacheDirs are host directories ({slot} required) holding warm caches that consecutive jobs on a slot share
+	// (toolchain, package and image layer caches). A job can plant code in them that a later job runs, so the guard
+	// empties them whenever a slot is torn down, unless the scaler has vouched for the job that ran there
+	// (POST /v1/slots/{n}/keep-cache). They are also emptied at startup and before a slot whose last wipe failed
+	// is reused.
+	CacheDirs []string `yaml:"cache_dirs"`
 	// CgroupParent puts every container the guard creates under one cgroup, so one memory limit can cover all
 	// runners together (several guards may share it). With Docker's systemd cgroup driver this is a slice, e.g.
 	// runner-scaling.slice; set its limit on the host: systemctl set-property runner-scaling.slice MemoryMax=8G.
@@ -209,6 +215,11 @@ func (c *Config) Validate() error {
 	if c.WorkBind != "" {
 		if h := c.Expand(c.WorkBind, 1); !path.IsAbs(h) || path.Clean(h) == "/" || strings.Contains(h, ":") || !strings.Contains(c.WorkBind, "{slot}") {
 			errs = append(errs, errors.New("work_bind must be an absolute host path containing {slot}"))
+		}
+	}
+	for _, d := range c.CacheDirs {
+		if h := c.Expand(d, 1); !path.IsAbs(h) || path.Clean(h) != h || h == "/" || strings.Contains(h, ":") || !strings.Contains(d, "{slot}") {
+			errs = append(errs, fmt.Errorf("cache_dirs entry %q must be a clean absolute host path containing {slot}", d))
 		}
 	}
 	if c.MaxRuntime.Duration < 0 || (c.MaxRuntime.Duration > 0 && c.MaxRuntime.Duration < time.Minute) {

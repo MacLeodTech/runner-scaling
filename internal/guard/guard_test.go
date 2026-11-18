@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ type fakeDocker struct {
 	pulled     []string
 	dindHealth string
 	wipes      []ContainerSpec
+	wipeExit   int              // exit code of one-shot wipers
 	mem        map[string]int64 // by container name
 	memErr     error
 	memCalls   int
@@ -102,6 +104,9 @@ func (f *fakeDocker) ContainerInspect(_ context.Context, id string) (*ContainerS
 		return nil, ErrNotFound
 	}
 	st := &ContainerState{Status: c.state}
+	if c.spec.Labels[labelRole] == "wipe" {
+		st.ExitCode = f.wipeExit
+	}
 	if c.spec.Healthcheck != nil {
 		st.Health = f.dindHealth
 	}
@@ -840,5 +845,141 @@ func TestMemoryAdmissionCountsCreatedContainers(t *testing.T) {
 	f.containers["lite-dind-2"] = &fakeContainer{state: "created", spec: ContainerSpec{Labels: map[string]string{labelInstance: "lite", labelSlot: "2", labelRole: "dind"}}}
 	if err := startSlot(t, g, 1); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("two mid-start slots (2G) must deny: %v", err)
+	}
+}
+
+func cacheGuard(t *testing.T) (*Guard, *fakeDocker) {
+	t.Helper()
+	g, f := newGuard(t)
+	g.cfg.CacheDirs = []string{"/srv/rs/{slot}/cache", "/srv/rs/{slot}/docker"}
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return g, f
+}
+
+// cacheWipes returns the host paths each cache wipe covered.
+func cacheWipes(f *fakeDocker) [][]string {
+	var out [][]string
+	for _, w := range f.wipes {
+		if len(w.HostConfig.Binds) > 0 && strings.Contains(w.HostConfig.Binds[0], ":/wipe/") {
+			var hosts []string
+			for _, b := range w.HostConfig.Binds {
+				hosts = append(hosts, strings.SplitN(b, ":", 2)[0])
+			}
+			out = append(out, hosts)
+		}
+	}
+	return out
+}
+
+func TestCachesWipedAtTeardownUnlessVouched(t *testing.T) {
+	ctx := context.Background()
+	g, f := cacheGuard(t)
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Stop(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cacheWipes(f), [][]string{{"/srv/rs/1/cache", "/srv/rs/1/docker"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unvouched stop wiped %v, want %v", got, want)
+	}
+	for _, w := range f.wipes {
+		if w.HostConfig.NetworkMode != "none" || w.HostConfig.Privileged {
+			t.Errorf("wiper spec: %+v", w.HostConfig)
+		}
+	}
+
+	f.wipes = nil
+	if err := startSlot(t, g, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.KeepCache(ctx, 2, "homelab-2-abcd12"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Stop(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if w := cacheWipes(f); len(w) != 0 {
+		t.Fatalf("vouched stop wiped %v", w)
+	}
+
+	// The vouch is for one runner only: the next one on the slot starts without it.
+	if err := startSlot(t, g, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Stop(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if w := cacheWipes(f); len(w) != 1 {
+		t.Fatalf("second runner's stop wiped %v, want one wipe", w)
+	}
+}
+
+func TestKeepCacheRejectsWrongRunner(t *testing.T) {
+	g, _ := cacheGuard(t)
+	ctx := context.Background()
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		slot   int
+		runner string
+		want   error
+	}{{1, "homelab-1-zzzzzz", ErrConflict}, {1, "", ErrConflict}, {3, "homelab-3-abcd12", ErrConflict}, {9, "homelab-9-abcd12", ErrBadRequest}} {
+		if err := g.KeepCache(ctx, c.slot, c.runner); !errors.Is(err, c.want) {
+			t.Errorf("KeepCache(%d,%q) = %v, want %v", c.slot, c.runner, err, c.want)
+		}
+	}
+}
+
+func TestReapWipesCachesOfExitedRunner(t *testing.T) {
+	g, f := cacheGuard(t)
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	f.containers["homelab-runner-1"].state = "exited"
+	g.Reap(context.Background())
+	if w := cacheWipes(f); len(w) != 1 {
+		t.Fatalf("reap wiped %v, want one wipe", w)
+	}
+}
+
+func TestFailedCacheWipeBlocksReuse(t *testing.T) {
+	g, f := cacheGuard(t)
+	ctx := context.Background()
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	f.wipeExit = 1
+	if err := g.Stop(ctx, 1); err == nil {
+		t.Fatal("stop should report the failed wipe")
+	}
+	if err := startSlot(t, g, 1); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("start after failed wipe = %v, want ErrNotReady", err)
+	}
+	f.wipeExit = 0
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatalf("start after wipe works again: %v", err)
+	}
+}
+
+func TestWipeStaleEmptiesCaches(t *testing.T) {
+	g, f := cacheGuard(t)
+	f.containers["homelab-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: g.labels(2, "runner", "homelab-2-abcd12")}}
+	g.WipeStale(context.Background())
+	if got := len(cacheWipes(f)); got != 2 { // slots 1 and 3; slot 2 is in use
+		t.Fatalf("startup wiped caches of %d slots, want 2", got)
+	}
+}
+
+func TestCacheDirsValidation(t *testing.T) {
+	for _, d := range []string{"relative/{slot}", "/srv/cache", "/srv/{slot}/../x", "/srv/a:b/{slot}", "/"} {
+		g, _ := newGuard(t)
+		g.cfg.CacheDirs = []string{d}
+		if err := g.cfg.Validate(); err == nil {
+			t.Errorf("cache_dirs %q accepted", d)
+		}
 	}
 }

@@ -57,6 +57,24 @@ func (g *Guard) Handler() http.Handler {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("POST /v1/slots/{n}/keep-cache", func(w http.ResponseWriter, r *http.Request) {
+		n, ok := g.slotArg(w, r)
+		if !ok {
+			return
+		}
+		var req api.KeepCacheRequest
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			g.fail(w, r, errors.Join(ErrBadRequest, err))
+			return
+		}
+		if err := g.KeepCache(r.Context(), n, req.RunnerName); err != nil {
+			g.fail(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		g.log.Warn("DENY", "method", r.Method, "path", r.URL.Path, "reason", "no such endpoint")
 		writeJSON(w, http.StatusNotFound, api.Error{Error: "no such endpoint"})

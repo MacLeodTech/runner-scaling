@@ -17,6 +17,7 @@ import (
 type fakeGuard struct {
 	slots   map[int]api.Slot
 	failing bool
+	kept    []string // runners whose caches were vouched for
 }
 
 func (g *fakeGuard) Info(context.Context) (api.Info, error) { return api.Info{}, nil }
@@ -33,6 +34,10 @@ func (g *fakeGuard) Start(_ context.Context, n int, r api.StartRequest) error {
 		return errors.New("boom")
 	}
 	g.slots[n] = api.Slot{Slot: n, RunnerName: r.RunnerName, RunnerState: "running"}
+	return nil
+}
+func (g *fakeGuard) KeepCache(_ context.Context, _ int, runner string) error {
+	g.kept = append(g.kept, runner)
 	return nil
 }
 func (g *fakeGuard) Stop(_ context.Context, n int) error { delete(g.slots, n); return nil }
@@ -156,5 +161,54 @@ func TestNilMessageReconverges(t *testing.T) {
 	s.Scale(ctx, nil)
 	if len(g.slots) != 2 {
 		t.Fatalf("not refilled: %v", g.slots)
+	}
+}
+
+func TestTrustedJobsKeepCaches(t *testing.T) {
+	cases := []struct {
+		name, event, ref string
+		refs             []string
+		keep             bool
+	}{
+		{"push to main", "push", "refs/heads/main", []string{"refs/heads/main"}, true},
+		{"schedule on main", "schedule", "refs/heads/main", []string{"refs/heads/main"}, true},
+		{"push to a branch", "push", "refs/heads/feature", []string{"refs/heads/main"}, false},
+		{"pull request", "pull_request", "refs/pull/3/merge", []string{"refs/heads/main"}, false},
+		{"pull_request_target runs on main", "pull_request_target", "refs/heads/main", []string{"refs/heads/main"}, false},
+		{"workflow_run on main", "workflow_run", "refs/heads/main", []string{"refs/heads/main"}, false},
+		{"nothing trusted", "push", "refs/heads/main", nil, false},
+		{"tag push", "push", "refs/tags/v1", []string{"refs/heads/main"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, g, _ := newScaler(2)
+			s.TrustedRefs = c.refs
+			if err := s.Scale(context.Background(), stats(1)); err != nil {
+				t.Fatal(err)
+			}
+			name := g.slots[1].RunnerName
+			started := &scaleset.JobStarted{RunnerName: name, JobMessageBase: scaleset.JobMessageBase{
+				EventName: c.event, JobWorkflowRef: "MacLeodTech/eddas/.github/workflows/rust.yml@" + c.ref,
+			}}
+			if err := s.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{started}}); err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.Contains(g.kept, name); got != c.keep {
+				t.Errorf("kept=%v (%v), want %v", got, g.kept, c.keep)
+			}
+		})
+	}
+}
+
+func TestIdleRunnerKeepsCachesWhenRemoved(t *testing.T) {
+	s, g, _ := newScaler(2)
+	if err := s.Scale(context.Background(), stats(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Scale(context.Background(), stats(1)); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.slots) != 1 || len(g.kept) != 1 {
+		t.Fatalf("slots=%v kept=%v: want one idle runner removed with its caches kept", g.slots, g.kept)
 	}
 }

@@ -78,10 +78,13 @@ names. The guard decodes it and requires that:
 - **Only run jobs from repos you trust.** On GitHub, limit the runner group to private repos, disable fork PR
   workflows (or require approval), keep bot PRs off the Docker pool, and fence the per-slot subnets with a host
   firewall so jobs reach only the internet. On plans without branch protection, any branch can change a workflow.
-- **Caches carry over between jobs.** Runners are thrown away, but per-slot cache directories (`binds`, including a
-  dind `/var/lib/docker`) are not. A job that can write to them can plant code (a toolchain binary, a retagged
-  image) that the next job on that slot runs, whatever repo it comes from. Share caches only between repos that
-  trust each other, or leave them out.
+- **Caches carry over between jobs, unless you list them in `cache_dirs`.** Runners are thrown away, but per-slot
+  cache directories (`binds`, including a dind `/var/lib/docker`) are not. A job that can write to them can plant
+  code (a toolchain binary, a retagged image) that the next job on that slot runs, whatever repo it comes from.
+  Directories listed in `cache_dirs` are emptied by the guard after every job except one the scaler vouches for
+  (a push, schedule, dispatch or release on a trusted ref, `refs/heads/main` by default), so a PR or branch job can't
+  leave anything behind for a `main` build. Jobs from different repos on `main` still share caches, and a reusable
+  workflow's ref is the called workflow's, not the caller's. Unlisted cache binds are not protected.
 - **Without dind, jobs are still root in their container** unless the runner image says otherwise, and containers
   share the host kernel: a kernel escape is root on the host. Add a stronger runtime (gVisor, Sysbox, user
   namespaces) if the jobs aren't fully trusted.
@@ -147,7 +150,12 @@ names. The guard decodes it and requires that:
   runners under one cgroup that you can cap with `systemctl set-property`.
 - **Caches.** Bind per-slot cache directories (`{slot}` in a path is replaced with the slot number) so warm jobs
   skip downloads. A dind `/var/lib/docker` must never be shared between slots. Slots are only ever reused one
-  runner at a time.
+  runner at a time. List the same directories under `cache_dirs` to keep them safe: the guard empties them (in a
+  one-shot container, no network) when a slot is torn down, at startup, and before reusing a slot whose wipe failed,
+  except after a job the scaler marked trusted. The scaler marks a job trusted when its event is `push`, `schedule`,
+  `workflow_dispatch` or `release` and its workflow ref is in `CACHE_TRUSTED_REFS` (comma-separated, default
+  `refs/heads/main`; `none` wipes after every job). If the scaler is down or misses the job start, the caches are
+  wiped: the failure costs speed, not safety. The cost is cold caches for every PR and branch job.
 
 ## Development
 

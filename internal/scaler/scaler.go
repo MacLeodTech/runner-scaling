@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -34,6 +36,9 @@ type Scaler struct {
 	ScaleSetID int
 	Info       api.Info // from the guard: prefix, slot count, work dir
 	Min, Max   int
+	// TrustedRefs are the git refs (e.g. refs/heads/main) whose push, schedule, dispatch and release jobs may reuse
+	// and leave behind the slot's warm caches. Every other job's caches are wiped by the guard. Empty: wipe always.
+	TrustedRefs []string
 
 	busy         map[string]bool // runners that have started a job
 	lastAssigned int
@@ -62,6 +67,11 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	for _, j := range msg.JobStartedMessages {
 		s.Log.Info("job started", "runner", j.RunnerName, "repo", j.OwnerName+"/"+j.RepositoryName, "job", j.JobDisplayName)
 		s.busy[j.RunnerName] = true
+		if s.trusted(&j.JobMessageBase) {
+			if err := s.keepCache(ctx, j.RunnerName); err != nil {
+				return err
+			}
+		}
 	}
 	if len(msg.JobCompletedMessages) > 0 {
 		slots, err := s.Guard.Slots(ctx)
@@ -86,6 +96,35 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		s.lastAssigned = msg.Statistics.TotalAssignedJobs
 	}
 	return s.converge(ctx, s.lastAssigned)
+}
+
+// trustedEvents are the triggers that only someone with write access to the repo can fire. pull_request,
+// pull_request_target, issue_comment, workflow_run and the like can carry content from elsewhere.
+var trustedEvents = []string{"push", "schedule", "workflow_dispatch", "release"}
+
+// trusted reports whether a job is a trusted event on a trusted ref. The ref comes from job_workflow_ref
+// (owner/repo/.github/workflows/x.yml@refs/heads/main); for a reusable workflow that is the called workflow's ref,
+// not the caller's, so a push to another branch that calls a reusable workflow at main counts as trusted.
+func (s *Scaler) trusted(j *scaleset.JobMessageBase) bool {
+	_, ref, ok := strings.Cut(j.JobWorkflowRef, "@")
+	return ok && slices.Contains(s.TrustedRefs, ref) && slices.Contains(trustedEvents, j.EventName)
+}
+
+// keepCache asks the guard to leave the caches of the slot running runner alone when it is torn down. A guard that
+// can't be reached is an error; a refusal (the runner already left) only means the caches get wiped.
+func (s *Scaler) keepCache(ctx context.Context, runner string) error {
+	slots, err := s.Guard.Slots(ctx)
+	if err != nil {
+		return err
+	}
+	for _, sl := range slots {
+		if sl.RunnerName == runner {
+			if err := s.Guard.KeepCache(ctx, sl.Slot, runner); err != nil {
+				s.Log.Warn("keep cache", "slot", sl.Slot, "runner", runner, "err", err)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Scaler) converge(ctx context.Context, assigned int) error {
@@ -172,6 +211,10 @@ func (s *Scaler) removeIdle(ctx context.Context, sl api.Slot) bool {
 			s.Log.Info("idle runner not removed (probably took a job)", "runner", sl.RunnerName, "err", err)
 			return false
 		}
+	}
+	// It never ran a job, so its caches are as clean as it found them.
+	if err := s.Guard.KeepCache(ctx, sl.Slot, sl.RunnerName); err != nil {
+		s.Log.Warn("keep cache of idle runner", "slot", sl.Slot, "err", err)
 	}
 	if err := s.Guard.Stop(ctx, sl.Slot); err != nil {
 		s.Log.Warn("stop slot", "slot", sl.Slot, "err", err)

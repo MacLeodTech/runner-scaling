@@ -49,15 +49,18 @@ type Guard struct {
 	afterAdmit func()     // test seam: runs after the budget check passes, before the slot is claimed; nil in production
 	mu         sync.Mutex
 	starting   map[int]bool
-	overMem    int // consecutive reap ticks over memory_budget; only touched by Reap
+	keepMu     sync.Mutex     // guards keepCache and cacheDirty
+	keepCache  map[int]string // slot -> runner whose caches the scaler vouched for; consumed at teardown
+	cacheDirty map[int]bool   // slots whose caches could not be emptied
+	overMem    int            // consecutive reap ticks over memory_budget; only touched by Reap
 	nameRE     *regexp.Regexp
 }
 
 func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
 	return &Guard{
 		cfg: cfg, d: d, log: log,
-		starting: map[int]bool{},
-		nameRE:   regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.Prefix) + `-([0-9]+)-[a-z0-9]{4,16}$`),
+		starting: map[int]bool{}, keepCache: map[int]string{}, cacheDirty: map[int]bool{},
+		nameRE: regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.Prefix) + `-([0-9]+)-[a-z0-9]{4,16}$`),
 	}
 }
 
@@ -158,9 +161,18 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 
 	ctx, cancel := context.WithTimeout(ctx, g.cfg.StartTimeout.Duration)
 	defer cancel()
+	g.keepMu.Lock()
+	delete(g.keepCache, slot)
+	dirty := g.cacheDirty[slot]
+	g.keepMu.Unlock()
+	if dirty {
+		if err := g.wipeCaches(ctx, slot); err != nil {
+			return fmt.Errorf("%w: caches of slot %d could not be emptied: %v", ErrNotReady, slot, err)
+		}
+	}
 	if err := g.start(ctx, slot, req); err != nil {
 		g.log.Error("slot start failed, tearing down", "slot", slot, "err", err)
-		g.teardown(context.WithoutCancel(ctx), slot, false)
+		g.teardown(context.WithoutCancel(ctx), slot, false, false) // no job ran: the caches are as they were
 		return err
 	}
 	g.log.Info("slot started", "slot", slot, "runner", req.RunnerName)
@@ -285,7 +297,7 @@ func (g *Guard) wipeWork(ctx context.Context, slot int) error {
 		_, dindName, _, _ := g.names(slot)
 		code, err = g.d.Exec(ctx, dindName, cmd)
 	} else {
-		code, err = g.wipeOneShot(ctx, slot, cmd)
+		code, err = g.wipeOneShot(ctx, slot, cmd, []string{g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir})
 	}
 	if err == nil && code != 0 {
 		err = fmt.Errorf("exit %d", code)
@@ -296,7 +308,7 @@ func (g *Guard) wipeWork(ctx context.Context, slot int) error {
 	return nil
 }
 
-func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd []string) (int, error) {
+func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) (int, error) {
 	name := g.wiperName(slot)
 	if err := g.d.ContainerRemove(ctx, name); err != nil {
 		return -1, err
@@ -308,7 +320,7 @@ func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd []string) (int, e
 		Entrypoint: cmd,
 		Labels:     g.labels(slot, "wipe", ""),
 		HostConfig: HostConfig{
-			Binds:         []string{g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir},
+			Binds:         binds,
 			NetworkMode:   "none",
 			RestartPolicy: map[string]any{"Name": "no"},
 			CapDrop:       []string{"ALL"},
@@ -435,10 +447,68 @@ func (g *Guard) Stop(ctx context.Context, slot int) error {
 	if g.starting[slot] {
 		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
 	}
-	return g.teardown(ctx, slot, true)
+	return g.teardown(ctx, slot, true, !g.takeKeep(slot))
 }
 
-func (g *Guard) teardown(ctx context.Context, slot int, prune bool) error {
+// KeepCache records that the runner on slot is running a trusted job, so teardown leaves the slot's caches alone.
+// The runner name must be the one currently on the slot, so a late call can't vouch for a later runner.
+func (g *Guard) KeepCache(ctx context.Context, slot int, runner string) error {
+	if slot < 1 || slot > g.cfg.MaxSlots {
+		return fmt.Errorf("%w: slot %d outside 1..%d", ErrBadRequest, slot, g.cfg.MaxSlots)
+	}
+	slots, err := g.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, s := range slots {
+		if s.Slot == slot && s.RunnerName == runner && runner != "" {
+			g.keepMu.Lock()
+			g.keepCache[slot] = runner
+			g.keepMu.Unlock()
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: slot %d is not running %q", ErrConflict, slot, runner)
+}
+
+// takeKeep consumes the slot's keep-cache vouch.
+func (g *Guard) takeKeep(slot int) bool {
+	g.keepMu.Lock()
+	defer g.keepMu.Unlock()
+	_, ok := g.keepCache[slot]
+	delete(g.keepCache, slot)
+	return ok
+}
+
+// wipeCaches empties every cache_dirs directory of the slot in a one-shot container with nothing else mounted and
+// no network. The slot's containers must be gone (dind's image store is among them).
+func (g *Guard) wipeCaches(ctx context.Context, slot int) error {
+	if len(g.cfg.CacheDirs) == 0 {
+		return nil
+	}
+	var binds, targets []string
+	for i, d := range g.cfg.CacheDirs {
+		t := "/wipe/" + strconv.Itoa(i)
+		binds = append(binds, g.cfg.Expand(d, slot)+":"+t)
+		targets = append(targets, t)
+	}
+	cmd := append([]string{"sh", "-c", `for d in "$@"; do find "$d" -mindepth 1 -delete || exit 1; done`, "wipe"}, targets...)
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	code, err := g.wipeOneShot(wctx, slot, cmd, binds)
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	g.keepMu.Lock()
+	g.cacheDirty[slot] = err != nil
+	g.keepMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("empty caches: %w", err)
+	}
+	return nil
+}
+
+func (g *Guard) teardown(ctx context.Context, slot int, prune, wipeCaches bool) error {
 	runnerName, dindName, _, volName := g.names(slot)
 	var errs []error
 	if err := g.d.ContainerRemove(ctx, runnerName); err != nil {
@@ -475,6 +545,11 @@ func (g *Guard) teardown(ctx context.Context, slot int, prune bool) error {
 	if err := g.d.ContainerRemove(ctx, g.wiperName(slot)); err != nil {
 		errs = append(errs, err)
 	}
+	if wipeCaches {
+		if err := g.wipeCaches(ctx, slot); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if g.cfg.WorkBind == "" {
 		if err := g.d.VolumeRemove(ctx, volName); err != nil {
 			errs = append(errs, err)
@@ -483,25 +558,33 @@ func (g *Guard) teardown(ctx context.Context, slot int, prune bool) error {
 	return errors.Join(errs...)
 }
 
-// WipeStale empties the work_bind directory of every slot that has no containers, so a crash can't leave job data
-// behind. Call it at startup, before serving. Failures are logged and skipped.
+// WipeStale empties the work_bind directory and the cache_dirs of every slot that has no containers, so a crash
+// can't leave job data or a poisoned cache behind. Call it at startup, before serving. Failures are logged and
+// skipped (a slot whose caches could not be emptied is refused until they are).
 func (g *Guard) WipeStale(ctx context.Context) {
-	if g.cfg.WorkBind == "" {
+	if g.cfg.WorkBind == "" && len(g.cfg.CacheDirs) == 0 {
 		return
 	}
 	for slot := 1; slot <= g.cfg.MaxSlots; slot++ {
 		g.mu.Lock()
 		busy, err := g.slotHasContainers(ctx, slot)
 		if err == nil && !busy && !g.starting[slot] {
-			wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-			code, werr := g.wipeOneShot(wctx, slot, append(slices.Clone(wipeCmd), g.cfg.WorkDir))
-			cancel()
-			if werr == nil && code != 0 {
-				werr = fmt.Errorf("exit %d", code)
+			if g.cfg.WorkBind != "" {
+				wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				var code int
+				code, err = g.wipeOneShot(wctx, slot, append(slices.Clone(wipeCmd), g.cfg.WorkDir), []string{g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir})
+				if err == nil && code != 0 {
+					err = fmt.Errorf("exit %d", code)
+				}
+				cancel()
+				if err == nil {
+					g.log.Info("wiped stale work dir", "slot", slot)
+				}
 			}
-			err = werr
-			if err == nil {
-				g.log.Info("wiped stale work dir", "slot", slot)
+			if cerr := g.wipeCaches(ctx, slot); cerr != nil {
+				err = errors.Join(err, cerr)
+			} else if len(g.cfg.CacheDirs) > 0 {
+				g.log.Info("wiped caches at startup", "slot", slot)
 			}
 		}
 		g.mu.Unlock()
@@ -558,7 +641,7 @@ func (g *Guard) Reap(ctx context.Context) {
 		if !g.starting[s.Slot] {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
 			reaped[s.Slot] = true
-			if err := g.teardown(ctx, s.Slot, true); err != nil {
+			if err := g.teardown(ctx, s.Slot, true, !g.takeKeep(s.Slot)); err != nil {
 				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
 			}
 		}
@@ -695,7 +778,7 @@ func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map
 	if !g.starting[victim.Slot] {
 		g.log.Info("reaping slot", "slot", victim.Slot, "runner", victim.RunnerName, "runner_state", victim.RunnerState,
 			"reason", "memory_budget", "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
-		if err := g.teardown(ctx, victim.Slot, true); err != nil {
+		if err := g.teardown(ctx, victim.Slot, true, true); err != nil {
 			g.log.Error("reap: teardown", "slot", victim.Slot, "err", err)
 		}
 	}

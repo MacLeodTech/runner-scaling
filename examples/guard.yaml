@@ -14,6 +14,9 @@ subnet: 172.30.{slot}.0/24    # optional: fixed per-slot subnets, so a host fire
 # memory_budget: 8G           # optional: cap on the memory working set of ALL runner-scaling containers on this host.
 #                             # Shared by every pool: give every guard the same value. New slots wait (503) when full.
 # memory_reserve: 1G          # assumed minimum per slot (runner+dind) for admission; default 1G with memory_budget
+# cache_dirs:                 # optional: warm caches that are emptied when a slot is torn down, unless the scaler vouches
+#   - /srv/runner-scaling/{slot}/toolcache   # for the job (a push/schedule/dispatch/release on CACHE_TRUSTED_REFS,
+#   - /srv/runner-scaling/{slot}/docker      # default refs/heads/main). Also emptied at guard startup. List every cache bind.
 work_dir: /home/runner/_work  # fresh Docker volume per runner, mounted here in the runner and in dind
 
 runner:

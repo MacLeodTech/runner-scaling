@@ -26,6 +26,12 @@ type StartRequest struct {
 	JITConfig  string `json:"jit_config"`
 }
 
+// KeepCacheRequest is the body of POST /v1/slots/{n}/keep-cache: the scaler vouches that the runner on this slot is
+// running a trusted job, so the slot's warm caches (cache_dirs) survive its teardown. Without it they are emptied.
+type KeepCacheRequest struct {
+	RunnerName string `json:"runner_name"`
+}
+
 // Error is the body of every non-2xx response.
 type Error struct {
 	Error string `json:"error"`
