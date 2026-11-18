@@ -101,6 +101,12 @@ names. The guard decodes it and requires that:
    `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_FILE`) with organization *Self-hosted runners: read and
    write*, or a classic PAT with `admin:org` (`GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`). For a repo-level scale set, use
    repo *Administration: read and write*.
+   To make the App: Organization settings > Developer settings > GitHub Apps > New GitHub App. Untick Webhook, grant
+   only Organization permission *Self-hosted runners: Read and write*, and choose "Only on this account". Then
+   *Generate a private key* (a `.pem`), and *Install App* on the organization. The Client ID is on the App's page; the
+   installation ID is the number at the end of the installation's settings URL
+   (`.../settings/installations/<id>`). The App can only manage runners: unlike the PAT it can't touch repos or
+   members, and its tokens expire after an hour.
 2. **`guard.yaml`.** Start from [examples/guard.yaml](examples/guard.yaml). Pin image digests.
 3. **Compose.** See [examples/compose.yaml](examples/compose.yaml). Start it and watch the guard:
    `docker compose logs -f guard`.
