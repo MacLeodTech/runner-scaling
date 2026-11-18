@@ -14,6 +14,7 @@ import (
 	"github.com/actions/scaleset/listener"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
+	"github.com/MacLeodTech/runner-scaling/internal/dashboard"
 )
 
 // GitHub is the part of *scaleset.Client the scaler uses.
@@ -39,6 +40,8 @@ type Scaler struct {
 	// TrustedRefs are the git refs (e.g. refs/heads/main) whose push, schedule, dispatch and release jobs may reuse
 	// and leave behind the slot's warm caches. Every other job's caches are wiped by the guard. Empty: wipe always.
 	TrustedRefs []string
+	// Dash, if set, records every message for the dashboard. It never influences scaling.
+	Dash *dashboard.Tracker
 
 	busy         map[string]bool // runners that have started a job
 	lastAssigned int
@@ -52,6 +55,7 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	if s.busy == nil {
 		s.busy = map[string]bool{}
 	}
+	s.Dash.Observe(msg)
 	if msg == nil {
 		return s.converge(ctx, s.lastAssigned)
 	}
