@@ -131,10 +131,16 @@ names. The guard decodes it and requires that:
   socket and labels: for example one with a `dind:` section for jobs that build images, and a lighter one without
   for everything else. Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
   no network, no other mounts).
-- **One memory limit for all runners.** Set `cgroup_parent` (e.g. `runner-scaling.slice` with Docker's systemd
-  cgroup driver) in every pool's guard config, then cap the slice on the host:
-  `systemctl set-property runner-scaling.slice MemoryHigh=7G MemoryMax=8G`. Per-container `memory` limits still
-  apply inside it. Busy slots then share the cap instead of each reserving their worst case.
+- **One memory budget for all runners.** Set `memory_budget` (e.g. `8G`) and `memory_reserve` (default `1G`, the
+  assumed minimum size of one slot) in every pool's guard config, with the same values. The guard measures the working
+  set of every runner-scaling container on the host (all pools, found by label) through the Docker API. It starts a
+  new slot only if measured use, counting each slot as at least the reserve, plus the reserve fits the budget;
+  otherwise the scaler is told to retry on its next poll. If measured use stays over the budget for three checks in a
+  row, the guard removes its newest runner. This is enforced in the guard, so it needs no host or systemd setup, but it
+  is a polling limit: a sudden spike can briefly overshoot, so keep the per-container `memory` limits as the hard
+  stop. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
+  is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
+  runners under one cgroup that you can cap with `systemctl set-property`.
 - **Caches.** Bind per-slot cache directories (`{slot}` in a path is replaced with the slot number) so warm jobs
   skip downloads. A dind `/var/lib/docker` must never be shared between slots. Slots are only ever reused one
   runner at a time.

@@ -27,6 +27,8 @@ type Docker interface {
 	ContainerRemove(ctx context.Context, id string) error
 	ContainerList(ctx context.Context, label string) ([]ContainerSummary, error)
 	Exec(ctx context.Context, id string, cmd []string) (int, error)
+	// ContainerMemory returns a container's memory working set in bytes (usage minus inactive file cache).
+	ContainerMemory(ctx context.Context, id string) (int64, error)
 }
 
 // ContainerSpec is the body of POST /containers/create. Only fields the guard sets are listed.
@@ -62,6 +64,7 @@ type HostConfig struct {
 	DNS           []string       `json:"Dns,omitempty"`
 	Memory        int64          `json:"Memory,omitempty"`
 	NanoCPUs      int64          `json:"NanoCpus,omitempty"`
+	CPUShares     int64          `json:"CpuShares,omitempty"`
 	PidsLimit     *int64         `json:"PidsLimit,omitempty"`
 	CgroupParent  string         `json:"CgroupParent,omitempty"`
 	LogConfig     *LogConfig     `json:"LogConfig,omitempty"`
@@ -245,6 +248,28 @@ func (d *SocketDocker) ContainerList(ctx context.Context, label string) ([]Conta
 	var out []ContainerSummary
 	_, err := d.do(ctx, http.MethodGet, "/containers/json", url.Values{"all": {"1"}, "filters": {string(f)}}, nil, &out)
 	return out, err
+}
+
+// ContainerMemory reads one stats sample: memory_stats.usage minus the inactive file cache (inactive_file on
+// cgroup v2, total_inactive_file on v1), the same working set `docker stats` shows.
+func (d *SocketDocker) ContainerMemory(ctx context.Context, id string) (int64, error) {
+	var out struct {
+		MemoryStats struct {
+			Usage int64            `json:"usage"`
+			Stats map[string]int64 `json:"stats"`
+		} `json:"memory_stats"`
+	}
+	q := url.Values{"stream": {"false"}, "one-shot": {"true"}}
+	if _, err := d.do(ctx, http.MethodGet, "/containers/"+id+"/stats", q, nil, &out); err != nil {
+		return 0, err
+	}
+	use := out.MemoryStats.Usage
+	if v, ok := out.MemoryStats.Stats["inactive_file"]; ok {
+		use -= v
+	} else if v, ok := out.MemoryStats.Stats["total_inactive_file"]; ok {
+		use -= v
+	}
+	return max(use, 0), nil
 }
 
 // Exec runs cmd detached and polls until it finishes, returning its exit code.

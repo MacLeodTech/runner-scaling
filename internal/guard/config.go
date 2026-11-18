@@ -48,8 +48,16 @@ type Config struct {
 	WorkBind string `yaml:"work_bind"`
 	// CgroupParent puts every container the guard creates under one cgroup, so one memory limit can cover all
 	// runners together (several guards may share it). With Docker's systemd cgroup driver this is a slice, e.g.
-	// runner-scaling.slice; set its limit on the host: systemctl set-property runner-scaling.slice MemoryMax=8G
+	// runner-scaling.slice; set its limit on the host: systemctl set-property runner-scaling.slice MemoryMax=8G.
+	// Optional: memory_budget below needs no host setup.
 	CgroupParent string `yaml:"cgroup_parent"`
+	// MemoryBudget, if set (e.g. 8G), caps the total memory working set of all runner-scaling containers on the host,
+	// across every pool: give every guard on the host the same value. The guard refuses new slots that would not fit
+	// and reaps its newest slot if measured use stays over budget. Needs no host or systemd setup.
+	MemoryBudget string `yaml:"memory_budget"`
+	// MemoryReserve is the assumed minimum footprint of one slot (runner and dind together) for admission, so slots
+	// that have just started and not ramped up are not counted as nearly empty. Default 1G with memory_budget.
+	MemoryReserve string `yaml:"memory_reserve"`
 	// RequireFile, if set, must exist before the guard starts any slot: a gate for something that must happen first,
 	// such as a host firewall that fences the slot subnets. Put it on a tmpfs so it is gone after a reboot.
 	RequireFile string `yaml:"require_file"`
@@ -59,6 +67,8 @@ type Config struct {
 	MaxRuntime Duration `yaml:"max_runtime"`
 	// ReapInterval is how often exited runners are cleaned up.
 	ReapInterval Duration `yaml:"reap_interval"`
+
+	memBudget, memReserve int64 // parsed MemoryBudget and MemoryReserve
 
 	Runner Template  `yaml:"runner"`
 	Dind   *Template `yaml:"dind"` // optional: omit for runners without a private Docker daemon
@@ -78,6 +88,7 @@ type Template struct {
 	DNS         []string          `yaml:"dns"`
 	Memory      string            `yaml:"memory"` // e.g. 3G
 	CPUs        float64           `yaml:"cpus"`
+	CPUShares   int64             `yaml:"cpu_shares"` // relative CPU weight against other host workloads (Docker default 1024), 2..262144
 	Pids        int64             `yaml:"pids"`
 	Health      *Health           `yaml:"healthcheck"`
 	Log         map[string]string `yaml:"log_opts"` // json-file options
@@ -200,6 +211,25 @@ func (c *Config) Validate() error {
 	if c.MaxRuntime.Duration < 0 || (c.MaxRuntime.Duration > 0 && c.MaxRuntime.Duration < time.Minute) {
 		errs = append(errs, errors.New("max_runtime must be 0 (disabled) or at least 1m"))
 	}
+	c.memBudget, c.memReserve = 0, 0
+	if c.MemoryBudget != "" {
+		b, err := ParseBytes(c.MemoryBudget)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("memory_budget: %w", err))
+		}
+		r := int64(1 << 30)
+		if c.MemoryReserve != "" {
+			if r, err = ParseBytes(c.MemoryReserve); err != nil {
+				errs = append(errs, fmt.Errorf("memory_reserve: %w", err))
+			}
+		}
+		if b > 0 && r > b {
+			errs = append(errs, errors.New("memory_reserve must not exceed memory_budget"))
+		}
+		c.memBudget, c.memReserve = b, r
+	} else if c.MemoryReserve != "" {
+		errs = append(errs, errors.New("memory_reserve needs memory_budget"))
+	}
 	if c.CgroupParent != "" && !regexp.MustCompile(`^([A-Za-z0-9_-]+\.slice|/[A-Za-z0-9_./-]+)$`).MatchString(c.CgroupParent) {
 		errs = append(errs, errors.New("cgroup_parent must be a systemd slice (name.slice) or an absolute cgroup path"))
 	}
@@ -236,6 +266,9 @@ func (t *Template) validate(name string) []error {
 		if _, err := ParseBytes(t.Memory); err != nil {
 			errs = append(errs, fmt.Errorf("%s: memory: %w", name, err))
 		}
+	}
+	if t.CPUShares != 0 && (t.CPUShares < 2 || t.CPUShares > 262144) {
+		errs = append(errs, fmt.Errorf("%s: cpu_shares must be 2..262144", name))
 	}
 	for k := range t.Labels {
 		if strings.HasPrefix(k, "io.github.runner-scaling.") {
