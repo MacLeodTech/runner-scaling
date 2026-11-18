@@ -89,6 +89,12 @@ func (g *GuardClient) SlotStats(ctx context.Context) ([]api.Slot, error) {
 	return s, g.do(ctx, http.MethodGet, "/v1/slots?stats=1", nil, &s, http.StatusOK)
 }
 
+// Counters returns the guard's counters (denials, refusals, reaps, starts).
+func (g *GuardClient) Counters(ctx context.Context) (api.Counters, error) {
+	var c api.Counters
+	return c, g.do(ctx, http.MethodGet, "/v1/counters", nil, &c, http.StatusOK)
+}
+
 func (g *GuardClient) Start(ctx context.Context, slot int, req api.StartRequest) error {
 	return g.do(ctx, http.MethodPut, "/v1/slots/"+strconv.Itoa(slot), req, nil, http.StatusCreated)
 }

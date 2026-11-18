@@ -47,9 +47,12 @@ type Tracker struct {
 	stats   Stats
 	updated time.Time
 	now     func() time.Time
+	metrics *metrics
 }
 
-func NewTracker() *Tracker { return &Tracker{active: map[int64]*Job{}, now: time.Now} }
+func NewTracker() *Tracker {
+	return &Tracker{active: map[int64]*Job{}, now: time.Now, metrics: newMetrics()}
+}
 
 // Observe records one scale set message.
 func (t *Tracker) Observe(msg *scaleset.RunnerScaleSetMessage) {
@@ -77,6 +80,12 @@ func (t *Tracker) Observe(msg *scaleset.RunnerScaleSetMessage) {
 		if job.Finished.IsZero() {
 			job.Finished = t.now()
 		}
+		t.metrics.mu.Lock()
+		t.metrics.completed[j.Result]++
+		if !job.Started.IsZero() && job.Finished.After(job.Started) {
+			t.metrics.jobDuration.observe(job.Finished.Sub(job.Started).Seconds())
+		}
+		t.metrics.mu.Unlock()
 		delete(t.active, job.ID)
 		t.history = append([]Job{*job}, t.history...)
 		if len(t.history) > HistorySize {
@@ -109,6 +118,11 @@ func (t *Tracker) upsert(b *scaleset.JobMessageBase, state, runner string) *Job 
 		j.Started = t.now()
 		if !b.RunnerAssignTime.IsZero() {
 			j.Started = b.RunnerAssignTime
+		}
+		if !j.Queued.IsZero() && j.Started.After(j.Queued) {
+			t.metrics.mu.Lock()
+			t.metrics.startLatency.observe(j.Started.Sub(j.Queued).Seconds())
+			t.metrics.mu.Unlock()
 		}
 	}
 	if !b.FinishTime.IsZero() {

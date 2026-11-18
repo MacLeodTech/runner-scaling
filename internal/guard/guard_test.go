@@ -1227,3 +1227,63 @@ func TestMemoryHighValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestCountersTrackWhatHappened(t *testing.T) {
+	g, f := memGuard(t, "8G")
+	h := g.Handler()
+	counters := func() map[string]int64 {
+		rec := do(t, h, "GET", "/v1/counters", nil)
+		if rec.Code != 200 {
+			t.Fatalf("counters: %d", rec.Code)
+		}
+		var m map[string]int64
+		if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	for _, k := range []string{CounterDenied, CounterNotReady, CounterConflicts, CounterAdmissionRefused, CounterStarts, CounterStartFailures, "reaped_memory_budget_total"} {
+		if v, ok := counters()[k]; !ok || v != 0 {
+			t.Fatalf("%s should start at 0, got %v (present: %v)", k, v, ok)
+		}
+	}
+
+	if err := startSlot(t, g, 1); err != nil { // a start
+		t.Fatal(err)
+	}
+	if err := startSlot(t, g, 1); !errors.Is(err, ErrConflict) { // the slot is in use
+		t.Fatalf("second start: %v", err)
+	}
+	do(t, h, "PUT", "/v1/slots/1", `{"runner_name":"x","jit_config":"y"}`) // refused: bad runner name
+	do(t, h, "GET", "/v1/nothing", nil)                                    // unknown endpoint
+	f.containers["ci-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: "ci", labelSlot: "2", labelRole: "runner"}}}
+	f.mem["ci-runner-2"] = 8 * gib
+	if err := startSlot(t, g, 3); !errors.Is(err, ErrNotReady) { // memory budget full
+		t.Fatalf("start over budget: %v", err)
+	}
+	do(t, h, "PUT", "/v1/slots/3", fmt.Sprintf(`{"runner_name":"ci-3-abcd12","jit_config":%q}`, jitFor("ci-3-abcd12", "https://github.com/example-org"))) // 503 through the API
+	f.containers["ci-runner-1"].state = "exited"
+	g.Reap(context.Background()) // a runner that exited
+
+	c := counters()
+	want := map[string]int64{
+		CounterStarts: 1, CounterDenied: 2, CounterConflicts: 0, CounterAdmissionRefused: 2, CounterNotReady: 1,
+		"reaped_runner_exited_total": 1,
+	}
+	for k, v := range want {
+		if c[k] != v {
+			t.Errorf("%s = %d, want %d (all: %v)", k, c[k], v, c)
+		}
+	}
+}
+
+func TestInfoCarriesTheMemoryBudget(t *testing.T) {
+	g, _ := memGuard(t, "8G")
+	if got := g.Info().MemoryBudget; got != 8*gib {
+		t.Errorf("MemoryBudget = %d", got)
+	}
+	g2, _ := newGuard(t)
+	if g2.Info().MemoryBudget != 0 {
+		t.Error("budget reported without one set")
+	}
+}

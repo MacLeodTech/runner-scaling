@@ -56,6 +56,7 @@ type Guard struct {
 	cpuPrev    map[string]cpuSample // container id -> last CPU reading, for the dashboard's CPU %
 	overMem    int                  // consecutive reap ticks over memory_budget; only touched by Reap
 	nameRE     *regexp.Regexp
+	count      counters
 }
 
 func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
@@ -67,7 +68,7 @@ func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
 }
 
 func (g *Guard) Info() api.Info {
-	return api.Info{Prefix: g.cfg.Prefix, MaxSlots: g.cfg.MaxSlots, WorkDir: g.cfg.WorkDir, GitHubURL: g.cfg.GitHubURL}
+	return api.Info{Prefix: g.cfg.Prefix, MaxSlots: g.cfg.MaxSlots, WorkDir: g.cfg.WorkDir, GitHubURL: g.cfg.GitHubURL, MemoryBudget: g.cfg.memBudget}
 }
 
 func (g *Guard) names(slot int) (runner, dind, network, volume string) {
@@ -256,10 +257,12 @@ func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error
 		}
 	}
 	if err := g.start(ctx, slot, req); err != nil {
+		g.count.add(CounterStartFailures)
 		g.log.Error("slot start failed, tearing down", "slot", slot, "err", err)
 		g.teardown(context.WithoutCancel(ctx), slot, false, false) // no job ran: the caches are as they were
 		return err
 	}
+	g.count.add(CounterStarts)
 	g.log.Info("slot started", "slot", slot, "runner", req.RunnerName)
 	return nil
 }
@@ -798,6 +801,7 @@ func (g *Guard) Reap(ctx context.Context) {
 		}
 		if g.claim(s.Slot) {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
+			g.count.add(CounterReapedPrefix + reason + "_total")
 			reaped[s.Slot] = true
 			if err := g.teardown(ctx, s.Slot, true, !g.takeKeep(s.Slot)); err != nil {
 				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
@@ -912,6 +916,7 @@ func (g *Guard) admit(ctx context.Context, slot int) error {
 		total += max(l.used, g.cfg.memReserve, int64(float64(l.young)*g.cfg.memRampShare))
 	}
 	if total+g.cfg.memReserve > g.cfg.memBudget {
+		g.count.add(CounterAdmissionRefused)
 		return fmt.Errorf("%w: memory budget: %s in use of %s, need %s reserve", ErrNotReady,
 			fmtBytes(total), fmtBytes(g.cfg.memBudget), fmtBytes(g.cfg.memReserve))
 	}
@@ -958,6 +963,7 @@ func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map
 		}
 	}
 	if g.claim(victim.Slot) {
+		g.count.add(CounterReapedPrefix + "memory_budget_total")
 		g.log.Info("reaping slot", "slot", victim.Slot, "runner", victim.RunnerName, "runner_state", victim.RunnerState,
 			"reason", "memory_budget", "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
 		if err := g.teardown(ctx, victim.Slot, true, true); err != nil {

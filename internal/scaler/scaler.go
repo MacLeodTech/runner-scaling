@@ -246,7 +246,9 @@ func (s *Scaler) scheduleRetry(ctx context.Context) {
 	})
 }
 
-func (s *Scaler) startSlot(ctx context.Context, n int) error {
+func (s *Scaler) startSlot(ctx context.Context, n int) (err error) {
+	began := time.Now()
+	defer func() { s.Dash.SlotStart(time.Since(began), err) }()
 	name := s.Info.Prefix + "-" + strconv.Itoa(n) + "-" + randSuffix()
 	jit, err := s.GitHub.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name, WorkFolder: s.Info.WorkDir}, s.ScaleSetID)
 	if err != nil {

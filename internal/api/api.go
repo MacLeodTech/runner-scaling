@@ -9,7 +9,13 @@ type Info struct {
 	MaxSlots  int    `json:"max_slots"`
 	WorkDir   string `json:"work_dir"`
 	GitHubURL string `json:"github_url"`
+	// MemoryBudget is the guard's memory_budget in bytes, 0 when none is set.
+	MemoryBudget int64 `json:"memory_budget,omitempty"`
 }
+
+// Counters is GET /v1/counters: monotonic totals since the guard started, by name (denied_total,
+// admission_refused_total, starts_total, start_failures_total, reaped_<reason>_total).
+type Counters map[string]int64
 
 // Slot is one entry of GET /v1/slots.
 type Slot struct {
