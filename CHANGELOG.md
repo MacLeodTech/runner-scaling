@@ -3,6 +3,13 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
+## [Unreleased]
+
+### Changed
+
+- Docs: the Sysbox section now says what was verified about kernel module autoload (it happens under Sysbox too, so block
+  unused link types on the host) and about `/proc/sys` writes (refused under Sysbox, effective under plain privileged).
+
 ## [0.4.0] - 2026-11-18
 
 ### Added
@@ -25,7 +32,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 ### Known limitations
 
 - Sysbox narrows the "any job is root on the host" route; it does not remove the shared kernel. A job with
-  `NET_ADMIN` can still make the host kernel load a module (we saw `dummy`), with or without Sysbox.
+  `NET_ADMIN` can still make the host kernel load a module (`dummy`, `ifb`, `bonding`, `nlmon` seen), with or without Sysbox.
 - Sysbox was tried with one real workflow and a probe suite, not weeks of use. Reboot behaviour is untested.
 
 ## [0.3.0] - 2026-11-18

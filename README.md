@@ -463,6 +463,8 @@ What we measured on a real build and a probe suite (private repo, quiet host, ru
   block devices against 14. `/proc/sys`, `/proc/uptime` and `/proc/swaps` are served by sysbox-fs.
 - The per-slot firewall fence behaved the same, from the runner and from inside inner containers, and no slot could
   reach another slot's dind.
+- Writes to `/proc/sys` and `/proc/sysrq-trigger` from a privileged inner container were refused under Sysbox, and the host's
+  values were unchanged. The same writes from a plain privileged container changed the host (we restored it afterwards).
 - Compose, published ports, a mounted `docker.sock`, `--network host`, `NET_ADMIN`, ptrace, `chown` on bind mounts,
   overlay mounts and memory limits all worked as under privileged dind. No job changed the host's sysctls, `/dev`,
   accounts, cron or sudoers.
@@ -470,9 +472,10 @@ What we measured on a real build and a probe suite (private repo, quiet host, ru
 What it does not do:
 
 - Containers still share the host kernel. A kernel exploit is still an escape, and we did not try to escape.
-- A job can still make the host kernel load a module: a container with `NET_ADMIN` creating a dummy interface loaded
-  `dummy`. That holds with or without Sysbox. Blacklist modules you don't want loadable on a host that runs
-  untrusted jobs.
+- A job can still make the host kernel load a module. A container with `NET_ADMIN` that creates a link of a type the host
+  hasn't loaded (`ip link add ... type ifb`) makes the kernel autoload that module on the host. We saw this under plain runc
+  (`bonding`) and under Sysbox, from an unprivileged inner container (`ifb`) and from a privileged one (`nlmon`), so Sysbox
+  does not prevent it. Block the link types you don't use with `install <module> /bin/false` in `/etc/modprobe.d`.
 - It only changes the dind sidecar. The runner container, the guard and the firewall are as before.
 - Only a few kinds of workflow were tried. Jobs that need KVM, kernel modules or `/proc/sys` writes may not work.
 - Start and stop took no longer on a quiet host. Under heavy load on a slow disk we saw slow starts and a container
