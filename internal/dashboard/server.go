@@ -18,9 +18,9 @@ import (
 //go:embed index.html
 var page []byte
 
-// Slots lists the runners the guard holds.
+// Slots lists the runners the guard holds, with their resource use.
 type Slots interface {
-	Slots(ctx context.Context) ([]api.Slot, error)
+	SlotStats(ctx context.Context) ([]api.Slot, error)
 }
 
 // State is GET /api/state.
@@ -66,7 +66,7 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	st := State{Name: s.Name, Version: s.Version, Now: time.Now(), MaxSlots: s.Info.MaxSlots, Snapshot: s.Tracker.Snapshot(), Slots: []api.Slot{}}
-	if slots, err := s.Guard.Slots(ctx); err != nil {
+	if slots, err := s.Guard.SlotStats(ctx); err != nil {
 		st.GuardErr = "guard unreachable"
 	} else if slots != nil {
 		st.Slots = slots

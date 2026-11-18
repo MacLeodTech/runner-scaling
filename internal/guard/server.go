@@ -21,7 +21,11 @@ func (g *Guard) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, g.Info())
 	})
 	mux.HandleFunc("GET /v1/slots", func(w http.ResponseWriter, r *http.Request) {
-		s, err := g.List(r.Context())
+		list := g.List
+		if r.URL.Query().Get("stats") != "" {
+			list = g.ListWithStats
+		}
+		s, err := list(r.Context())
 		if err != nil {
 			g.fail(w, r, err)
 			return

@@ -39,6 +39,8 @@ type fakeDocker struct {
 	mem        map[string]int64 // by container name
 	memErr     error
 	memCalls   int
+	cpu        map[string]int64 // cumulative CPU ns by container name
+	statCalls  int
 }
 
 type fakeContainer struct {
@@ -139,6 +141,12 @@ func (f *fakeDocker) ContainerMemory(_ context.Context, id string) (int64, error
 		return 0, f.memErr
 	}
 	return f.mem[id], nil
+}
+func (f *fakeDocker) ContainerStats(_ context.Context, id string) (ContainerUsage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statCalls++
+	return ContainerUsage{MemBytes: f.mem[id], CPUNanos: f.cpu[id], PIDs: 3, NetRx: 10, NetTx: 20, BlkRead: 1, BlkWrite: 2}, nil
 }
 func (f *fakeDocker) Exec(_ context.Context, _ string, cmd []string) (int, error) {
 	f.mu.Lock()
@@ -981,5 +989,34 @@ func TestCacheDirsValidation(t *testing.T) {
 		if err := g.cfg.Validate(); err == nil {
 			t.Errorf("cache_dirs %q accepted", d)
 		}
+	}
+}
+
+func TestListWithStatsSumsContainersAndComputesCPU(t *testing.T) {
+	g, f := memGuard(t, "8G")
+	f.cpu = map[string]int64{}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	f.mem["ci-runner-1"], f.mem["ci-dind-1"] = 100<<20, 50<<20
+	if plain, _ := g.List(context.Background()); plain[0].Stats != nil || f.statCalls != 0 {
+		t.Fatalf("List must not sample stats: %+v calls=%d", plain[0].Stats, f.statCalls)
+	}
+	first, err := g.ListWithStats(context.Background())
+	if err != nil || len(first) != 1 || first[0].Stats == nil {
+		t.Fatalf("%+v %v", first, err)
+	}
+	st := first[0].Stats
+	if st.MemBytes != 150<<20 || st.PIDs != 6 || st.NetRxBytes != 20 || st.NetTxBytes != 40 || st.BlkWriteBytes != 4 {
+		t.Errorf("not summed over runner+dind: %+v", st)
+	}
+	if st.CPUPercent != 0 {
+		t.Errorf("first sample has no rate: %v", st.CPUPercent)
+	}
+	time.Sleep(20 * time.Millisecond)
+	f.cpu["ci-runner-1"] = 10_000_000 // 10ms of CPU in ~20ms+ wall: a sizeable fraction of a core
+	second, _ := g.ListWithStats(context.Background())
+	if c := second[0].Stats.CPUPercent; c <= 5 || c > 60 {
+		t.Errorf("cpu%% = %v", c)
 	}
 }

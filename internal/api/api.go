@@ -18,6 +18,20 @@ type Slot struct {
 	RunnerState string `json:"runner_state,omitempty"` // Docker state: running, exited, ...
 	DindState   string `json:"dind_state,omitempty"`
 	Starting    bool   `json:"starting,omitempty"`
+	// Stats is the slot's resource use, summed over its runner and dind containers. Only set when asked for
+	// (GET /v1/slots?stats=1).
+	Stats *SlotStats `json:"stats,omitempty"`
+}
+
+// SlotStats is one sample of a slot's resource use.
+type SlotStats struct {
+	MemBytes      int64   `json:"mem_bytes"`   // working set (usage minus inactive file cache)
+	CPUPercent    float64 `json:"cpu_percent"` // 100 = one core fully busy; 0 until two samples exist
+	PIDs          int64   `json:"pids"`
+	NetRxBytes    int64   `json:"net_rx_bytes"` // cumulative since the container started
+	NetTxBytes    int64   `json:"net_tx_bytes"`
+	BlkReadBytes  int64   `json:"blk_read_bytes"` // cumulative
+	BlkWriteBytes int64   `json:"blk_write_bytes"`
 }
 
 // StartRequest is the body of PUT /v1/slots/{n}.
