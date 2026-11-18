@@ -21,6 +21,8 @@ preview: GitHub may change them.
   file name to be a plain name. The tenant URL is pinned on first use.
 - **Pools.** Run several guard + scaler pairs, for example one with `dind` and one without. They share one
   host-wide `memory_budget` enforced by the guards (admission check, reserve, reap-newest backstop), plus `cpu_shares`.
+  A new slot counts at half its memory limits for its first 2 minutes (`memory_ramp`, `memory_ramp_share`), then at
+  measured use, so a burst of fresh jobs isn't admitted against memory they haven't used yet.
 - **Cache isolation.** Directories in `cache_dirs` are emptied after every job except one the scaler vouches for
   (push, schedule, dispatch or release on `CACHE_TRUSTED_REFS`, default `refs/heads/main`), and at startup. A slot
   whose wipe failed is not reused until a wipe succeeds. Work directories (`work_bind`) are emptied after every job.

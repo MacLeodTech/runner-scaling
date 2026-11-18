@@ -107,7 +107,7 @@ func (f *fakeDocker) ContainerInspect(_ context.Context, id string) (*ContainerS
 	if c == nil {
 		return nil, ErrNotFound
 	}
-	st := &ContainerState{Status: c.state}
+	st := &ContainerState{Status: c.state, MemoryLimit: c.spec.HostConfig.Memory}
 	if c.spec.Labels[labelRole] == "wipe" {
 		st.ExitCode = f.wipeExit
 	}
@@ -783,6 +783,13 @@ func TestMemoryAndCPUConfigValidation(t *testing.T) {
 		{"bad budget", "prefix: ci", "prefix: ci\nmemory_budget: lots", false},
 		{"bad reserve", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_reserve: x", false},
 		{"reserve without budget", "prefix: ci", "prefix: ci\nmemory_reserve: 1G", false},
+		{"ramp off", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: 0s", true},
+		{"ramp and share", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: 5m\nmemory_ramp_share: 0.75", true},
+		{"ramp negative", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: -1m", false},
+		{"ramp too long", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp: 2h", false},
+		{"share over 1", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp_share: 1.5", false},
+		{"share negative", "prefix: ci", "prefix: ci\nmemory_budget: 8G\nmemory_ramp_share: -0.5", false},
+		{"ramp without budget", "prefix: ci", "prefix: ci\nmemory_ramp: 1m", false},
 		{"cpu_shares ok", "  cpus: 2", "  cpus: 2\n  cpu_shares: 512", true},
 		{"cpu_shares 1", "  cpus: 2", "  cpus: 2\n  cpu_shares: 1", false},
 		{"cpu_shares huge", "  cpus: 2", "  cpus: 2\n  cpu_shares: 262145", false},
@@ -1085,5 +1092,62 @@ func TestSlowStopDoesNotBlockOtherSlots(t *testing.T) {
 	}
 	if slots, _ := g.List(ctx); len(slots) != 2 || slots[0].Slot != 2 {
 		t.Errorf("after stop: %+v", slots)
+	}
+}
+
+func TestMemoryRampCountsYoungSlotsAtAShareOfTheirLimit(t *testing.T) {
+	// Two slots of another pool, each with an 8G limit but only 100M in use. Budget 8G, reserve 1G.
+	// Young: each counts max(100M, 1G, 8G*0.5) = 4G, 8G in all, so no room for another. Settled: 1G each, plenty.
+	cases := []struct {
+		name  string
+		age   time.Duration
+		extra string // appended to the config
+		ok    bool
+	}{
+		{"young slots reserve their ramp share", 10 * time.Second, "", false},
+		{"settled slots count as measured", 10 * time.Minute, "", true},
+		{"ramp off", 10 * time.Second, "memory_ramp: 0s", true},
+		{"small share", 10 * time.Second, "memory_ramp_share: 0.25", true}, // 2G each, 4G in all
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, f := newGuard(t)
+			g.cfg.MemoryBudget, g.cfg.MemoryReserve = "8G", "1G"
+			if strings.Contains(c.extra, "memory_ramp: 0s") {
+				g.cfg.MemoryRamp = &Duration{}
+			}
+			if strings.Contains(c.extra, "memory_ramp_share") {
+				g.cfg.MemoryRampShare = 0.25
+			}
+			if err := g.cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			f.mem = map[string]int64{}
+			for _, n := range []string{"1", "2"} {
+				name := "lite-runner-" + n
+				f.containers[name] = &fakeContainer{
+					state: "running", created: time.Now().Add(-c.age),
+					spec: ContainerSpec{
+						Labels:     map[string]string{labelInstance: "lite", labelSlot: n, labelRole: "runner"},
+						HostConfig: HostConfig{Memory: 8 * gib},
+					},
+				}
+				f.mem[name] = 100 << 20
+			}
+			err := startSlot(t, g, 1)
+			if (err == nil) != c.ok {
+				t.Fatalf("err=%v, want ok=%v", err, c.ok)
+			}
+			if err != nil && !errors.Is(err, ErrNotReady) {
+				t.Errorf("err: %v", err)
+			}
+		})
+	}
+}
+
+func TestMemoryRampDefaults(t *testing.T) {
+	g, _ := memGuard(t, "8G")
+	if g.cfg.memRamp != 2*time.Minute || g.cfg.memRampShare != 0.5 {
+		t.Errorf("defaults: ramp %v share %v", g.cfg.memRamp, g.cfg.memRampShare)
 	}
 }

@@ -773,37 +773,60 @@ type slotKey struct {
 	slot     int
 }
 
+// slotLoad is one slot's memory as the admission check sees it.
+type slotLoad struct {
+	used  int64 // measured working set of its running containers
+	young int64 // memory limits of its containers that are still inside the ramp window (see memory_ramp)
+}
+
 // memoryBySlot measures the working set of every running runner-scaling container on the host, all pools together
 // (the label filter is on the key only), summed per (instance, slot).
 func (g *Guard) memoryBySlot(ctx context.Context) (map[slotKey]int64, error) {
+	loads, err := g.slotLoads(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[slotKey]int64, len(loads))
+	for k, l := range loads {
+		out[k] = l.used
+	}
+	return out, nil
+}
+
+// slotLoads is memoryBySlot plus, for containers created less than memory_ramp ago, their memory limits.
+func (g *Guard) slotLoads(ctx context.Context) (map[slotKey]slotLoad, error) {
 	cs, err := g.d.ContainerList(ctx, labelInstance)
 	if err != nil {
 		return nil, err
 	}
-	out := map[slotKey]int64{}
+	out := map[slotKey]slotLoad{}
 	for _, c := range cs {
 		n, err := strconv.Atoi(c.Labels[labelSlot])
 		if err != nil {
 			continue
 		}
-		if c.State == "created" || c.State == "restarting" {
-			// Not running yet, so nothing to measure; the slot still exists and will count as at least the reserve.
-			if _, ok := out[slotKey{c.Labels[labelInstance], n}]; !ok {
-				out[slotKey{c.Labels[labelInstance], n}] = 0
+		k := slotKey{c.Labels[labelInstance], n}
+		if c.State != "created" && c.State != "restarting" && c.State != "running" {
+			continue
+		}
+		l := out[k] // the slot exists from here on, so it counts as at least the reserve
+		if g.cfg.memRamp > 0 && c.Created > 0 && time.Since(time.Unix(c.Created, 0)) < g.cfg.memRamp {
+			// A limit we can't read is left out: the slot then counts as measured, or as the reserve.
+			if st, err := g.d.ContainerInspect(ctx, c.ID); err == nil {
+				l.young += st.MemoryLimit
 			}
-			continue
 		}
-		if c.State != "running" {
-			continue
+		if c.State == "running" { // created or restarting: nothing to measure yet
+			m, err := g.d.ContainerMemory(ctx, c.ID)
+			if errors.Is(err, ErrNotFound) {
+				continue // gone since the list
+			}
+			if err != nil {
+				return nil, err
+			}
+			l.used += m
 		}
-		m, err := g.d.ContainerMemory(ctx, c.ID)
-		if errors.Is(err, ErrNotFound) {
-			continue // gone since the list
-		}
-		if err != nil {
-			return nil, err
-		}
-		out[slotKey{c.Labels[labelInstance], n}] += m
+		out[k] = l
 	}
 	return out, nil
 }
@@ -814,7 +837,7 @@ func (g *Guard) admit(ctx context.Context, slot int) error {
 	if g.cfg.memBudget <= 0 {
 		return nil
 	}
-	by, err := g.memoryBySlot(ctx)
+	by, err := g.slotLoads(ctx)
 	if err != nil {
 		g.log.Warn("memory budget: cannot read stats, admitting", "slot", slot, "err", err)
 		return nil
@@ -823,13 +846,15 @@ func (g *Guard) admit(ctx context.Context, slot int) error {
 	g.mu.Lock()
 	for n := range g.starting {
 		if _, ok := by[slotKey{g.cfg.Prefix, n}]; !ok && n != slot {
-			by[slotKey{g.cfg.Prefix, n}] = 0
+			by[slotKey{g.cfg.Prefix, n}] = slotLoad{}
 		}
 	}
 	g.mu.Unlock()
+	// A slot counts as its measured use, but at least the reserve, and while its containers are young at least a
+	// share of their limits: they look light now and will grow.
 	var total int64
-	for _, m := range by {
-		total += max(m, g.cfg.memReserve)
+	for _, l := range by {
+		total += max(l.used, g.cfg.memReserve, int64(float64(l.young)*g.cfg.memRampShare))
 	}
 	if total+g.cfg.memReserve > g.cfg.memBudget {
 		return fmt.Errorf("%w: memory budget: %s in use of %s, need %s reserve", ErrNotReady,

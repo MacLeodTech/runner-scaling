@@ -242,7 +242,10 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   assumed minimum size of one slot) in every pool's guard config, with the same values. The guard measures the working
   set of every runner-scaling container on the host (all pools, found by label) through the Docker API. It starts a
   new slot only if measured use, counting each slot as at least the reserve, plus the reserve fits the budget;
-  otherwise the scaler is told to retry on its next poll. If measured use stays over the budget for three checks in a
+  otherwise the scaler is told to retry on its next poll. A slot counts as its measured use but at least the reserve,
+  and for `memory_ramp` (default 2m) after its containers were created, at least `memory_ramp_share` (default half)
+  of their memory limits: a job that has just started looks light and then grows, so a burst of new jobs isn't
+  admitted against memory they haven't used yet, while settled light jobs pack tightly. If measured use stays over the budget for three checks in a
   row, the guard removes its newest runner. This is enforced in the guard, so it needs no host or systemd setup, but it
   is a polling limit: a sudden spike can briefly overshoot, so keep the per-container `memory` limits as the hard
   stop. The guard rejects a config where one slot's `memory` limits add up to more than the budget (that slot could never
@@ -317,6 +320,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `work_bind` | host directory (`{slot}` required) to use as `work_dir` instead of a Docker volume |
 | `cache_dirs` | host directories (`{slot}` required) emptied after untrusted jobs |
 | `memory_budget`, `memory_reserve` | host-wide memory cap and per-slot admission estimate |
+| `memory_ramp`, `memory_ramp_share` | how long a new slot counts at a share of its memory limits (default `2m`, `0.5`; `0s` turns the ramp off) |
 | `cgroup_parent` | put all runner containers under one cgroup you can cap with systemd |
 | `require_file` | the guard starts no slot until this file exists (a gate for a host firewall) |
 | `start_timeout` | how long a slot may take to come up (default 2m) |
