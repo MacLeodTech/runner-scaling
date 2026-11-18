@@ -24,6 +24,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 
+	"github.com/MacLeodTech/runner-scaling/internal/dashboard"
 	"github.com/MacLeodTech/runner-scaling/internal/guard"
 	"github.com/MacLeodTech/runner-scaling/internal/scaler"
 )
@@ -230,6 +231,24 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 	s := &scaler.Scaler{
 		Log: log, Guard: gc, GitHub: gh, Session: session, ScaleSetID: ss.ID, Info: info, Min: *minR, Max: *maxR,
 		TrustedRefs: trustedRefs(),
+	}
+	if addr := env("DASHBOARD_ADDR", ""); addr != "" {
+		token, err := secret("DASHBOARD_TOKEN")
+		if err != nil {
+			return err
+		}
+		s.Dash = dashboard.NewTracker()
+		ds := &http.Server{
+			Addr: addr, ReadHeaderTimeout: 10 * time.Second,
+			Handler: (&dashboard.Server{Name: ss.Name, Version: version, Info: info, Guard: gc, Tracker: s.Dash, Token: token}).Handler(),
+		}
+		go func() {
+			if err := ds.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				log.Error("dashboard", "err", err)
+			}
+		}()
+		go func() { <-ctx.Done(); ds.Close() }()
+		log.Info("dashboard listening", "addr", addr, "token", token != "")
 	}
 	// Deliberately no scale set deletion on exit: queued jobs keep waiting for it while the scaler restarts.
 	return l.Run(ctx, s)
