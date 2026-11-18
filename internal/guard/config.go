@@ -216,8 +216,8 @@ func (c *Config) Validate() error {
 		c.SharedHosts = jit.DefaultSharedHosts
 	}
 	if len(c.Runner.Command) == 0 {
-		// The official runner image. The JIT config arrives in RUNNER_SCALING_JITCONFIG and is moved off the
-		// environment before the runner starts, so job steps don't inherit it.
+		// The official runner image. The JIT config arrives in ACTIONS_RUNNER_INPUT_JITCONFIG, which the runner
+		// reads like --jitconfig, so it is never on the command line.
 		c.Runner.Command = []string{"/home/runner/run.sh"}
 	}
 

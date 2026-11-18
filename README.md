@@ -148,8 +148,10 @@ names. The guard decodes it and requires that:
   share the host kernel: a kernel escape is root on the host. Add a stronger runtime (gVisor, Sysbox, user
   namespaces) if the jobs aren't fully trusted.
 - **Jobs can read their runner's credentials.** A job runs as the same user as its runner, so it can read the
-  runner's session credentials. This is true of every self-hosted runner. The JIT config is kept out of the job
-  environment, but it is on the runner process's command line.
+  runner's session credentials. This is true of every self-hosted runner. The JIT config reaches the runner
+  through its environment (`ACTIONS_RUNNER_INPUT_JITCONFIG`), not its command line, so other users on the host can't
+  read it with `ps`. A job could still read it from the runner's environment, but it is single-use and the runner has
+  already spent it by the time a job starts.
 - **The tenant URL is pinned on first use.** Leave `tenant_url` empty on first start. The guard refuses the first
   config and logs the URL it named. Pin that URL only if you are sure the scaler that sent it is yours and talks to
   your org. Check this before anything untrusted could reach the scaler, so on a fresh setup.

@@ -5,6 +5,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Security
+- The JIT config is passed to the runner as `ACTIONS_RUNNER_INPUT_JITCONFIG` instead of `--jitconfig`, so it no longer
+  appears in the runner's `/proc/<pid>/cmdline` (readable by every user on the host, and by jobs through `ps`).
+
 ### Documentation
 - Reverse-proxy example for the dashboard (Caddy, LAN only, `X-Forwarded-Proto`), and a note on running `:latest`.
 

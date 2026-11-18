@@ -24,13 +24,14 @@ const (
 	labelRole     = "io.github.runner-scaling.role"
 	labelRunner   = "io.github.runner-scaling.runner-name"
 
-	// jitEnv carries the JIT config into the runner container; the entrypoint wrapper unsets it before exec.
-	jitEnv = "RUNNER_SCALING_JITCONFIG"
+	// jitEnv carries the JIT config into the runner container. The runner reads it exactly as it reads --jitconfig
+	// (its ACTIONS_RUNNER_INPUT_<FLAG> convention), so it never appears in the process's argv, which any user on the
+	// host can read from /proc/<pid>/cmdline. The environment is readable only by the process's owner and root.
+	jitEnv = "ACTIONS_RUNNER_INPUT_JITCONFIG"
 )
 
-// entrypointWrapper moves the JIT config from the environment to the runner's command line, so job steps (which
-// inherit the runner's environment) never see it.
-const entrypointWrapper = `j="$` + jitEnv + `"; unset ` + jitEnv + `; exec "$@" --jitconfig "$j"`
+// entrypointWrapper replaces the image's own entrypoint with the configured command, unchanged.
+const entrypointWrapper = `exec "$@"`
 
 // ErrBadRequest and ErrConflict map to 400 and 409.
 var (
