@@ -28,6 +28,8 @@ preview: GitHub may change them.
   whose wipe failed is not reused until a wipe succeeds. Work directories (`work_bind`) are emptied after every job.
 - **Firewall gate.** `require_file` holds back every slot until a host firewall has put its rules in place.
   `examples/firewall.sh` is a sidecar that applies the fence and keeps it applied.
+- **Soft memory limit.** Optional `memory_high` on `runner` and `dind` slows a container down past it (cgroup v2
+  `memory.high`) instead of OOM-killing it. Docker can't set it, so the guard writes it from a one-shot container.
 - **Limits.** `max_runtime` reaps a stuck runner; `memory`, `cpus`, `pids` and `log_opts` limit each container.
 - **Dashboard.** A read-only status page (`DASHBOARD_ADDR`) with the slots, running and queued jobs, recent
   results, and each runner's CPU, memory, processes, network and disk use. `DASHBOARD_PEERS` folds other pools in.

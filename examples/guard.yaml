@@ -27,7 +27,8 @@ runner:
   command: [/home/runner/run.sh]
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
-  memory: 4G
+  memory: 4G                  # hard limit: past it the container is OOM-killed
+  # memory_high: 3G           # optional soft limit: past it the container is slowed down instead (see the README)
   cpus: 2
   # cpu_shares: 512           # optional relative CPU weight vs other host workloads (Docker default 1024; 2..262144)
   pids: 2048

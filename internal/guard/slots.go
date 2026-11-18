@@ -337,13 +337,16 @@ func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error
 	}
 
 	extraEnv := map[string]string{}
+	high := map[string]*Template{} // container id -> template, for memory_high
 	if g.cfg.Dind != nil {
 		spec := g.spec(g.cfg.Dind, slot, netName, work, map[string]string{"DOCKER_TLS_CERTDIR": ""})
 		spec.Hostname = dindName
 		spec.Labels = g.labels(slot, "dind", "")
-		if err := g.run(ctx, dindName, spec); err != nil {
+		id, err := g.run(ctx, dindName, spec)
+		if err != nil {
 			return fmt.Errorf("dind: %w", err)
 		}
+		high[id] = g.cfg.Dind
 		if err := g.waitHealthy(ctx, dindName); err != nil {
 			return fmt.Errorf("dind: %w", err)
 		}
@@ -363,9 +366,12 @@ func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error
 	spec.Labels = g.labels(slot, "runner", req.RunnerName)
 	spec.Entrypoint = []string{"/bin/sh", "-c", entrypointWrapper, "runner-scaling"}
 	spec.Cmd = g.cfg.Runner.Command
-	if err := g.run(ctx, runnerName, spec); err != nil {
+	id, err := g.run(ctx, runnerName, spec)
+	if err != nil {
 		return fmt.Errorf("runner: %w", err)
 	}
+	high[id] = &g.cfg.Runner
+	g.applyMemoryHigh(ctx, slot, high)
 	return nil
 }
 
@@ -417,7 +423,7 @@ func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) 
 		},
 	}
 	defer g.d.ContainerRemove(context.WithoutCancel(ctx), name)
-	if err := g.run(ctx, name, spec); err != nil {
+	if _, err := g.run(ctx, name, spec); err != nil {
 		return -1, err
 	}
 	for {
@@ -438,12 +444,61 @@ func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) 
 
 func (g *Guard) wiperName(slot int) string { return g.cfg.Prefix + "-wipe-" + strconv.Itoa(slot) }
 
-func (g *Guard) run(ctx context.Context, name string, spec ContainerSpec) error {
+// run creates and starts a container and returns its id.
+func (g *Guard) run(ctx context.Context, name string, spec ContainerSpec) (string, error) {
 	id, err := g.d.ContainerCreate(ctx, name, spec)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return g.d.ContainerStart(ctx, id)
+	return id, g.d.ContainerStart(ctx, id)
+}
+
+// memoryHighScript sets memory.high on the cgroup of each container given as id=bytes. The container's cgroup has
+// the id in its name (docker-<id>.scope with Docker's systemd cgroup driver, <id> with cgroupfs), wherever the
+// cgroup_parent puts it. It fails unless every container was found and written.
+const memoryHighScript = `rc=0
+for a in "$@"; do
+  id=${a%%=*}; v=${a#*=}; found=0
+  for d in $(find /cgroup -maxdepth 6 -type d \( -name "docker-$id.scope" -o -name "$id" \)); do
+    echo "$v" > "$d/memory.high" && found=1
+  done
+  [ "$found" = 1 ] || { echo "no writable cgroup for $id" >&2; rc=1; }
+done
+exit $rc`
+
+// cgroupSafeRE limits what reaches the script's find patterns: no glob characters.
+var cgroupSafeRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// applyMemoryHigh sets the soft memory limit (memory_high) of the given containers, in one one-shot container with
+// no network that has the host's cgroup tree mounted. This is best effort: Docker has no setting for it, and the
+// hard memory limit protects the host either way, so a failure is logged and the job runs without the throttle.
+// targets maps each container id to the template that created it.
+func (g *Guard) applyMemoryHigh(ctx context.Context, slot int, targets map[string]*Template) {
+	args := []string{"sh", "-c", memoryHighScript, "sh"}
+	for _, id := range slices.Sorted(maps.Keys(targets)) {
+		t := targets[id]
+		if t.MemoryHigh == "" {
+			continue
+		}
+		high, err := ParseBytes(t.MemoryHigh) // validated at load
+		if err != nil || !cgroupSafeRE.MatchString(id) {
+			g.log.Warn("memory_high skipped", "slot", slot, "container", id)
+			continue
+		}
+		args = append(args, id+"="+strconv.FormatInt(high, 10))
+	}
+	if len(args) == 4 {
+		return
+	}
+	code, err := g.wipeOneShot(ctx, slot, args, []string{"/sys/fs/cgroup:/cgroup"})
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	if err != nil {
+		g.log.Warn("memory_high not applied: the hard memory limit still holds", "slot", slot, "err", err)
+		return
+	}
+	g.log.Info("memory_high applied", "slot", slot)
 }
 
 func (g *Guard) waitHealthy(ctx context.Context, name string) error {

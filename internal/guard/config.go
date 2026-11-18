@@ -102,13 +102,18 @@ type Template struct {
 	CapAdd      []string          `yaml:"cap_add"`
 	SecurityOpt []string          `yaml:"security_opt"`
 	DNS         []string          `yaml:"dns"`
-	Memory      string            `yaml:"memory"` // e.g. 3G
-	CPUs        float64           `yaml:"cpus"`
-	CPUShares   int64             `yaml:"cpu_shares"` // relative CPU weight against other host workloads (Docker default 1024), 2..262144
-	Pids        int64             `yaml:"pids"`
-	Health      *Health           `yaml:"healthcheck"`
-	Log         map[string]string `yaml:"log_opts"` // json-file options
-	Labels      map[string]string `yaml:"labels"`   // extra container labels; the guard's own io.github.runner-scaling.* labels win
+	Memory      string            `yaml:"memory"` // e.g. 3G; a hard limit: a container that passes it is OOM-killed
+	// MemoryHigh, if set (e.g. 2560M), is a soft limit below Memory (cgroup v2 memory.high): a container that passes it
+	// is slowed down by the kernel's reclaim instead of being killed. Docker has no setting for this, so the guard
+	// writes it after the container has started, from a one-shot container that mounts the host's /sys/fs/cgroup for
+	// that moment only. Optional; if the write fails the job runs with the hard limit alone.
+	MemoryHigh string            `yaml:"memory_high"`
+	CPUs       float64           `yaml:"cpus"`
+	CPUShares  int64             `yaml:"cpu_shares"` // relative CPU weight against other host workloads (Docker default 1024), 2..262144
+	Pids       int64             `yaml:"pids"`
+	Health     *Health           `yaml:"healthcheck"`
+	Log        map[string]string `yaml:"log_opts"` // json-file options
+	Labels     map[string]string `yaml:"labels"`   // extra container labels; the guard's own io.github.runner-scaling.* labels win
 	// PruneOnStop runs these commands in the container before it is removed (dind only), e.g. to trim build cache.
 	PruneOnStop [][]string `yaml:"prune_on_stop"`
 }
@@ -305,6 +310,18 @@ func (t *Template) validate(name string) []error {
 	if t.Memory != "" {
 		if _, err := ParseBytes(t.Memory); err != nil {
 			errs = append(errs, fmt.Errorf("%s: memory: %w", name, err))
+		}
+	}
+	if t.MemoryHigh != "" {
+		high, err := ParseBytes(t.MemoryHigh)
+		limit, lerr := ParseBytes(t.Memory)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%s: memory_high: %w", name, err))
+		case t.Memory == "" || lerr != nil:
+			errs = append(errs, fmt.Errorf("%s: memory_high needs a valid memory limit above it", name))
+		case high <= 0 || high >= limit:
+			errs = append(errs, fmt.Errorf("%s: memory_high (%s) must be above 0 and below memory (%s)", name, t.MemoryHigh, t.Memory))
 		}
 	}
 	if t.CPUShares != 0 && (t.CPUShares < 2 || t.CPUShares > 262144) {

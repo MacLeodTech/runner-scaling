@@ -1151,3 +1151,79 @@ func TestMemoryRampDefaults(t *testing.T) {
 		t.Errorf("defaults: ramp %v share %v", g.cfg.memRamp, g.cfg.memRampShare)
 	}
 }
+
+func TestMemoryHighIsAppliedFromAOneShotContainer(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.Runner.MemoryHigh, g.cfg.Dind.MemoryHigh = "2560M", "1G"
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wipes) != 1 {
+		t.Fatalf("want one one-shot container, got %d", len(f.wipes))
+	}
+	w := f.wipes[0]
+	if w.HostConfig.NetworkMode != "none" || !slices.Contains(w.HostConfig.Binds, "/sys/fs/cgroup:/cgroup") {
+		t.Errorf("one-shot should have no network and mount the cgroup tree: %+v", w.HostConfig)
+	}
+	args := strings.Join(w.Entrypoint, " ")
+	for _, want := range []string{"ci-runner-1=" + strconv.FormatInt(2560<<20, 10), "ci-dind-1=" + strconv.FormatInt(1<<30, 10)} {
+		if !strings.Contains(args, want) {
+			t.Errorf("entrypoint %q lacks %q", args, want)
+		}
+	}
+	if f.containers["ci-wipe-1"] != nil {
+		t.Error("one-shot container left behind")
+	}
+}
+
+func TestMemoryHighFailureDoesNotFailTheStart(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.Runner.MemoryHigh = "2G"
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f.wipeExit = 1 // the one-shot reports it could not write
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatalf("start failed because memory_high was not applied: %v", err)
+	}
+	if f.containers["ci-runner-1"] == nil {
+		t.Error("runner not started")
+	}
+}
+
+func TestNoMemoryHighNoOneShot(t *testing.T) {
+	g, f := newGuard(t)
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wipes) != 0 {
+		t.Errorf("one-shot container started without memory_high: %d", len(f.wipes))
+	}
+}
+
+func TestMemoryHighValidation(t *testing.T) {
+	cases := []struct {
+		name, old, new string
+		ok             bool
+	}{
+		{"below memory", "  memory: 3G", "  memory: 3G\n  memory_high: 2G", true},
+		{"equal to memory", "  memory: 3G", "  memory: 3G\n  memory_high: 3G", false},
+		{"above memory", "  memory: 3G", "  memory: 3G\n  memory_high: 4G", false},
+		{"not a size", "  memory: 3G", "  memory: 3G\n  memory_high: lots", false},
+		{"zero", "  memory: 3G", "  memory: 3G\n  memory_high: 0", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "guard.yaml")
+			if err := os.WriteFile(p, []byte(strings.Replace(testConfig, c.old, c.new, 1)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(p); (err == nil) != c.ok {
+				t.Fatalf("err = %v, want ok = %v", err, c.ok)
+			}
+		})
+	}
+}

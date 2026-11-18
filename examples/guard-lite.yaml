@@ -40,6 +40,7 @@ runner:
   security_opt: [no-new-privileges:true]
   dns: [1.1.1.1, 9.9.9.9]     # public DNS: the fence blocks private ranges, so a LAN resolver would be unreachable
   memory: 3G
+  # memory_high: 2G           # optional soft limit: past it the job is slowed down instead of killed (see the README)
   cpus: 2
   cpu_shares: 512             # half the default weight: other host workloads win when the CPU is contended
   pids: 1024

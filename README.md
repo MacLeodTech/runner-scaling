@@ -256,6 +256,27 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
 
+### Slow a job down instead of killing it (`memory_high`)
+
+`memory` is a hard limit: a container that passes it is OOM-killed, and so is its job. Set `memory_high` below it
+(for example `memory: 3G`, `memory_high: 2560M`) and a container that passes `memory_high` is slowed by the kernel's
+memory reclaim instead, which usually lets a short spike pass. It is the cgroup v2 `memory.high` setting. It is optional and
+off unless you set it on `runner` or `dind`.
+
+Docker has no setting for it (the Engine API ignores cgroup v2 `Unified` values), so the guard writes it after the
+container has started, from a one-shot container: no network, all capabilities dropped but two, and the host's
+`/sys/fs/cgroup` mounted read-write for that one write. The guard container itself gets no cgroup access. The one-shot
+finds each container's cgroup by its id, wherever `cgroup_parent` puts it. This needs cgroup v2 and a runner image
+with `sh` and `find`. It is best effort: if the write fails, the guard logs `memory_high not applied` and the job runs
+with the hard limit alone.
+
+How it behaves: a container that grows past `memory_high` is held there, and the kernel pushes the excess to swap
+and throttles the allocating process. Tested with a 512M hard limit and a 256M `memory_high`: use stayed at about 256M,
+the rest went to swap, and nothing was killed until the swap allowance (by default as large as `memory`) ran out. That
+means the throttle needs swap on the host to work: with none, the excess is all that reclaim has to work with and the
+container ends up in the same place as without it. Pick a value that leaves headroom: a job held at `memory_high` runs
+slowly rather than failing, so a job that really needs more will crawl until it hits the hard limit or `max_runtime`.
+
 ### Dashboard
 
 Set `DASHBOARD_ADDR` and the scaler serves a read-only status page, a bit like the Actions tab: the runner slots and
@@ -326,7 +347,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `start_timeout` | how long a slot may take to come up (default 2m) |
 | `max_runtime` | the reaper removes a runner that runs longer than this (default: no limit) |
 | `reap_interval` | how often exited runners are cleaned up (default 5s) |
-| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
+| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
 
 Omit `dind` for runners without a private Docker daemon.
 
