@@ -240,7 +240,7 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 		s.Dash = dashboard.NewTracker()
 		ds := &http.Server{
 			Addr: addr, ReadHeaderTimeout: 10 * time.Second,
-			Handler: (&dashboard.Server{Name: ss.Name, Version: version, Info: info, Guard: gc, Tracker: s.Dash, Token: token}).Handler(),
+			Handler: (&dashboard.Server{Name: ss.Name, Version: version, Info: info, Guard: gc, Tracker: s.Dash, Token: token, Peers: dashboardPeers()}).Handler(),
 		}
 		go func() {
 			if err := ds.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
@@ -389,6 +389,18 @@ func trustedRefs() []string {
 	for _, r := range strings.Split(v, ",") {
 		if r = strings.TrimSpace(r); r != "" && r != "none" {
 			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// dashboardPeers parses DASHBOARD_PEERS, "name=http://host:port,name2=http://...": other scalers whose state this
+// dashboard folds into its own page. They must use the same DASHBOARD_TOKEN.
+func dashboardPeers() []dashboard.Peer {
+	var out []dashboard.Peer
+	for _, p := range strings.Split(env("DASHBOARD_PEERS", ""), ",") {
+		if name, url, ok := strings.Cut(strings.TrimSpace(p), "="); ok && name != "" && url != "" {
+			out = append(out, dashboard.Peer{Name: name, URL: url})
 		}
 	}
 	return out

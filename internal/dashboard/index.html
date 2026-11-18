@@ -33,19 +33,34 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 let off=0;
 const dur=ms=>{ms=Math.max(0,Math.round(ms/1000));const m=Math.floor(ms/60),s=ms%60,h=Math.floor(m/60);return h?`${h}h ${m%60}m`:m?`${m}m ${s}s`:`${s}s`};
 const ago=t=>t&&t>'1971'?dur(Date.now()+off-Date.parse(t))+' ago':'';
-const job=(j,right)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${esc(j.name)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}</div></div><div class="r">${right}</div></div>`;
+const job=(j,right)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${esc(j.name)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}${j.pool?' · <b>'+esc(j.pool)+'</b>':''}</div></div><div class="r">${right}</div></div>`;
 const list=(id,items,f)=>$(id).innerHTML=items.length?items.map(f).join(''):'<div class="empty">Nothing here.</div>';
+function merge(r){
+ const pools=[r,...(r.peers||[])],m={name:r.name,version:r.version,now:r.now,max_slots:0,slots:[],queued:[],running:[],recent:[],stats:{},guard_error:'',pools:pools.length};
+ for(const p of pools){
+  if(p.peer_error)m.guard_error+=(m.guard_error?'; ':'')+p.peer_error;
+  else if(p.guard_error)m.guard_error+=(m.guard_error?'; ':'')+p.name+': '+p.guard_error;
+  m.max_slots+=p.max_slots||0;
+  const tag=x=>({...x,pool:pools.length>1?p.name:''});
+  m.slots.push(...(p.slots||[]).map(tag));m.queued.push(...(p.queued||[]).map(tag));m.running.push(...(p.running||[]).map(tag));m.recent.push(...(p.recent||[]).map(tag));
+  for(const k in p.stats||{})m.stats[k]=(m.stats[k]||0)+p.stats[k];
+ }
+ m.queued.sort((a,b)=>Date.parse(a.queued)-Date.parse(b.queued));m.running.sort((a,b)=>Date.parse(a.started)-Date.parse(b.started));
+ m.recent.sort((a,b)=>Date.parse(b.finished)-Date.parse(a.finished));m.recent=m.recent.slice(0,100);
+ if(pools.length>1)m.name='Runners';
+ return m;
+}
 async function tick(){
  try{
   const r=await fetch('api/state'+location.search,{cache:'no-store'});if(!r.ok)throw new Error(r.status);
-  const s=await r.json();off=Date.parse(s.now)-Date.now();
+  const raw=await r.json();const s=merge(raw);off=Date.parse(s.now)-Date.now();
   $('err').style.display=s.guard_error?'block':'none';$('err').textContent=s.guard_error||'';
   $('title').textContent=s.name||'Runners';$('sub').textContent='v'+s.version;
   const st=s.stats||{};
   $('tiles').innerHTML=[['Running',s.running.length],['Queued',s.queued.length],['Runners',`${s.slots.length} / ${s.max_slots}`],['Idle runners',st.idle_runners??0],['Registered',st.registered_runners??0]].map(([k,v])=>`<div class="tile"><b>${v}</b><small>${k}</small></div>`).join('');
   const busy=new Set(s.running.map(j=>j.runner));
   list('slots',s.slots,x=>{const state=x.starting?'starting':busy.has(x.runner_name)?'running':x.runner_state==='running'?'idle':'failed';
-   return `<div class="row"><div class="i ${state}"></div><div><div class="t">Slot ${x.slot} <span class="m">${state}</span></div><div class="m">${esc(x.runner_name||'starting…')}${x.dind_state?' · dind '+esc(x.dind_state):''}</div></div><div class="r"></div></div>`});
+   return `<div class="row"><div class="i ${state}"></div><div><div class="t">${x.pool?esc(x.pool)+' ':''}slot ${x.slot} <span class="m">${state}</span></div><div class="m">${esc(x.runner_name||'starting…')}${x.dind_state?' · dind '+esc(x.dind_state):''}</div></div><div class="r"></div></div>`});
   list('running',s.running,j=>job(j,'running '+dur(Date.now()+off-Date.parse(j.started||j.queued))));
   list('queued',s.queued,j=>job(j,'waiting '+dur(Date.now()+off-Date.parse(j.queued))));
   list('recent',s.recent,j=>job(j,esc(j.state)+(j.started&&j.finished?' in '+dur(Date.parse(j.finished)-Date.parse(j.started)):'')+'<br>'+ago(j.finished)));

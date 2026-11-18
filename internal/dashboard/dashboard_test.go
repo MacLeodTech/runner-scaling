@@ -101,3 +101,18 @@ func TestOpenWithoutToken(t *testing.T) {
 		t.Fatalf("%d", w.Code)
 	}
 }
+
+func TestPeers(t *testing.T) {
+	lite := httptest.NewServer((&Server{Name: "lite", Guard: fakeSlots{}, Tracker: NewTracker(), Token: "t"}).Handler())
+	defer lite.Close()
+	h := (&Server{Name: "main", Guard: fakeSlots{}, Tracker: NewTracker(), Token: "t",
+		Peers: []Peer{{"lite", lite.URL}, {"gone", "http://127.0.0.1:1"}}}).Handler()
+	w := get(h, "/api/state?token=t")
+	body := w.Body.String()
+	if w.Code != 200 || !strings.Contains(body, `"name":"lite"`) || !strings.Contains(body, `"peer_error":"gone unreachable"`) {
+		t.Fatalf("%d %s", w.Code, body)
+	}
+	if w := get(h, "/api/state?token=t&local=1"); strings.Contains(w.Body.String(), `"peers"`) {
+		t.Fatalf("local=1 returned peers")
+	}
+}
