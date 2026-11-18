@@ -3,6 +3,11 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
+## [Unreleased]
+
+### Documentation
+- Reverse-proxy example for the dashboard (Caddy, LAN only, `X-Forwarded-Proto`), and a note on running `:latest`.
+
 ## [0.6.0] - 2026-11-18
 
 ### Added
