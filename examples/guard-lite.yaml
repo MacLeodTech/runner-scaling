@@ -1,0 +1,50 @@
+# Example guard config for a second, lighter pool: runners WITHOUT a Docker daemon, for jobs that don't run
+# `docker build` or service containers (tests, lint, builds that don't make images). Run it as its own guard +
+# scaler pair next to the one in guard.yaml (see compose.yaml); workflows pick a pool by its labels.
+#
+# No dind means no privileged sidecar, so a job here is root in its container only, not on the host, and a slot
+# costs one container of memory instead of two. Put every repo that doesn't need Docker on this pool.
+#
+# What differs from guard.yaml:
+#   - own prefix, subnets, API socket and labels, so the two pools never touch each other's containers or networks;
+#   - no dind: section;
+#   - work_bind instead of a Docker volume: without dind there is no daemon to mount a volume for the job to share,
+#     and a bind lets the guard empty the workspace with a one-shot container (runner image, no network);
+#   - work_dir may sit anywhere (the "not under /tmp" rule exists only because dind mounts a tmpfs on /tmp);
+#   - the same memory_budget and cgroup_parent as the other pool, so both draw on one host-wide cap.
+
+github_url: https://github.com/YOUR-ORG
+# tenant_url: https://pipelines….actions.githubusercontent.com/<tenant>/   # pin it as in guard.yaml
+
+prefix: ci-lite               # containers ci-lite-runner-N, networks ci-lite-slot-N
+max_slots: 4
+subnet: 172.30.2{slot}.0/24   # next to guard.yaml's 172.30.{slot}.0/24; both sit inside the 172.30.0.0/16 fence
+require_file: /gate/firewall-ok   # see firewall.sh: no slot starts until the fence is up
+max_runtime: 6h
+
+# Every guard of every pool on the host should carry the same values: the budget is shared.
+memory_budget: 8G
+memory_reserve: 1G
+# cgroup_parent: ci.slice     # optional: groups all runners so `systemd-cgtop ci.slice` shows them together
+
+work_dir: /home/runner/_work
+work_bind: /srv/runner-scaling/lite-{slot}/work   # emptied before and after every job
+
+cache_dirs:                   # emptied after every job the scaler doesn't vouch for (see the README's "Caches")
+  - /srv/runner-scaling/lite-{slot}/toolcache
+
+runner:
+  image: ghcr.io/actions/actions-runner:latest  # pin a digest: ghcr.io/actions/actions-runner@sha256:…
+  command: [/home/runner/run.sh]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  dns: [1.1.1.1, 9.9.9.9]     # public DNS: the fence blocks private ranges, so a LAN resolver would be unreachable
+  memory: 3G
+  cpus: 2
+  cpu_shares: 512             # half the default weight: other host workloads win when the CPU is contended
+  pids: 1024
+  env:
+    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+  binds:
+    - /srv/runner-scaling/lite-{slot}/toolcache:/opt/hostedtoolcache
+  log_opts: {max-size: 10m, max-file: "3"}

@@ -8,7 +8,7 @@ is thrown away. Nothing runs while nothing is queued. The scaler is built on Git
 [`actions/scaleset`](https://github.com/actions/scaleset) client, the same runner scale set API that
 Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's no webhook endpoint to expose.
 
-> Status: early (0.x). The scale set API and the `actions/scaleset` module are in public preview.
+> Status: early (0.x); see the [changelog](CHANGELOG.md). The scale set API and the `actions/scaleset` module are in public preview.
 
 ## How it works
 
@@ -170,10 +170,38 @@ names. The guard decodes it and requires that:
 4. **Pin the tenant.** The first runner request is refused with
    `DENY ... no tenant_url pinned: this config's ServerUrl is "https://…/<tenant>/"`. Check it, put it in
    `tenant_url`, and restart the guard.
-5. **Fence the slot networks (recommended).** Give `subnet` a fixed range and add host firewall rules, in Docker's
-   `DOCKER-USER` chain, so jobs reach the internet but not your LAN or the host. Set `require_file` to a file your
-   firewall script creates (on a tmpfs), and the guard won't start a slot until the rules are in place.
+5. **Fence the slot networks (recommended).** Give `subnet` a fixed range and run the [firewall](#firewall)
+   sidecar, so jobs reach the internet but not your LAN or the host. Set `require_file` to its gate file, and the
+   guard won't start a slot until the rules are in place.
 6. **Target it from workflows** with the scale set's labels, for example `runs-on: [self-hosted, ci]`.
+7. **Optional: a second pool without Docker.** See [Several pools](#operations) and
+   [examples/guard-lite.yaml](examples/guard-lite.yaml).
+
+### Firewall
+
+A job can talk to anything its network can reach. With the default Docker bridge setup that includes your LAN, the
+host's own services and the other slots. The fence closes that: runner networks reach the internet and nothing else.
+
+[examples/firewall.sh](examples/firewall.sh) is a small sidecar that does it with `iptables` and is wired into
+[examples/compose.yaml](examples/compose.yaml):
+
+- **Rules.** A chain `GH_RUNNERS` is hooked into `DOCKER-USER` (traffic the runners send through the host) and
+  `INPUT` (traffic aimed at the host itself). Traffic from the fenced range to private and link-local addresses
+  (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`) is dropped, and the rest goes through to Docker's
+  normal handling. Replies to connections the host opened still work.
+- **Range.** `FENCE_SRC` (default `172.30.0.0/16`) must contain every guard's `subnet`. This is why `subnet` has a
+  fixed value: with `subnet` empty Docker picks ranges the fence can't know about.
+- **Gate.** After the rules are in place the script creates a file (`/gate/firewall-ok`, on a tmpfs volume).
+  Set `require_file` to it in every guard: no slot starts without it, so a reboot can't start an unfenced runner
+  before the rules are back.
+- **Upkeep.** Every 30 seconds it re-checks the rules and re-applies any that are missing. If it can't, it removes the
+  gate, so no new slot starts. Runners that are already running stay unfenced until the rules return (up to 30
+  seconds after something flushes them).
+- **Limits.** It needs host networking, `NET_ADMIN`, and a Docker that uses `iptables` and the `DOCKER-USER` chain.
+  Docker's nftables firewall backend has no such chain and isn't supported.
+
+Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` should time out, and
+`curl https://github.com` should work.
 
 ### Scaler flags (or environment)
 
@@ -201,9 +229,14 @@ names. The guard decodes it and requires that:
 - **Remove everything.** Stop the scaler, then
   `docker rm -f $(docker ps -aq -f label=io.github.runner-scaling.instance=<prefix>)`.
   To remove the scale set from GitHub too: `runner-scaling scaler --delete-scale-set`.
+- **Changing labels.** The scaler keeps the scale set's labels in step with `--labels`. GitHub accepts a label
+  update on an existing scale set and ignores it, so when the labels change the scaler deletes the scale set and
+  creates it again (with a new id). Runners already started for the old one finish their jobs. Renaming `--name` creates a second scale set and leaves the first behind: remove it with
+  `--delete-scale-set`.
 - **Several pools.** Run one guard + scaler pair per kind of runner, each with its own `prefix`, subnets, API
   socket and labels: for example one with a `dind:` section for jobs that build images, and a lighter one without
-  for everything else. Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
+  for everything else ([examples/guard-lite.yaml](examples/guard-lite.yaml) and
+  [examples/compose.yaml](examples/compose.yaml) show both). Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
   no network, no other mounts).
 - **One memory budget for all runners.** Set `memory_budget` (e.g. `8G`) and `memory_reserve` (default `1G`, the
   assumed minimum size of one slot) in every pool's guard config, with the same values. The guard measures the working
