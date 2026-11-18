@@ -287,6 +287,14 @@ With the [dashboard](#dashboard) on (`DASHBOARD_ADDR`), the scaler also serves `
 format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so scrape each
 pool's scaler. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
 
+```yaml
+scrape_configs:
+  - job_name: runner-scaling
+    authorization: {type: Bearer, credentials_file: /etc/prometheus/runner_scaling_token}   # the dashboard token
+    static_configs:
+      - targets: ["scaler:8080", "scaler-lite:8080"]   # one per pool; Prometheus on the scalers' Docker network
+```
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `runner_scaling_jobs{state}` | gauge | jobs queued and running, as the scaler knows them |
