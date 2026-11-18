@@ -1,0 +1,500 @@
+package guard
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"regexp"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/MacLeodTech/runner-scaling/internal/api"
+	"github.com/MacLeodTech/runner-scaling/internal/jit"
+)
+
+const (
+	labelInstance = "io.github.runner-scaling.instance"
+	labelSlot     = "io.github.runner-scaling.slot"
+	labelRole     = "io.github.runner-scaling.role"
+	labelRunner   = "io.github.runner-scaling.runner-name"
+
+	// jitEnv carries the JIT config into the runner container; the entrypoint wrapper unsets it before exec.
+	jitEnv = "RUNNER_SCALING_JITCONFIG"
+)
+
+// entrypointWrapper moves the JIT config from the environment to the runner's command line, so job steps (which
+// inherit the runner's environment) never see it.
+const entrypointWrapper = `j="$` + jitEnv + `"; unset ` + jitEnv + `; exec "$@" --jitconfig "$j"`
+
+// ErrBadRequest and ErrConflict map to 400 and 409.
+var (
+	ErrBadRequest = errors.New("bad request")
+	ErrConflict   = errors.New("conflict")
+	ErrNotReady   = errors.New("not ready")
+)
+
+// Guard creates and removes runner slots from its fixed templates.
+type Guard struct {
+	cfg *Config
+	d   Docker
+	log *slog.Logger
+
+	mu       sync.Mutex
+	starting map[int]bool
+	nameRE   *regexp.Regexp
+}
+
+func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
+	return &Guard{
+		cfg: cfg, d: d, log: log,
+		starting: map[int]bool{},
+		nameRE:   regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.Prefix) + `-([0-9]+)-[a-z0-9]{4,16}$`),
+	}
+}
+
+func (g *Guard) Info() api.Info {
+	return api.Info{Prefix: g.cfg.Prefix, MaxSlots: g.cfg.MaxSlots, WorkDir: g.cfg.WorkDir, GitHubURL: g.cfg.GitHubURL}
+}
+
+func (g *Guard) names(slot int) (runner, dind, network, volume string) {
+	p, s := g.cfg.Prefix, strconv.Itoa(slot)
+	return p + "-runner-" + s, p + "-dind-" + s, p + "-slot-" + s, p + "-work-" + s
+}
+
+// EnsureImages pulls any template image the daemon doesn't have yet.
+func (g *Guard) EnsureImages(ctx context.Context) error {
+	imgs := []string{g.cfg.Runner.Image}
+	if g.cfg.Dind != nil {
+		imgs = append(imgs, g.cfg.Dind.Image)
+	}
+	for _, img := range imgs {
+		ok, err := g.d.ImageExists(ctx, img)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			g.log.Info("pulling image", "image", img)
+			if err := g.d.ImagePull(ctx, img); err != nil {
+				return fmt.Errorf("pull %s: %w", img, err)
+			}
+		}
+	}
+	return nil
+}
+
+// List reports every slot that has containers.
+func (g *Guard) List(ctx context.Context) ([]api.Slot, error) {
+	cs, err := g.d.ContainerList(ctx, labelInstance+"="+g.cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	by := map[int]*api.Slot{}
+	for _, c := range cs {
+		n, err := strconv.Atoi(c.Labels[labelSlot])
+		if err != nil {
+			continue
+		}
+		s := by[n]
+		if s == nil {
+			s = &api.Slot{Slot: n}
+			by[n] = s
+		}
+		switch c.Labels[labelRole] {
+		case "runner":
+			s.RunnerName, s.RunnerState = c.Labels[labelRunner], c.State
+		case "dind":
+			s.DindState = c.State
+		}
+	}
+	g.mu.Lock()
+	for n := range g.starting {
+		if by[n] == nil {
+			by[n] = &api.Slot{Slot: n}
+		}
+		by[n].Starting = true
+	}
+	g.mu.Unlock()
+	out := make([]api.Slot, 0, len(by))
+	for _, k := range slices.Sorted(maps.Keys(by)) {
+		out = append(out, *by[k])
+	}
+	return out, nil
+}
+
+// Start brings a slot up: network, fresh work volume, dind (waited on until healthy), then the runner.
+func (g *Guard) Start(ctx context.Context, slot int, req api.StartRequest) error {
+	if slot < 1 || slot > g.cfg.MaxSlots {
+		return fmt.Errorf("%w: slot %d outside 1..%d", ErrBadRequest, slot, g.cfg.MaxSlots)
+	}
+	m := g.nameRE.FindStringSubmatch(req.RunnerName)
+	if m == nil || m[1] != strconv.Itoa(slot) {
+		return fmt.Errorf("%w: runner name %q must be %s-%d-<4-16 lowercase alphanumerics>", ErrBadRequest, req.RunnerName, g.cfg.Prefix, slot)
+	}
+	if err := jit.Validate(req.JITConfig, jit.Expect{
+		TenantURL: g.cfg.TenantURL, RunnerName: req.RunnerName, WorkFolder: g.cfg.WorkDir, SharedHosts: g.cfg.SharedHosts,
+	}); err != nil {
+		g.log.Warn("refused jit config", "runner", req.RunnerName, "shape", jit.Shape(req.JITConfig))
+		return fmt.Errorf("%w: %v", ErrBadRequest, err)
+	}
+
+	if g.cfg.RequireFile != "" {
+		if _, err := os.Stat(g.cfg.RequireFile); err != nil {
+			return fmt.Errorf("%w: %s is missing (is the firewall up?)", ErrNotReady, g.cfg.RequireFile)
+		}
+	}
+	g.mu.Lock()
+	if g.starting[slot] {
+		g.mu.Unlock()
+		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
+	}
+	busy, err := g.slotHasContainers(ctx, slot)
+	if err != nil {
+		g.mu.Unlock()
+		return err
+	}
+	if busy {
+		g.mu.Unlock()
+		return fmt.Errorf("%w: slot %d is in use", ErrConflict, slot)
+	}
+	g.starting[slot] = true
+	g.mu.Unlock()
+	defer func() { g.mu.Lock(); delete(g.starting, slot); g.mu.Unlock() }()
+
+	ctx, cancel := context.WithTimeout(ctx, g.cfg.StartTimeout.Duration)
+	defer cancel()
+	if err := g.start(ctx, slot, req); err != nil {
+		g.log.Error("slot start failed, tearing down", "slot", slot, "err", err)
+		g.teardown(context.WithoutCancel(ctx), slot, false)
+		return err
+	}
+	g.log.Info("slot started", "slot", slot, "runner", req.RunnerName)
+	return nil
+}
+
+func (g *Guard) slotHasContainers(ctx context.Context, slot int) (bool, error) {
+	cs, err := g.d.ContainerList(ctx, labelInstance+"="+g.cfg.Prefix)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range cs {
+		if c.Labels[labelSlot] == strconv.Itoa(slot) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (g *Guard) labels(slot int, role, runner string) map[string]string {
+	l := map[string]string{}
+	switch role {
+	case "runner":
+		maps.Copy(l, g.cfg.Runner.Labels)
+	case "dind":
+		maps.Copy(l, g.cfg.Dind.Labels)
+	}
+	maps.Copy(l, map[string]string{labelInstance: g.cfg.Prefix, labelSlot: strconv.Itoa(slot), labelRole: role})
+	if runner != "" {
+		l[labelRunner] = runner
+	}
+	return l
+}
+
+func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error {
+	runnerName, dindName, netName, volName := g.names(slot)
+	subnet := ""
+	if g.cfg.Subnet != "" {
+		subnet = g.cfg.Expand(g.cfg.Subnet, slot)
+	}
+	if err := g.d.NetworkEnsure(ctx, netName, subnet, g.labels(slot, "network", "")); err != nil {
+		return fmt.Errorf("network: %w", err)
+	}
+	work := volName + ":" + g.cfg.WorkDir
+	if g.cfg.WorkBind != "" {
+		work = g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir
+	} else if err := g.d.VolumeCreate(ctx, volName, g.labels(slot, "work", "")); err != nil {
+		return fmt.Errorf("work volume: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if g.cfg.Dind != nil {
+		spec := g.spec(g.cfg.Dind, slot, netName, work, map[string]string{"DOCKER_TLS_CERTDIR": ""})
+		spec.Hostname = dindName
+		spec.Labels = g.labels(slot, "dind", "")
+		if err := g.run(ctx, dindName, spec); err != nil {
+			return fmt.Errorf("dind: %w", err)
+		}
+		if err := g.waitHealthy(ctx, dindName); err != nil {
+			return fmt.Errorf("dind: %w", err)
+		}
+		extraEnv["DOCKER_HOST"] = "tcp://" + dindName + ":2375"
+	}
+
+	if g.cfg.WorkBind != "" {
+		if err := g.wipeWork(ctx, slot); err != nil {
+			return err
+		}
+	}
+
+	extraEnv[jitEnv] = req.JITConfig
+	extraEnv["RUNNER_SCALING_SLOT"] = strconv.Itoa(slot)
+	spec := g.spec(&g.cfg.Runner, slot, netName, work, extraEnv)
+	spec.Hostname = req.RunnerName
+	spec.Labels = g.labels(slot, "runner", req.RunnerName)
+	spec.Entrypoint = []string{"/bin/sh", "-c", entrypointWrapper, "runner-scaling"}
+	spec.Cmd = g.cfg.Runner.Command
+	if err := g.run(ctx, runnerName, spec); err != nil {
+		return fmt.Errorf("runner: %w", err)
+	}
+	return nil
+}
+
+// wipeCmd empties the directory given as $0, including dotfiles, without removing it.
+var wipeCmd = []string{"sh", "-c", `find "$0" -mindepth 1 -delete`}
+
+// wipeWork empties a slot's work_bind directory: inside its dind if there is one (it mounts the same directory),
+// otherwise in a one-shot container from the runner image with nothing but that directory and no network.
+func (g *Guard) wipeWork(ctx context.Context, slot int) error {
+	cmd := append(slices.Clone(wipeCmd), g.cfg.WorkDir)
+	var code int
+	var err error
+	if g.cfg.Dind != nil {
+		_, dindName, _, _ := g.names(slot)
+		code, err = g.d.Exec(ctx, dindName, cmd)
+	} else {
+		code, err = g.wipeOneShot(ctx, slot, cmd)
+	}
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	if err != nil {
+		return fmt.Errorf("empty work dir: %w", err)
+	}
+	return nil
+}
+
+func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd []string) (int, error) {
+	name := g.wiperName(slot)
+	if err := g.d.ContainerRemove(ctx, name); err != nil {
+		return -1, err
+	}
+	pids := int64(64)
+	spec := ContainerSpec{
+		Image:      g.cfg.Runner.Image,
+		User:       "0",
+		Entrypoint: cmd,
+		Labels:     g.labels(slot, "wipe", ""),
+		HostConfig: HostConfig{
+			Binds:         []string{g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir},
+			NetworkMode:   "none",
+			RestartPolicy: map[string]any{"Name": "no"},
+			CapDrop:       []string{"ALL"},
+			CapAdd:        []string{"DAC_OVERRIDE", "FOWNER"}, // delete files any job user left behind
+			SecurityOpt:   []string{"no-new-privileges:true"},
+			Memory:        256 << 20,
+			PidsLimit:     &pids,
+			CgroupParent:  g.cfg.CgroupParent,
+		},
+	}
+	defer g.d.ContainerRemove(context.WithoutCancel(ctx), name)
+	if err := g.run(ctx, name, spec); err != nil {
+		return -1, err
+	}
+	for {
+		st, err := g.d.ContainerInspect(ctx, name)
+		if err != nil {
+			return -1, err
+		}
+		if st.Status == "exited" || st.Status == "dead" {
+			return st.ExitCode, nil
+		}
+		select {
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (g *Guard) wiperName(slot int) string { return g.cfg.Prefix + "-wipe-" + strconv.Itoa(slot) }
+
+func (g *Guard) run(ctx context.Context, name string, spec ContainerSpec) error {
+	id, err := g.d.ContainerCreate(ctx, name, spec)
+	if err != nil {
+		return err
+	}
+	return g.d.ContainerStart(ctx, id)
+}
+
+func (g *Guard) waitHealthy(ctx context.Context, name string) error {
+	for {
+		st, err := g.d.ContainerInspect(ctx, name)
+		if err != nil {
+			return err
+		}
+		switch {
+		case st.Status != "running" && st.Status != "created":
+			return fmt.Errorf("container %s", st.Status)
+		case st.Health == "" && st.Status == "running", st.Health == "healthy":
+			return nil
+		case st.Health == "unhealthy":
+			return errors.New("unhealthy")
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("not healthy in time: %w", ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// spec turns a template into a container spec for one slot. extra env wins over the template's.
+func (g *Guard) spec(t *Template, slot int, network, work string, extra map[string]string) ContainerSpec {
+	env := map[string]string{}
+	for k, v := range t.Env {
+		env[k] = g.cfg.Expand(v, slot)
+	}
+	maps.Copy(env, extra)
+	envList := make([]string, 0, len(env))
+	for _, k := range slices.Sorted(maps.Keys(env)) {
+		envList = append(envList, k+"="+env[k])
+	}
+	binds := []string{work}
+	for _, b := range t.Binds {
+		binds = append(binds, g.cfg.Expand(b, slot))
+	}
+	hc := HostConfig{
+		Binds:         binds,
+		NetworkMode:   network,
+		RestartPolicy: map[string]any{"Name": "no"},
+		Privileged:    t.Privileged,
+		CapDrop:       t.CapDrop,
+		CapAdd:        t.CapAdd,
+		SecurityOpt:   t.SecurityOpt,
+		DNS:           t.DNS,
+		NanoCPUs:      int64(t.CPUs * 1e9),
+		CgroupParent:  g.cfg.CgroupParent,
+	}
+	if t.Memory != "" {
+		hc.Memory, _ = ParseBytes(t.Memory) // validated at load
+	}
+	if t.Pids > 0 {
+		p := t.Pids
+		hc.PidsLimit = &p
+	}
+	if len(t.Log) > 0 {
+		hc.LogConfig = &LogConfig{Type: "json-file", Config: t.Log}
+	}
+	s := ContainerSpec{
+		Image:            t.Image,
+		User:             t.User,
+		Env:              envList,
+		HostConfig:       hc,
+		NetworkingConfig: &NetworkingConfig{EndpointsConfig: map[string]struct{}{network: {}}},
+	}
+	if t.Health != nil {
+		s.Healthcheck = &HealthConfig{
+			Test: t.Health.Test, Interval: t.Health.Interval.Duration, Timeout: t.Health.Timeout.Duration,
+			Retries: t.Health.Retries, StartPeriod: t.Health.StartPeriod.Duration,
+		}
+	}
+	return s
+}
+
+// Stop tears a slot down. Stopping a slot that has nothing in it is not an error.
+func (g *Guard) Stop(ctx context.Context, slot int) error {
+	if slot < 1 || slot > g.cfg.MaxSlots {
+		return fmt.Errorf("%w: slot %d outside 1..%d", ErrBadRequest, slot, g.cfg.MaxSlots)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.starting[slot] {
+		return fmt.Errorf("%w: slot %d is starting", ErrConflict, slot)
+	}
+	return g.teardown(ctx, slot, true)
+}
+
+func (g *Guard) teardown(ctx context.Context, slot int, prune bool) error {
+	runnerName, dindName, _, volName := g.names(slot)
+	var errs []error
+	if err := g.d.ContainerRemove(ctx, runnerName); err != nil {
+		errs = append(errs, err)
+	}
+	if g.cfg.Dind != nil {
+		if st, err := g.d.ContainerInspect(ctx, dindName); err == nil && st.Status == "running" {
+			pctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+			if g.cfg.WorkBind != "" {
+				if err := g.wipeWork(pctx, slot); err != nil {
+					g.log.Warn("teardown", "slot", slot, "err", err)
+				}
+			}
+			if prune {
+				for _, cmd := range g.cfg.Dind.PruneOnStop {
+					if code, err := g.d.Exec(pctx, dindName, cmd); err != nil || code != 0 {
+						g.log.Warn("prune command failed", "slot", slot, "cmd", cmd, "code", code, "err", err)
+					}
+				}
+			}
+			cancel()
+		}
+		if err := g.d.ContainerRemove(ctx, dindName); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if g.cfg.Dind == nil && g.cfg.WorkBind != "" {
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		if err := g.wipeWork(wctx, slot); err != nil {
+			g.log.Warn("teardown", "slot", slot, "err", err)
+		}
+		cancel()
+	}
+	if err := g.d.ContainerRemove(ctx, g.wiperName(slot)); err != nil {
+		errs = append(errs, err)
+	}
+	if g.cfg.WorkBind == "" {
+		if err := g.d.VolumeRemove(ctx, volName); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Reap tears down slots whose runner has exited (ephemeral runners exit after their one job) or is missing.
+func (g *Guard) Reap(ctx context.Context) {
+	slots, err := g.List(ctx)
+	if err != nil {
+		g.log.Error("reap: list", "err", err)
+		return
+	}
+	for _, s := range slots {
+		if s.Starting || s.RunnerState == "running" || s.RunnerState == "created" || s.RunnerState == "restarting" {
+			continue
+		}
+		g.mu.Lock()
+		if !g.starting[s.Slot] {
+			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState)
+			if err := g.teardown(ctx, s.Slot, true); err != nil {
+				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
+			}
+		}
+		g.mu.Unlock()
+	}
+}
+
+// ReapLoop runs Reap until ctx ends.
+func (g *Guard) ReapLoop(ctx context.Context) {
+	t := time.NewTicker(g.cfg.ReapInterval.Duration)
+	defer t.Stop()
+	for {
+		g.Reap(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}

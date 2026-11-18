@@ -1,0 +1,38 @@
+# Example deployment: guard + scaler. Put GITHUB_TOKEN (or GITHUB_APP_*) in .env next to this file.
+services:
+  guard:
+    image: ghcr.io/macleodtech/runner-scaling:0.1   # pin a digest
+    command: [guard, --config, /etc/runner-scaling/guard.yaml]
+    restart: unless-stopped
+    user: "0:65532"            # root for the Docker socket; group 65532 so the scaler (nonroot) can use the API socket
+    network_mode: none         # needs no network: it talks to Docker and the scaler over unix sockets
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 64
+    volumes:
+      - ./guard.yaml:/etc/runner-scaling/guard.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - guard-api:/run/runner-scaling
+    healthcheck:
+      test: [CMD, /usr/local/bin/runner-scaling, health]
+      interval: 30s
+
+  scaler:
+    image: ghcr.io/macleodtech/runner-scaling:0.1
+    command: [scaler, --labels, "self-hosted,linux,x64,ci"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    pids_limit: 64
+    env_file: [.env]
+    volumes:
+      - guard-api:/run/runner-scaling
+    depends_on:
+      guard: {condition: service_healthy}
+
+volumes:
+  guard-api:

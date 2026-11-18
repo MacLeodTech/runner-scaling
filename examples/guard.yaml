@@ -1,0 +1,43 @@
+# Example guard config using GitHub's official runner image. Everything about the containers the guard creates
+# comes from this file; the scaler can only pick a slot number and hand over a JIT config.
+# Mount it read-only into the guard, and keep it writable only by root on the host.
+
+github_url: https://github.com/YOUR-ORG          # or https://github.com/OWNER/REPO for a repo-level scale set
+# Leave tenant_url out on first start. The guard refuses the first JIT config and logs its ServerUrl
+# (`docker logs <guard> | grep DENY`). Check it came from your own scaler talking to your own org, then pin it here.
+# tenant_url: https://pipelines….actions.githubusercontent.com/<tenant>/
+
+prefix: ci                    # names containers ci-runner-N, ci-dind-N, networks ci-slot-N, runners ci-N-xxxxxx
+max_slots: 2
+subnet: 172.30.{slot}.0/24    # optional: fixed per-slot subnets, so a host firewall can fence them
+work_dir: /home/runner/_work  # fresh Docker volume per runner, mounted here in the runner and in dind
+
+runner:
+  image: ghcr.io/actions/actions-runner:latest  # pin a digest: ghcr.io/actions/actions-runner@sha256:…
+  command: [/home/runner/run.sh]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  memory: 4G
+  cpus: 2
+  pids: 2048
+  env:
+    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+  binds:
+    - /srv/runner-scaling/{slot}/toolcache:/opt/hostedtoolcache   # warm caches, one per slot
+  log_opts: {max-size: 10m, max-file: "3"}
+
+# Optional private Docker daemon per runner. Jobs get DOCKER_HOST=tcp://<prefix>-dind-<slot>:2375 on their own
+# network. Remove this section if jobs don't need Docker.
+dind:
+  image: docker:28-dind       # pin a digest
+  privileged: true            # the price of `docker build` in jobs; see the README's threat model
+  memory: 4G
+  cpus: 2
+  pids: 4096
+  binds:
+    - /srv/runner-scaling/{slot}/docker:/var/lib/docker            # image and layer cache, one per slot
+  healthcheck: {test: [CMD, docker, info], interval: 3s, timeout: 5s, retries: 40, start_period: 3s}
+  prune_on_stop:
+    - [docker, builder, prune, -f, --filter, until=168h]
+    - [docker, image, prune, -af, --filter, until=336h]
+  log_opts: {max-size: 10m, max-file: "3"}

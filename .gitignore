@@ -1,0 +1,5 @@
+/runner-scaling
+*.env
+.env*
+!.env.example
+examples/*.local.*
