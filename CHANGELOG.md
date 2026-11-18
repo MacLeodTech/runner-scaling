@@ -3,6 +3,31 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow [semver](https://semver.org/); until
 1.0, a minor version may change the config or flags.
 
+## [0.4.0] - 2026-11-18
+
+### Added
+
+- **`runners` CLI** (`cmd/runners`): a read-only command that shows pools, slots, jobs and memory from the scaler's
+  dashboard (`status`, `slots`, `jobs`, `memory`, `watch`, `--json`). It needs only the dashboard URL and token,
+  which it reads from `--token-file`, `RUNNERS_TOKEN`, or `~/.config/runners/token`. `runners host` lists the runner
+  containers on the host with their runtime and privilege flag; it runs the `docker` CLI.
+- **Sysbox support, tested.** `runtime: sysbox-runc` on `dind` runs the sidecar without `privileged`. A real image
+  build took the same time as under privileged dind, three Sysbox slots ran at once next to a privileged one, and the
+  inner privileged container had an unprivileged host uid, 16 `/dev` entries (218 under privileged dind) and no host
+  block devices (14). New `examples/guard-sysbox.yaml` and a README section, "Running dind under Sysbox", with the
+  install pitfalls, what was measured, and what it does not cover.
+
+### Changed
+
+- The README's threat model points at the Sysbox section instead of saying the runtime was untested.
+- Docs: `examples/guard.yaml` mentions `runtime: sysbox-runc` next to `privileged`.
+
+### Known limitations
+
+- Sysbox narrows the "any job is root on the host" route; it does not remove the shared kernel. A job with
+  `NET_ADMIN` can still make the host kernel load a module (we saw `dummy`), with or without Sysbox.
+- Sysbox was tried with one real workflow and a probe suite, not weeks of use. Reboot behaviour is untested.
+
 ## [0.3.0] - 2026-11-18
 
 ### Changed
@@ -60,6 +85,8 @@ preview: GitHub may change them.
 - **Dashboard.** A read-only status page (`DASHBOARD_ADDR`) with the slots, running and queued jobs, recent
   results, and each runner's CPU, memory, processes, network and disk use. `DASHBOARD_PEERS` folds other pools in.
 - **Examples** for both pool kinds (`examples/guard.yaml`, `examples/guard-lite.yaml`, `examples/compose.yaml`).
+- **Fuzzing and network checks.** A fuzz test for the JIT config validator (`FuzzValidate`), and the guard refuses to
+  reuse an existing Docker network whose subnet differs from the one it expects.
 - CI on GitHub-hosted runners: `gofmt`, `go vet`, `go test -race`, `govulncheck`, and an image build with build
   provenance attestation on `v*` tags.
 
@@ -73,6 +100,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.4.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.4.0
 [0.3.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.3.0
 [0.2.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.2.0
 [0.1.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.1.0

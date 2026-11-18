@@ -131,11 +131,9 @@ names. The guard decodes it and requires that:
   runners (a push to any branch, a bot such as Dependabot, a stolen token) can run code as root on the host, and so
   can anyone who holds the scaler's GitHub credential (they can create a repo and a workflow of their own). That is
   the cost of letting jobs run `docker build`. Drop the `dind:` section if your jobs don't need Docker, and use a
-  Docker-less pool for everything else. To narrow it, run the sidecar under a runtime that makes "privileged"
-  harmless to the host: install [Sysbox](https://github.com/nestybox/sysbox) (or another OCI runtime) on the host,
-  register it with the Docker daemon, set `runtime: sysbox-runc` on `dind` and drop `privileged`. The guard only
-  passes the name through to Docker; it hasn't been tested against any particular runtime, so try one on a
-  throwaway host before relying on it.
+  Docker-less pool for everything else. To narrow it, run the sidecar under Sysbox (see
+  [Running dind under Sysbox](#running-dind-under-sysbox)), which makes "privileged" harmless to the host's disks and
+  devices. It narrows the most common route; it is not a guarantee, because jobs still share the host kernel.
 - **Only run jobs from repos you trust.** On GitHub, limit the runner group to private repos, disable fork PR
   workflows (or require approval), keep bot PRs off the Docker pool, and fence the per-slot subnets with a host
   firewall so jobs reach only the internet. On plans without branch protection, any branch can change a workflow.
@@ -439,6 +437,66 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `runtime`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
 
 Omit `dind` for runners without a private Docker daemon.
+
+## Running dind under Sysbox
+
+[Sysbox](https://github.com/nestybox/sysbox) is an OCI runtime that runs the dind sidecar without `privileged`. Root
+inside it maps to an unprivileged host uid, so a job that starts a `--privileged` container against that dind gets a
+container that cannot see the host's disks or devices. `examples/guard-sysbox.yaml` is `guard.yaml` with
+`runtime: sysbox-runc` in place of `privileged: true`; run it as a pool of its own (own `prefix`, own subnets) so you
+can move repos over one at a time.
+
+Install Sysbox on the host first and register it with Docker (`runtimes` in `daemon.json`). Things that bit us on
+Ubuntu 24.04 with Docker 29:
+
+- The Sysbox installer refuses to run while containers exist unless `bip` and `default-address-pools` are set in
+  `daemon.json`. Set them to Docker's own defaults first.
+- sysbox-fs needs an AppArmor override for `fusermount3` that allows `/var/lib/sysboxfs/**/`.
+- Sysbox adds host services (`sysbox-mgr`, `sysbox-fs`) that Docker now depends on for these containers. Keep them
+  in mind when you upgrade the kernel or Docker.
+
+What we measured on a real build and a probe suite (private repo, quiet host, runner state on local NVMe):
+
+- A real BuildKit image build took the same time as with privileged dind (388 s against 383 s).
+- Three Sysbox slots and one privileged slot ran at the same time. The inner privileged container had uid map
+  `0 165536 65536` (privileged dind: `0 0 4294967295`, real host root), 16 `/dev` entries against 218, and no host
+  block devices against 14. `/proc/sys`, `/proc/uptime` and `/proc/swaps` are served by sysbox-fs.
+- The per-slot firewall fence behaved the same, from the runner and from inside inner containers, and no slot could
+  reach another slot's dind.
+- Compose, published ports, a mounted `docker.sock`, `--network host`, `NET_ADMIN`, ptrace, `chown` on bind mounts,
+  overlay mounts and memory limits all worked as under privileged dind. No job changed the host's sysctls, `/dev`,
+  accounts, cron or sudoers.
+
+What it does not do:
+
+- Containers still share the host kernel. A kernel exploit is still an escape, and we did not try to escape.
+- A job can still make the host kernel load a module: a container with `NET_ADMIN` creating a dummy interface loaded
+  `dummy`. That holds with or without Sysbox. Blacklist modules you don't want loadable on a host that runs
+  untrusted jobs.
+- It only changes the dind sidecar. The runner container, the guard and the firewall are as before.
+- Only a few kinds of workflow were tried. Jobs that need KVM, kernel modules or `/proc/sys` writes may not work.
+- Start and stop took no longer on a quiet host. Under heavy load on a slow disk we saw slow starts and a container
+  that would not stop; keep runner state on a fast local disk.
+
+## The `runners` CLI
+
+`runners` is a small read-only command for asking a running deployment what it is doing. It talks only to the
+scaler's dashboard (`/api/state` and `/metrics`), so it needs the dashboard URL and token and nothing else: no Docker
+socket, no GitHub credential. It shows every pool the dashboard folds in (the `DASHBOARD_PEERS` ones too).
+
+```sh
+go install github.com/MacLeodTech/runner-scaling/cmd/runners@latest   # or: go build -o runners ./cmd/runners
+
+export RUNNERS_URL=http://localhost:8787            # default
+export RUNNERS_TOKEN_FILE=/path/to/dashboard_token  # or RUNNERS_TOKEN; sent as a bearer header, never in the URL
+
+runners            # status: slots in use, queued and running jobs, per pool
+runners slots      # every slot with memory, CPU and process count
+runners jobs -n 20 # queued, running and the 20 most recent jobs
+runners memory     # memory used against memory_budget, per slot
+runners watch -i 2 # status, refreshed every 2 seconds
+runners status --json   # status, slots, jobs and memory also have --json
+```
 
 ## Development
 

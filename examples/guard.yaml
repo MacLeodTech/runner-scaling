@@ -42,7 +42,7 @@ runner:
 # network. Remove this section if jobs don't need Docker.
 dind:
   image: docker:28-dind       # pin a digest
-  privileged: true            # the price of `docker build` in jobs; see the README's threat model
+  privileged: true            # the price of `docker build` in jobs; see the README's threat model (or runtime: sysbox-runc)
   memory: 4G
   cpus: 2
   pids: 4096
