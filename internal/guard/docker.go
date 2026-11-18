@@ -60,6 +60,7 @@ type HostConfig struct {
 	NetworkMode   string         `json:"NetworkMode,omitempty"`
 	RestartPolicy map[string]any `json:"RestartPolicy,omitempty"`
 	Privileged    bool           `json:"Privileged"`
+	Runtime       string         `json:"Runtime,omitempty"`
 	CapDrop       []string       `json:"CapDrop,omitempty"`
 	CapAdd        []string       `json:"CapAdd,omitempty"`
 	SecurityOpt   []string       `json:"SecurityOpt,omitempty"`

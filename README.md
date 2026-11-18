@@ -131,7 +131,11 @@ names. The guard decodes it and requires that:
   runners (a push to any branch, a bot such as Dependabot, a stolen token) can run code as root on the host, and so
   can anyone who holds the scaler's GitHub credential (they can create a repo and a workflow of their own). That is
   the cost of letting jobs run `docker build`. Drop the `dind:` section if your jobs don't need Docker, and use a
-  Docker-less pool for everything else.
+  Docker-less pool for everything else. To narrow it, run the sidecar under a runtime that makes "privileged"
+  harmless to the host: install [Sysbox](https://github.com/nestybox/sysbox) (or another OCI runtime) on the host,
+  register it with the Docker daemon, set `runtime: sysbox-runc` on `dind` and drop `privileged`. The guard only
+  passes the name through to Docker; it hasn't been tested against any particular runtime, so try one on a
+  throwaway host before relying on it.
 - **Only run jobs from repos you trust.** On GitHub, limit the runner group to private repos, disable fork PR
   workflows (or require approval), keep bot PRs off the Docker pool, and fence the per-slot subnets with a host
   firewall so jobs reach only the internet. On plans without branch protection, any branch can change a workflow.
@@ -201,7 +205,9 @@ host's own services and the other slots. The fence closes that: runner networks 
   before the rules are back.
 - **Upkeep.** Every 30 seconds it re-checks the rules and re-applies any that are missing. If it can't, it removes the
   gate, so no new slot starts. Runners that are already running stay unfenced until the rules return (up to 30
-  seconds after something flushes them).
+  seconds after something flushes them). The guard watches the gate file too: when it vanishes while the guard is
+  running it logs one `GATE WITHDRAWN` error and counts `gate_withdrawn_total` (see Metrics), so you hear about the
+  gap. It doesn't kill running jobs over it.
 - **Limits.** It needs host networking, `NET_ADMIN`, and a Docker that uses `iptables` and the `DOCKER-USER` chain.
   Docker's nftables firewall backend has no such chain and isn't supported.
 
@@ -262,11 +268,32 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   is busy. If you'd rather have the kernel enforce one limit, `cgroup_parent` (e.g. `runner-scaling.slice`) puts all
   runners under one cgroup that you can cap with `systemctl set-property`.
 
+### Keeping the runner image current
+
+The scale set is registered with `DisableUpdate: true`: a runner never updates itself, so the version inside your
+pinned runner image is the version you run. GitHub refuses runners that get too old, and when that happens jobs just
+wait. Check from time to time (or from cron):
+
+```
+scripts/check-runner-image.sh guard.yaml guard-lite.yaml   # exits 1 when behind
+```
+
+To bump: pick a newer tag of your runner image, `docker pull` it, put its digest in every guard config's runner
+`image`, run `runner-scaling guard --check`, then restart the guards (running jobs keep their containers).
+
 ### Metrics
 
 With the [dashboard](#dashboard) on (`DASHBOARD_ADDR`), the scaler also serves `GET /metrics` in Prometheus text
 format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so scrape each
 pool's scaler. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
+
+```yaml
+scrape_configs:
+  - job_name: runner-scaling
+    authorization: {type: Bearer, credentials_file: /etc/prometheus/runner_scaling_token}   # the dashboard token
+    static_configs:
+      - targets: ["scaler:8080", "scaler-lite:8080"]   # one per pool; Prometheus on the scalers' Docker network
+```
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -293,6 +320,7 @@ serve metrics itself; its read-only `GET /v1/counters` is what the scaler reads)
 | `denied_total` | a bad or refused request, or an unknown endpoint: the guard's API was misused. **Alert on any.** |
 | `not_ready_total` | a start refused with 503: the memory budget was full, or the firewall gate was missing |
 | `admission_refused_total` | starts held back by the memory budget (normal under load; a steady climb with idle memory means the reserve or ramp is too cautious) |
+| `gate_withdrawn_total` | `require_file` vanished (the firewall rules were lost): running slots may be unfenced until it returns. **Alert on any.** |
 | `conflicts_total` | a start or stop refused because the slot was in use or in transition |
 | `starts_total`, `start_failures_total` | slots started, and starts that failed after being admitted |
 | `reaped_runner_exited_total`, `reaped_max_runtime_total`, `reaped_memory_budget_total` | slots torn down, by reason. `memory_budget` means the backstop killed a running job. |
@@ -302,6 +330,8 @@ Alerts worth having:
 ```yaml
 - alert: RunnerScalingGuardDenied   # the guard's API was misused: look at the guard's DENY log lines
   expr: increase(runner_scaling_guard_denied_total[10m]) > 0
+- alert: RunnerScalingFirewallGateLost   # the fence is down; running jobs may be unfenced
+  expr: increase(runner_scaling_guard_gate_withdrawn_total[10m]) > 0
 - alert: RunnerScalingJobKilledForMemory   # the memory backstop removed a running job
   expr: increase(runner_scaling_guard_reaped_memory_budget_total[1h]) > 0
 - alert: RunnerScalingGuardDown
@@ -406,7 +436,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `start_timeout` | how long a slot may take to come up (default 2m) |
 | `max_runtime` | the reaper removes a runner that runs longer than this (default: no limit) |
 | `reap_interval` | how often exited runners are cleaned up (default 5s) |
-| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
+| `runner`, `dind` | container templates: `image`, `user`, `command`, `env`, `binds`, `privileged`, `runtime`, `cap_drop`, `cap_add`, `security_opt`, `dns`, `memory`, `memory_high`, `cpus`, `cpu_shares`, `pids`, `healthcheck`, `log_opts`, `labels`, and for dind `prune_on_stop` |
 
 Omit `dind` for runners without a private Docker daemon.
 

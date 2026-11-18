@@ -368,6 +368,7 @@ func TestConfigRejects(t *testing.T) {
 		"http tenant":       {"https://pipelines.actions", "http://pipelines.actions"},
 		"work_dir in /tmp":  {"work_dir: /runner/work", "work_dir: /tmp/runner"},
 		"bad cgroup parent": {"work_dir: /runner/work", "work_dir: /runner/work\ncgroup_parent: ../evil"},
+		"bad runtime":       {"  privileged: true\n  binds: [\"/srv/runners/{slot}/docker", "  privileged: true\n  runtime: \"../x y\"\n  binds: [\"/srv/runners/{slot}/docker"},
 		"work_bind no slot": {"work_dir: /runner/work", "work_dir: /runner/work\nwork_bind: /big/work"},
 	}
 	for name, sub := range cases {
@@ -448,6 +449,51 @@ func TestRequireFileGatesStarts(t *testing.T) {
 	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
 	if rec := do(t, g.Handler(), "PUT", "/v1/slots/1", req); rec.Code != http.StatusCreated {
 		t.Fatalf("gate file present: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestRuntimeIsPassedToDocker(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.Dind.Runtime = "sysbox-runc"
+	g.cfg.Dind.Privileged = false
+	if err := g.Start(context.Background(), 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.containers["ci-dind-1"].spec.HostConfig.Runtime; got != "sysbox-runc" {
+		t.Errorf("dind runtime %q", got)
+	}
+	if got := f.containers["ci-runner-1"].spec.HostConfig.Runtime; got != "" {
+		t.Errorf("runner should use the default runtime, got %q", got)
+	}
+}
+
+func TestGateWithdrawnIsCountedOnceAndRunnersSurvive(t *testing.T) {
+	g, f := newGuard(t)
+	ctx := context.Background()
+	g.cfg.RequireFile = filepath.Join(t.TempDir(), "firewall-ok")
+	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
+	if err := g.Start(ctx, 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}); err != nil {
+		t.Fatal(err)
+	}
+	g.Reap(ctx)
+	if n := g.Counters()[CounterGateWithdrawn]; n != 0 {
+		t.Fatalf("counted with the gate in place: %d", n)
+	}
+	os.Remove(g.cfg.RequireFile)
+	g.Reap(ctx)
+	g.Reap(ctx)
+	if n := g.Counters()[CounterGateWithdrawn]; n != 1 {
+		t.Fatalf("one outage should count once, got %d", n)
+	}
+	if f.containers["ci-runner-1"] == nil {
+		t.Fatal("a running job was killed because the gate went away")
+	}
+	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
+	g.Reap(ctx)
+	os.Remove(g.cfg.RequireFile)
+	g.Reap(ctx)
+	if n := g.Counters()[CounterGateWithdrawn]; n != 2 {
+		t.Fatalf("second outage should count: %d", n)
 	}
 }
 
