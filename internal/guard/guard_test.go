@@ -1463,3 +1463,42 @@ func TestModprobeScriptBehaviour(t *testing.T) {
 		t.Error("foreign file was modified")
 	}
 }
+
+func TestCacheMaxTrimsKeptCaches(t *testing.T) {
+	ctx := context.Background()
+	g, f := newGuard(t)
+	g.cfg.CacheDirs = []string{"/srv/rs/{slot}/cache"}
+	g.cfg.CacheMax = "2G"
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := startSlot(t, g, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.KeepCache(ctx, 1, "ci-1-abcd12"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Stop(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wipes) != 1 {
+		t.Fatalf("a kept slot should run one size check, got %d one-shots", len(f.wipes))
+	}
+	e := f.wipes[0].Entrypoint
+	if e[4] != strconv.Itoa(2<<20) {
+		t.Errorf("limit (2G in KiB) missing from %v", e)
+	}
+	if !strings.Contains(e[2], "du -sk") {
+		t.Errorf("not a size check: %v", e)
+	}
+
+	g.cfg.CacheMax = "bogus"
+	if g.cfg.Validate() == nil {
+		t.Error("bad cache_max accepted")
+	}
+	g.cfg.CacheMax = "2G"
+	g.cfg.CacheDirs = nil
+	if g.cfg.Validate() == nil {
+		t.Error("cache_max without cache_dirs accepted")
+	}
+}
