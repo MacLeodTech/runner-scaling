@@ -36,13 +36,13 @@ RUN chmod +x /usr/local/bin/get
 # Go, laid out as an actions toolcache entry (go/<version>/x64 plus the .complete marker).
 RUN if [ -n "${GO_VERSION:-}" ]; then \
       get "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256" go.tgz; \
-      d=/out/opt/ci/toolcache/go/${GO_VERSION}/x64; mkdir -p "$d"; tar -xzf go.tgz -C "$d" --strip-components=1; touch "$d.complete"; \
+      d=/out/opt/ci/toolcache/go/${GO_VERSION}/x64; mkdir -p "$d"; tar -xzf go.tgz -C "$d" --strip-components=1; rm -rf "$d/test" "$d/api" "$d/doc" "$d/misc"; touch "$d.complete"; \
     fi
 # Node, same layout.
 RUN for p in "${NODE_VERSION:-}:${NODE_SHA256:-}" "${NODE_OLD_VERSION:-}:${NODE_OLD_SHA256:-}"; do \
       v=${p%%:*}; s=${p#*:}; [ -n "$v" ] || continue; \
       get "https://nodejs.org/dist/v$v/node-v$v-linux-x64.tar.xz" "$s" node.txz; \
-      d=/out/opt/ci/toolcache/node/$v/x64; mkdir -p "$d"; tar -xJf node.txz -C "$d" --strip-components=1; touch "$d.complete"; \
+      d=/out/opt/ci/toolcache/node/$v/x64; mkdir -p "$d"; tar -xJf node.txz -C "$d" --strip-components=1; rm -rf "$d/share/doc" "$d/share/man" "$d/CHANGELOG.md"; touch "$d.complete"; \
     done
 # Maven
 RUN if [ -n "${MAVEN_VERSION:-}" ]; then \
@@ -84,7 +84,7 @@ ARG JDK_MAJORS RUST_VERSION GO_VERSION NODE_VERSION NODE_OLD_VERSION MAVEN_VERSI
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN if [ -n "${JDK_MAJORS:-}" ]; then \
       apt-get update && for m in $JDK_MAJORS; do apt-get install -y --no-install-recommends "openjdk-$m-jdk-headless"; done \
-      && rm -rf /var/lib/apt/lists/*; \
+      && rm -rf /var/lib/apt/lists/* /usr/lib/jvm/*/jmods; \
       first=${JDK_MAJORS%% *}; update-java-alternatives -s "java-1.$first.0-openjdk-amd64" 2>/dev/null || true; \
     fi
 COPY --from=fetch /out/opt/ci/toolcache /opt/ci/toolcache
@@ -107,9 +107,11 @@ ARG PLAYWRIGHT_VERSION
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ci/ms-playwright
 RUN if [ -n "${PLAYWRIGHT_VERSION:-}" ]; then \
-      npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium \
+      npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps --only-shell chromium \
       && rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
+# cargo install puts binaries in CARGO_HOME/bin; GitHub-hosted images have it on PATH, so do the same.
+ENV PATH=/opt/ci/cargo/bin:${PATH}
 LABEL org.opencontainers.image.title="runner-scaling CI runner (lite)"
 
 # ---- sysbox ----

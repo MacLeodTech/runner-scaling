@@ -20,7 +20,7 @@ images/check.sh --versions ~/projects/Assay/ci/tool-versions guard-lite.yaml gua
 ```
 
 Tags: `runner-ci:<target>-<date>-<hash>` (hash of the versions file and Dockerfile) and the moving `runner-ci:<target>`.
-Local builds only; publishing to ghcr comes later. Expected size: `lite` and `sysbox` both about 5.4 GB on disk (the 2.4 GB runner base is shared with what runs today; the two images are identical, so they share every layer).
+Local builds only; publishing to ghcr comes later. Expected size: `lite` and `sysbox` both about 4.9 GB on disk (the 2.4 GB runner base is shared with what runs today; the two images are identical, so they share every layer).
 
 ## Rules
 
@@ -51,3 +51,20 @@ See `guard-image.diff` for the exact lines.
   Chrome falls back to /tmp, so a larger shm is optional (`shm_size`, if the guard supports it) not required.
 - Jobs still need to stop installing what the image has (Assay's `toolchain` action already skips when `mvn`/`rustup`
   are on PATH).
+
+## Jobs can still install their own tools
+
+The tool dirs are writable in the container layer and the toolcache is not a read-only volume, so a job that asks for
+something the image lacks installs it itself. Verified under the lite guard's limits (cap_drop ALL plus the guard's six
+caps, 3G, no-new-privileges, root): `setup-go`, `setup-node` and `setup-python` download a version the image lacks into
+`/opt/ci/toolcache`; `apt-get update && apt-get install` works (the lists are stripped to save space, so `update` is
+required first); `pip install`, `npm install -g`, `cargo install` and curl into `~/.local/bin` work; tools a job adds to
+`GITHUB_PATH` come first on the PATH and override the baked ones. `/opt/ci/cargo/bin` is on the image PATH.
+
+## What was trimmed (and what was not)
+
+Removed: JDK `jmods` (only for jlink), Go's `test`/`api`/`doc`/`misc` dirs, Node's docs, the full Chromium build
+(`--only-shell`: Playwright's `headless: true` uses the headless shell; a job needing headed Chromium runs
+`npx playwright install chromium` itself), apt lists, npm cache. Kept on purpose: both JDKs (17 and 21), both Node
+lines, Node headers (`include/`, for native addons), Maven, Rust minimal profile, man pages and docs (about 10 MB,
+license texts).
