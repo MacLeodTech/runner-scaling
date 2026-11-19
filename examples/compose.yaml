@@ -16,6 +16,11 @@ x-hardened: &hardened
   read_only: true
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
+  # Logs survive `compose down` and recreation only if they go somewhere outside the container. journald keeps them in
+  # the host journal (journalctl CONTAINER_NAME=<container>); the default json-file driver loses them with the container.
+  logging:
+    driver: journald
+    options: {tag: "{{.Name}}"}
 
 x-guard: &guard
   <<: *hardened

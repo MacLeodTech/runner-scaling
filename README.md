@@ -209,8 +209,10 @@ host's own services and the other slots. The fence closes that: runner networks 
   seconds after something flushes them). The guard watches the gate file too: when it vanishes while the guard is
   running it logs one `GATE WITHDRAWN` error and counts `gate_withdrawn_total` (see Metrics), so you hear about the
   gap. It doesn't kill running jobs over it.
-- **Limits.** It needs host networking, `NET_ADMIN`, and a Docker that uses `iptables` and the `DOCKER-USER` chain.
-  Docker's nftables firewall backend has no such chain and isn't supported.
+- **Limits.** It needs host networking, `NET_ADMIN` and an `iptables` binary. It hooks the `DOCKER-USER` chain. Under
+  Docker's nftables backend that chain doesn't exist, so it hooks `FORWARD` instead (Docker's rules are in a separate
+  table, so a drop there still applies). The fallback is tested on the iptables-nft variant only; check it on your
+  Docker version with the `curl` test below.
 
 Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` should time out, and
 `curl https://github.com` should work.
@@ -238,6 +240,10 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
 - **Logs.** `docker logs <guard> 2>&1 | grep DENY` shows every refusal; the same events are counted in
   [metrics](#metrics). When the guard refuses a JIT config, it
   also logs the config's shape: keys and URL hosts only, never values.
+  Docker's default `json-file` driver deletes a container's logs with the container, so a `compose down` or a recreate
+  loses the evidence of what happened. [`examples/compose.yaml`](examples/compose.yaml) uses the `journald` driver, which
+  keeps them in the host journal: `journalctl CONTAINER_NAME=<container> | grep DENY`. The journal's size is bounded by
+  journald (`SystemMaxUse`). `docker logs` keeps working.
 - **Restarts.** Restarting the scaler or guard doesn't kill running jobs. The scale set stays registered, and
   queued jobs wait for it. If the old message session hasn't expired yet, the scaler retries until it has.
 - **Remove everything.** Stop the scaler, then
