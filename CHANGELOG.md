@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-19
+
 ### Changed
 - Dashboard: one **Runners** section. Each slot now carries the job it is running (repo, trigger, who, step progress, step list, stall flag) next to its CPU and memory, so the separate **Running** list is gone; it only appears, as "Running (no runner slot)", for a job with no matching slot (for example just after a scaler restart).
 
@@ -188,6 +190,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.9.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.9.0
 [0.6.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.6.0
 [0.5.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.5.0
 [0.4.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.4.0
