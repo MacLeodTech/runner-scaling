@@ -30,8 +30,10 @@ Local builds only; publishing to ghcr comes later. Expected size: `lite` and `sy
   it (see `guard-image.diff`), so `actions/setup-go` and `setup-node` find them without downloading. Tested with the
   real pinned actions in a throwaway container: Go 1.26 (even with `check-latest: true`) resolves to the baked 1.26.x
   and Node 24 and 22 are found. Caveat: when a newer 1.26.x appears upstream, `check-latest` downloads it until the
-  image is rebuilt. `setup-python` has nothing to find (python comes from apt): it would download into the job's own
-  filesystem, which is discarded, so seed Python in the toolcache or let workflows use the system python3.
+  image is rebuilt. Python 3.12 (Ubuntu's own, as a self-contained `--copies` venv entry) is seeded the same way and
+  was tested with the real `setup-python`: resolved from the cache, no download, `pip install` into a venv and
+  `pip install -e` work. The guard must set `AGENT_TOOLSDIRECTORY` as well as `RUNNER_TOOL_CACHE`: the runner image
+  sets the former to `/opt/hostedtoolcache` and `setup-python` honours it over the latter.
 - The image build and its checks run on GitHub-hosted runners or by hand, never on these pools.
 
 ## Switching a pool (needs the owner's go-ahead: restarting a guard kills its running jobs)

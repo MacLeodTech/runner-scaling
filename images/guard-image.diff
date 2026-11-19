@@ -12,7 +12,8 @@
 +  image: runner-ci:lite-20261119-617562fe # built by runner-scaling/images/build.sh; bump deliberately
 @@ env:
 -    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
-+    RUNNER_TOOL_CACHE: /opt/ci/toolcache # baked into the image: setup-go and setup-node find Go and Node there
++    RUNNER_TOOL_CACHE: /opt/ci/toolcache # baked into the image: setup-go, setup-node and setup-python find their tools there
++    AGENT_TOOLSDIRECTORY: /opt/ci/toolcache # the runner image sets this to /opt/hostedtoolcache and setup-python honours it, so set both
 @@ binds:
 -    - ${USERDIR}/runner-scaling/lite-{slot}/toolcache:/opt/hostedtoolcache
      - ${USERDIR}/runner-scaling/lite-{slot}/cache:/cache
@@ -27,5 +28,6 @@
 @@ env:
 -    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
 +    RUNNER_TOOL_CACHE: /opt/ci/toolcache
++    AGENT_TOOLSDIRECTORY: /opt/ci/toolcache
 @@ binds:
 -    - ${USERDIR}/runner-scaling/sbx-{slot}/toolcache:/opt/hostedtoolcache

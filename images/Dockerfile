@@ -90,7 +90,11 @@ RUN if [ -n "${JDK_MAJORS:-}" ]; then \
 COPY --from=fetch /out/opt/ci/toolcache /opt/ci/toolcache
 COPY --from=fetch /out/opt/ci/maven /opt/ci/maven
 COPY --from=fetch /out/opt/ci/bin/rustup-init /opt/ci/bin/
-ENV RUSTUP_HOME=/opt/ci/rustup CARGO_HOME=/opt/ci/cargo
+# Python: Ubuntu's own python3 (3.12 on noble) laid out as an actions toolcache entry, as a --copies venv so the entry is
+# self-contained (bin/python, bin/pip, lib/) and pip works in it without the distro's externally-managed marker.
+RUN v=$(python3 -c 'import platform; print(platform.python_version())'); d=/opt/ci/toolcache/Python/$v/x64; \
+    python3 -m venv --copies "$d" && touch "$d.complete" && "$d/bin/pip" --version
+ENV RUSTUP_HOME=/opt/ci/rustup CARGO_HOME=/opt/ci/cargo RUNNER_TOOL_CACHE=/opt/ci/toolcache AGENT_TOOLSDIRECTORY=/opt/ci/toolcache
 RUN if [ -n "${GO_VERSION:-}" ]; then ln -sf /opt/ci/toolcache/go/${GO_VERSION}/x64/bin/go /opt/ci/toolcache/go/${GO_VERSION}/x64/bin/gofmt /usr/local/bin/; fi; \
     if [ -n "${NODE_VERSION:-}" ]; then for b in node npm npx corepack; do ln -sf /opt/ci/toolcache/node/${NODE_VERSION}/x64/bin/$b /usr/local/bin/$b; done; fi; \
     if [ -n "${MAVEN_VERSION:-}" ]; then ln -sf /opt/ci/maven/bin/mvn /usr/local/bin/mvn; fi; \
