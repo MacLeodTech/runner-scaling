@@ -3,8 +3,8 @@
 # run. Built by images/build.sh from a versions file; never by hand, never by the pools' own CI.
 #
 #   base    runner image + jq, python3 (venv, pip), build tools, gosec, gitleaks, govulncheck
-#   lite    base + Go, Node (two lines), JDKs, Maven, Rust. Nothing here needs a Docker daemon.
-#   sysbox  lite + Playwright with Chromium and its system libraries
+#   lite    base + Go, Node (two lines), JDKs, Maven, Rust, Playwright Chromium. Nothing here needs a Docker daemon.
+#   sysbox  same as lite today (a separate tag so the pools can diverge)
 #
 # Layout rule: tools live under /opt/ci and are symlinked into /usr/local/bin. NEVER under /opt/hostedtoolcache:
 # the guards bind-mount a per-slot directory there, which would hide anything baked into the image. Go and Node are
@@ -99,10 +99,6 @@ RUN if [ -n "${GO_VERSION:-}" ]; then ln -sf /opt/ci/toolcache/go/${GO_VERSION}/
       && for b in cargo rustc rustup rustdoc; do ln -sf /opt/ci/cargo/bin/$b /usr/local/bin/$b; done; \
     fi; \
     rm -f /opt/ci/bin/rustup-init
-LABEL org.opencontainers.image.title="runner-scaling CI runner (lite)"
-
-# ---- sysbox ----
-FROM lite AS sysbox
 ARG PLAYWRIGHT_VERSION
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ci/ms-playwright
@@ -110,4 +106,10 @@ RUN if [ -n "${PLAYWRIGHT_VERSION:-}" ]; then \
       npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium \
       && rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
+LABEL org.opencontainers.image.title="runner-scaling CI runner (lite)"
+
+# ---- sysbox ----
+# Same tools as lite: nothing in the CI workloads we know of needs more than Playwright, which now lives in lite. Kept as a
+# separate target so the pools keep their own tag and can diverge (e.g. Docker-side tooling) without a rename.
+FROM lite AS sysbox
 LABEL org.opencontainers.image.title="runner-scaling CI runner (sysbox)"

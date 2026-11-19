@@ -36,6 +36,6 @@ GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 # govulncheck has no release binaries: it is compiled once at build time, verified by Go's checksum database.
 GOVULNCHECK_VERSION=1.9.0
 
-# Playwright (sysbox target only). Must equal the version the project resolves, or it asks for another browser build.
+# Playwright (in lite, hence sysbox too). Must equal the version the project resolves, or it asks for another browser build.
 # Playwright publishes no checksums for its browser downloads: the one download here that is not hash-checked.
 PLAYWRIGHT_VERSION=1.64.1
