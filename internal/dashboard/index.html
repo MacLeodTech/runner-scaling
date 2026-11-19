@@ -23,6 +23,8 @@ button{cursor:pointer;background:var(--card)}button.pri{background:var(--q);bord
 .card label{display:block;margin:10px 0 4px;color:var(--mut);font-size:12px}.card input{width:100%}.card button{margin-top:16px;width:100%}
 .msg{margin-top:12px;color:var(--bad);min-height:1.2em}.good{color:var(--ok)}
 .bar{margin-left:auto;display:flex;gap:8px;align-items:center}.bar #dot{margin:0 8px 0 0}header .bar button{padding:3px 10px;font-size:12px}
+.srow{display:grid;grid-template-columns:1fr auto;gap:10px;padding:10px 14px;border-top:1px solid var(--line);align-items:center}
+.arow{display:grid;grid-template-columns:150px 150px 1fr;gap:10px;padding:6px 14px;border-top:1px solid var(--line);font-size:13px}.arow.bad b{color:var(--bad)}
 .urow{display:grid;grid-template-columns:1fr 80px auto;gap:10px;padding:10px 14px;border-top:1px solid var(--line);align-items:center}
 .add{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--line);flex-wrap:wrap}.add input{flex:1;min-width:140px}
 .secret{margin:12px 14px;padding:12px;border:1px dashed var(--run);border-radius:6px}.secret code{font-size:16px;user-select:all}.hide{display:none}
@@ -31,9 +33,11 @@ code{font:12px ui-monospace,monospace;background:var(--bg);padding:1px 5px;borde
 <div class="err" id="err"></div>
 <div id="auth" class="hide"></div>
 <div id="app" class="hide">
-<header><h1 id="title">Runners</h1><span id="sub"></span><div class="bar"><span id="dot"></span><span id="who"></span><button id="bUsers" class="hide" onclick="showUsers()">Users</button><button id="bPw" class="hide" onclick="showChange(false)">Password</button><button id="bOut" class="hide" onclick="logout()">Log out</button></div></header>
+<header><h1 id="title">Runners</h1><span id="sub"></span><div class="bar"><span id="dot"></span><span id="who"></span><button id="bUsers" class="hide" onclick="showUsers()">Users</button><button id="bSess" class="hide" onclick="showSessions()">Sessions</button><button id="bAudit" class="hide" onclick="showAudit()">Audit</button><button id="bPw" class="hide" onclick="showChange(false)">Password</button><button id="bOut" class="hide" onclick="logout()">Log out</button></div></header>
 <main>
 <section id="users" class="hide"><h2>Users</h2><div id="ulist"></div><div class="add"><input id="nu" placeholder="new username" autocomplete="off" maxlength="32"><select id="nr"><option value="user">user</option><option value="admin">admin</option></select><button class="pri" onclick="addUser()">Add user</button></div><div id="secret"></div><div class="msg" id="umsg" style="padding:0 14px 10px"></div></section>
+<section id="sessions" class="hide"><h2>Sessions</h2><div id="slist"></div><div class="msg" id="smsg" style="padding:0 14px 10px"></div></section>
+<section id="audit" class="hide"><h2>Audit log</h2><div id="alist"></div><div class="msg" id="amsg2" style="padding:0 14px 10px"></div></section>
 <div class="tiles" id="tiles"></div>
 <section><h2>Runners</h2><div id="slots"></div></section>
 <section><h2>Running</h2><div id="running"></div></section>
@@ -99,9 +103,25 @@ function showChange(forced){clearInterval(timer);card('Change password',forced?'
  if($('n').value!==$('n2').value){$('amsg').textContent='The new passwords do not match';return}
  const r=await api('api/password',{old:$('o').value,new:$('n').value});if(!r.ok){$('amsg').textContent=r.j.error||'failed';return}boot()})}
 async function logout(){await api('api/logout',{});showLogin()}
-function startDash(){show(true);if(me){$('who').textContent=me.name+(me.role==='admin'?' (admin)':'');['bPw','bOut'].forEach(i=>$(i).classList.remove('hide'));$('bUsers').classList.toggle('hide',me.role!=='admin')}
- $('users').classList.add('hide');tick();clearInterval(timer);timer=setInterval(tick,3000)}
-async function showUsers(){const sec=$('users');if(!sec.classList.toggle('hide')){await loadUsers()}}
+function startDash(){show(true);if(me){$('who').textContent=me.name+(me.role==='admin'?' (admin)':'');['bPw','bOut','bSess'].forEach(i=>$(i).classList.remove('hide'));$('bUsers').classList.toggle('hide',me.role!=='admin')}
+ $('bAudit').classList.toggle('hide',!me||me.role!=='admin');
+ ['users','sessions','audit'].forEach(i=>$(i).classList.add('hide'));tick();clearInterval(timer);timer=setInterval(tick,3000)}
+// one of the account panels open at a time
+function panel(id){const sec=$(id),open=sec.classList.contains('hide');['users','sessions','audit'].forEach(i=>$(i).classList.add('hide'));if(open)sec.classList.remove('hide');return open}
+async function showUsers(){if(panel('users'))await loadUsers()}
+const when=t=>t&&t>'1971'?new Date(t).toLocaleString():'-';
+const agentName=ua=>{ua=ua||'';const b=/Edg\//.test(ua)?'Edge':/Firefox\//.test(ua)?'Firefox':/Chrome\//.test(ua)?'Chrome':/Safari\//.test(ua)?'Safari':/curl|Go-http|python/i.test(ua)?ua.split(/[ \/]/)[0]:'browser';
+ const o=/Windows/.test(ua)?'Windows':/Android/.test(ua)?'Android':/iPhone|iPad/.test(ua)?'iOS':/Mac OS/.test(ua)?'macOS':/Linux/.test(ua)?'Linux':'';return o?b+' on '+o:b};
+async function showSessions(){if(panel('sessions'))await loadSessions()}
+async function loadSessions(){$('smsg').textContent='';const r=await api('api/sessions');if(!r.ok){$('smsg').textContent=r.j.error||'failed';return}
+ const admin=me&&me.role==='admin';
+ $('slist').innerHTML=r.j.length?r.j.map(s=>`<div class="srow"><div><span class="t">${admin?esc(s.user)+' · ':''}${esc(agentName(s.agent))}</span>${s.current?' <span class="m">· this session</span>':''}<div class="m" title="${esc(s.agent)}">${esc(s.ip)}${s.fwd?' (forwarded for '+esc(s.fwd)+')':''} · signed in ${esc(when(s.created))} · last active ${esc(ago(s.last_seen)||'now')} · expires ${esc(when(s.expires))}</div></div><div><button class="dng" data-s="${esc(s.id)}">${s.current?'Log out':'Sign out'}</button></div></div>`).join(''):'<div class="empty">No sessions.</div>';
+ $('slist').querySelectorAll('button[data-s]').forEach(b=>b.onclick=async()=>{const x=await api('api/sessions/'+encodeURIComponent(b.dataset.s)+'/revoke',{});
+  if(!x.ok){$('smsg').textContent=x.j.error||'failed';return}boot()})}
+async function showAudit(){if(panel('audit'))await loadAudit()}
+async function loadAudit(){$('amsg2').textContent='';const r=await api('api/audit?n=200');if(!r.ok){$('amsg2').textContent=r.j.error||'failed';return}
+ const names={login:'logged in',login_failed:'failed login',login_locked:'login refused (locked out)',logout:'logged out',password_changed:'changed password',password_change_failed:'wrong current password',user_created:'user created',password_reset:'password reset',user_deleted:'user deleted',session_revoked:'session ended'};
+ $('alist').innerHTML=r.j.length?r.j.map(e=>`<div class="arow ${/failed|locked/.test(e.event)?'bad':''}"><div class="m">${esc(when(e.time))}</div><div><b>${esc(e.user||'-')}</b></div><div>${esc(names[e.event]||e.event)}${e.by?' by '+esc(e.by):''}${e.detail?' · '+esc(e.detail):''} <span class="m">${esc(e.ip||'')}${e.fwd?' (forwarded for '+esc(e.fwd)+')':''}</span></div></div>`).join(''):'<div class="empty">Nothing recorded yet.</div>'}
 async function loadUsers(){const r=await api('api/users');if(!r.ok){$('umsg').textContent=r.j.error||'failed';return}
  $('ulist').innerHTML=r.j.map(u=>`<div class="urow"><div><span class="t">${esc(u.name)}</span> <span class="m">${u.must_change?'· must change password':''}${u.last_login&&u.last_login>'1971'?' · last login '+ago(u.last_login):' · never logged in'}</span></div><div class="m">${esc(u.role)}</div><div><button data-r="${esc(u.name)}">Reset password</button> ${u.name===me.name?'':`<button class="dng" data-d="${esc(u.name)}">Delete</button>`}</div></div>`).join('');
  $('ulist').querySelectorAll('button[data-r]').forEach(b=>b.onclick=()=>userAct(b.dataset.r,'reset'));

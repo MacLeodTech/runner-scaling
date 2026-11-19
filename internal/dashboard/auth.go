@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,14 +26,20 @@ const (
 )
 
 type session struct {
-	user    string
-	expires time.Time
+	id       string // random, shown in the session list; not derived from the cookie
+	user     string
+	expires  time.Time
+	created  time.Time
+	lastSeen time.Time
+	ip, fwd  string
+	agent    string
 }
 
 // Auth is the login layer: accounts, sessions (in memory, so a restart logs everyone out) and failed-login lockouts.
 type Auth struct {
 	Accounts *Accounts
 	Log      *slog.Logger
+	Audit    *Audit // optional: account and login events are appended here
 
 	mu       sync.Mutex
 	sessions map[string]session // sha256(cookie value) -> session
@@ -63,7 +71,12 @@ func (a *Auth) start(w http.ResponseWriter, r *http.Request, user string) {
 			delete(a.sessions, k)
 		}
 	}
-	a.sessions[tokenKey(v)] = session{user: user, expires: time.Now().Add(sessionTTL)}
+	id := make([]byte, 8)
+	rand.Read(id)
+	now := time.Now()
+	ip, fwd := peerInfo(r)
+	a.sessions[tokenKey(v)] = session{id: hex.EncodeToString(id), user: user, expires: now.Add(sessionTTL), created: now,
+		lastSeen: now, ip: ip, fwd: fwd, agent: trunc(r.UserAgent(), 200)}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: v, Path: "/", MaxAge: int(sessionTTL.Seconds()),
 		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: isHTTPS(r)})
@@ -84,6 +97,10 @@ func (a *Auth) current(r *http.Request) (Account, bool) {
 	if ok && time.Now().After(s.expires) {
 		delete(a.sessions, tokenKey(c.Value))
 		ok = false
+	}
+	if ok {
+		s.lastSeen = time.Now()
+		a.sessions[tokenKey(c.Value)] = s
 	}
 	a.mu.Unlock()
 	if !ok {
@@ -169,6 +186,29 @@ func clientIP(r *http.Request) string {
 	return h
 }
 
+// peerInfo returns the TCP peer and the X-Forwarded-For header as sent. Behind a reverse proxy the peer is the proxy,
+// and the header is whatever the client claimed, so it is recorded as a hint and never trusted.
+func peerInfo(r *http.Request) (ip, fwd string) {
+	return clientIP(r), trunc(r.Header.Get("X-Forwarded-For"), 100)
+}
+
+// trunc cuts attacker-controlled text to n bytes (on a rune boundary) before it is stored or logged.
+func trunc(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "")
+}
+
+// audit records an event about user, from this request.
+func (a *Auth) audit(r *http.Request, event, user, by, detail string) {
+	ip, fwd := peerInfo(r)
+	if by == user {
+		by = ""
+	}
+	a.Audit.Add(AuditEntry{Event: event, User: trunc(user, 64), By: by, IP: ip, Fwd: fwd, Detail: trunc(detail, 200)})
+}
+
 type meResp struct {
 	Authenticated bool   `json:"authenticated"`
 	Name          string `json:"name,omitempty"`
@@ -193,6 +233,7 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		in.Username = strings.ToLower(strings.TrimSpace(in.Username))
 		if a.locked(in.Username) {
 			a.Log.Warn("login refused: locked out", "user", in.Username, "ip", clientIP(r))
+			a.audit(r, "login_locked", in.Username, "", "")
 			writeJSON(w, http.StatusTooManyRequests, apiErr{"too many failed attempts: try again in a few minutes"})
 			return
 		}
@@ -200,12 +241,14 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		if !ok {
 			a.fail(in.Username)
 			a.Log.Warn("login failed", "user", in.Username, "ip", clientIP(r))
+			a.audit(r, "login_failed", in.Username, "", "")
 			writeJSON(w, http.StatusUnauthorized, apiErr{"wrong username or password"})
 			return
 		}
 		a.clear(in.Username)
 		a.start(w, r, u.Name)
 		a.Log.Info("login", "user", u.Name, "ip", clientIP(r), "must_change", u.MustChange)
+		a.audit(r, "login", u.Name, "", "")
 		writeJSON(w, 200, meResp{true, u.Name, u.Role, u.MustChange})
 	})
 	mux.HandleFunc("POST /api/logout", func(w http.ResponseWriter, r *http.Request) {
@@ -214,8 +257,12 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		}
 		if c, err := r.Cookie(sessionCookie); err == nil {
 			a.mu.Lock()
+			s, had := a.sessions[tokenKey(c.Value)]
 			delete(a.sessions, tokenKey(c.Value))
 			a.mu.Unlock()
+			if had {
+				a.audit(r, "logout", s.user, "", "")
+			}
 		}
 		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 		writeJSON(w, 200, meResp{})
@@ -236,6 +283,7 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		}
 		if _, ok := a.Accounts.Authenticate(u.Name, in.Old); !ok {
 			a.fail(u.Name)
+			a.audit(r, "password_change_failed", u.Name, "", "wrong current password")
 			writeJSON(w, 403, apiErr{"the current password is wrong"})
 			return
 		}
@@ -254,6 +302,7 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		}
 		a.endSessions(u.Name, keep) // other devices have to log in again with the new password
 		a.Log.Info("password changed", "user", u.Name)
+		a.audit(r, "password_changed", u.Name, "", "")
 		writeJSON(w, 200, meResp{true, u.Name, u.Role, false})
 	})
 	mux.HandleFunc("GET /api/users", a.admin(func(w http.ResponseWriter, r *http.Request, _ Account) {
@@ -285,6 +334,7 @@ func (a *Auth) routes(mux *http.ServeMux) {
 			return
 		}
 		a.Log.Info("user created", "user", in.Username, "role", in.Role, "by", by.Name)
+		a.audit(r, "user_created", in.Username, by.Name, "role "+in.Role)
 		writeJSON(w, 200, map[string]string{"username": in.Username, "password": pw})
 	}))
 	mux.HandleFunc("POST /api/users/{name}/reset", a.admin(func(w http.ResponseWriter, r *http.Request, by Account) {
@@ -299,6 +349,7 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		}
 		a.endSessions(name, "")
 		a.Log.Info("password reset", "user", name, "by", by.Name)
+		a.audit(r, "password_reset", name, by.Name, "")
 		writeJSON(w, 200, map[string]string{"username": name, "password": pw})
 	}))
 	mux.HandleFunc("POST /api/users/{name}/delete", a.admin(func(w http.ResponseWriter, r *http.Request, by Account) {
@@ -316,7 +367,73 @@ func (a *Auth) routes(mux *http.ServeMux) {
 		}
 		a.endSessions(name, "")
 		a.Log.Info("user deleted", "user", name, "by", by.Name)
+		a.audit(r, "user_deleted", name, by.Name, "")
 		writeJSON(w, 200, map[string]string{"deleted": name})
+	}))
+	// Sessions: everyone sees and ends their own logins; an admin sees and ends everyone's.
+	mux.HandleFunc("GET /api/sessions", a.member(func(w http.ResponseWriter, r *http.Request, u Account) {
+		cur := ""
+		if c, err := r.Cookie(sessionCookie); err == nil {
+			cur = tokenKey(c.Value)
+		}
+		type row struct {
+			ID       string    `json:"id"`
+			User     string    `json:"user"`
+			IP       string    `json:"ip"`
+			Fwd      string    `json:"fwd,omitempty"`
+			Agent    string    `json:"agent,omitempty"`
+			Created  time.Time `json:"created"`
+			LastSeen time.Time `json:"last_seen"`
+			Expires  time.Time `json:"expires"`
+			Current  bool      `json:"current,omitempty"`
+		}
+		out := []row{}
+		a.mu.Lock()
+		for k, s := range a.sessions {
+			if time.Now().After(s.expires) || (s.user != u.Name && u.Role != RoleAdmin) {
+				continue
+			}
+			out = append(out, row{s.id, s.user, s.ip, s.fwd, s.agent, s.created, s.lastSeen, s.expires, k == cur})
+		}
+		a.mu.Unlock()
+		sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
+		writeJSON(w, 200, out)
+	}))
+	mux.HandleFunc("POST /api/sessions/{id}/revoke", a.member(func(w http.ResponseWriter, r *http.Request, u Account) {
+		if !post(w, r, nil) {
+			return
+		}
+		id := r.PathValue("id")
+		a.mu.Lock()
+		var gone *session
+		for k, s := range a.sessions {
+			// someone else's session looks the same as a missing one, so ids cannot be probed
+			if s.id == id && (s.user == u.Name || u.Role == RoleAdmin) {
+				gone = &s
+				delete(a.sessions, k)
+				break
+			}
+		}
+		a.mu.Unlock()
+		if gone == nil {
+			writeJSON(w, 404, apiErr{"no such session"})
+			return
+		}
+		a.Log.Info("session revoked", "user", gone.user, "by", u.Name)
+		a.audit(r, "session_revoked", gone.user, u.Name, "")
+		writeJSON(w, 200, map[string]string{"revoked": id})
+	}))
+	mux.HandleFunc("GET /api/audit", a.admin(func(w http.ResponseWriter, r *http.Request, _ Account) {
+		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+		if n <= 0 || n > 1000 {
+			n = 200
+		}
+		es, err := a.Audit.Recent(n)
+		if err != nil {
+			a.writeErr(w, err)
+			return
+		}
+		writeJSON(w, 200, es)
 	}))
 }
 
@@ -327,6 +444,21 @@ func (a *Auth) writeErr(w http.ResponseWriter, err error) {
 	}
 	a.Log.Error("accounts", "err", err)
 	writeJSON(w, 500, apiErr{"internal error"})
+}
+
+// member wraps a handler that needs any logged-in user who is done with the forced password change.
+func (a *Auth) member(h func(http.ResponseWriter, *http.Request, Account)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u, ok := a.current(r)
+		switch {
+		case !ok:
+			writeJSON(w, 401, apiErr{"not logged in"})
+		case u.MustChange:
+			writeJSON(w, 403, apiErr{"change your password first"})
+		default:
+			h(w, r, u)
+		}
+	}
 }
 
 // admin wraps a handler that needs a logged-in admin who is done with the forced password change.

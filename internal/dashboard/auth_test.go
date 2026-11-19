@@ -32,13 +32,22 @@ type client struct {
 }
 
 func newServer(t *testing.T, token string) (*client, *Accounts, string) {
+	return newServerWith(t, token, nil)
+}
+
+// newServerWith is newServer with a hook to adjust the Auth (for example to attach an audit log) before serving.
+func newServerWith(t *testing.T, token string, tweak func(*Auth)) (*client, *Accounts, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "users.json")
 	accts, fresh, err := OpenAccounts(path)
 	if err != nil || !fresh {
 		t.Fatalf("open: %v fresh=%v", err, fresh)
 	}
-	srv := &Server{Name: "t", Tracker: NewTracker(), Guard: noSlots{}, Token: token, Auth: NewAuth(accts, nil)}
+	auth := NewAuth(accts, nil)
+	if tweak != nil {
+		tweak(auth)
+	}
+	srv := &Server{Name: "t", Tracker: NewTracker(), Guard: noSlots{}, Token: token, Auth: auth}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)

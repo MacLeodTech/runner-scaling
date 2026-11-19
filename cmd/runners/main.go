@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,7 +38,9 @@ commands:
   jobs      queued, running and recent jobs        (-n N limits recent, default 10)
   memory    memory used against the budget, per pool and per slot
   watch     status, refreshed until interrupted    (-i seconds, default 5)
-  host      runner containers on THIS host with their runtime and privilege (runs the docker CLI; needs docker access)
+  host      runner containers on THIS host with their runtime and privilege, and the firewall gate and fence checks
+            (runs the docker CLI; needs docker access)
+  completion bash|zsh   print a shell completion script
   version
 
 flags:
@@ -45,6 +48,8 @@ flags:
   --token-file FILE  file holding the dashboard token (env RUNNERS_TOKEN_FILE); or set RUNNERS_TOKEN;
                      default ~/.config/runners/token if it exists
   --json             machine-readable output where the command has one
+  --gate-file FILE   host: the guards' require_file; reported MISSING when absent (env RUNNERS_GATE_FILE)
+  --fence CIDR       host: the firewall's FENCE_SRC; a container outside it is reported UNFENCED (env RUNNERS_FENCE)
 `
 
 func main() {
@@ -56,6 +61,8 @@ func main() {
 
 type opts struct {
 	url, tokenFile string
+	gateFile       string
+	fence          string
 	json           bool
 	n              int
 	interval       int
@@ -67,6 +74,8 @@ func run(args []string, out io.Writer) error {
 	var o opts
 	fs.StringVar(&o.url, "url", env("RUNNERS_URL", "http://localhost:8787"), "")
 	fs.StringVar(&o.tokenFile, "token-file", os.Getenv("RUNNERS_TOKEN_FILE"), "")
+	fs.StringVar(&o.gateFile, "gate-file", os.Getenv("RUNNERS_GATE_FILE"), "")
+	fs.StringVar(&o.fence, "fence", os.Getenv("RUNNERS_FENCE"), "")
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.IntVar(&o.n, "n", 10, "")
 	fs.IntVar(&o.interval, "i", 5, "")
@@ -89,6 +98,12 @@ func run(args []string, out io.Writer) error {
 	cmd := "status"
 	if len(rest) > 0 {
 		cmd = rest[0]
+	}
+	if cmd == "completion" {
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: runners completion bash|zsh")
+		}
+		return printCompletion(out, rest[1])
 	}
 	if len(rest) > 1 {
 		return fmt.Errorf("unexpected argument %q\n\n%s", rest[1], usage)
@@ -147,7 +162,7 @@ func run(args []string, out io.Writer) error {
 		}
 		printMemory(out, st, m)
 	case "host":
-		return printHost(out, o.json)
+		return printHost(out, o)
 	case "watch":
 		for {
 			st, err := c.state()
@@ -203,9 +218,27 @@ func newClient(o opts) (*client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("token file: %w", err)
 		}
+		if w := tokenFileWarning(o.tokenFile); w != "" {
+			fmt.Fprintln(warnOut, "runners: warning:", w)
+		}
 		tok = strings.TrimSpace(string(b))
 	}
 	return &client{base: u, token: tok, http: &http.Client{Timeout: 10 * time.Second}}, nil
+}
+
+// warnOut receives warnings; a variable so tests can capture it.
+var warnOut io.Writer = os.Stderr
+
+// tokenFileWarning returns a message when the token file can be read or written by anyone but its owner.
+func tokenFileWarning(path string) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	if m := fi.Mode().Perm(); m&0o077 != 0 {
+		return fmt.Sprintf("token file %s is mode %04o, readable by other users; run: chmod 600 %s", path, m, path)
+	}
+	return ""
 }
 
 func (c *client) get(path string) ([]byte, error) {
@@ -417,21 +450,63 @@ func human(b int64) string {
 
 // hostRow is one runner-scaling container as Docker reports it.
 type hostRow struct {
-	Name       string `json:"name"`
-	Runtime    string `json:"runtime"`
-	Privileged bool   `json:"privileged"`
-	State      string `json:"state"`
-	Image      string `json:"image"`
+	Name       string   `json:"name"`
+	Runtime    string   `json:"runtime"`
+	Privileged bool     `json:"privileged"`
+	State      string   `json:"state"`
+	Image      string   `json:"image"`
+	Addresses  []string `json:"addresses,omitempty"`
+	Unfenced   bool     `json:"unfenced,omitempty"`
+}
+
+// hostReport is the JSON form of the host command.
+type hostReport struct {
+	Gate       string    `json:"gate,omitempty"` // "present", "MISSING", or empty when no gate file was given
+	Containers []hostRow `json:"containers"`
+}
+
+// gateStatus reports whether the firewall gate file exists. Empty path: not checked.
+func gateStatus(path string) string {
+	if path == "" {
+		return ""
+	}
+	if _, err := os.Stat(path); err != nil {
+		return "MISSING"
+	}
+	return "present"
+}
+
+// outsideFence reports whether a running container has an address outside the fenced range. A container with no
+// address (stopped) is not flagged.
+func outsideFence(fence *net.IPNet, addrs []string) bool {
+	if fence == nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && !fence.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // printHost lists the containers the guards started (found by their label) and shows how each one is isolated. It runs
-// the docker CLI, so unlike the other commands it needs access to Docker on this host.
-func printHost(w io.Writer, asJSON bool) error {
+// the docker CLI, so unlike the other commands it needs access to Docker on this host. With --gate-file and --fence
+// it also checks that the firewall gate exists and that every container sits inside the fenced range.
+func printHost(w io.Writer, o opts) error {
+	var fence *net.IPNet
+	if o.fence != "" {
+		_, f, err := net.ParseCIDR(o.fence)
+		if err != nil {
+			return fmt.Errorf("bad --fence %q: %w", o.fence, err)
+		}
+		fence = f
+	}
 	ids, err := exec.Command("docker", "ps", "-aq", "--filter", "label=io.github.runner-scaling.instance").Output()
 	if err != nil {
 		return fmt.Errorf("docker ps: %w (this command needs Docker access on this host)", err)
 	}
-	var rows []hostRow
+	rep := hostReport{Gate: gateStatus(o.gateFile), Containers: []hostRow{}}
 	if f := strings.Fields(string(ids)); len(f) > 0 {
 		out, err := exec.Command("docker", append([]string{"inspect"}, f...)...).Output()
 		if err != nil {
@@ -445,6 +520,9 @@ func printHost(w io.Writer, asJSON bool) error {
 				Runtime    string
 				Privileged bool
 			}
+			NetworkSettings struct {
+				Networks map[string]struct{ IPAddress string }
+			}
 		}
 		if err := json.Unmarshal(out, &raw); err != nil {
 			return err
@@ -454,21 +532,100 @@ func printHost(w io.Writer, asJSON bool) error {
 			if rt == "" {
 				rt = "runc"
 			}
-			rows = append(rows, hostRow{strings.TrimPrefix(r.Name, "/"), rt, r.HostConfig.Privileged, r.State.Status, r.Config.Image})
+			var addrs []string
+			for _, n := range r.NetworkSettings.Networks {
+				if n.IPAddress != "" {
+					addrs = append(addrs, n.IPAddress)
+				}
+			}
+			sort.Strings(addrs)
+			rep.Containers = append(rep.Containers, hostRow{strings.TrimPrefix(r.Name, "/"), rt, r.HostConfig.Privileged,
+				r.State.Status, r.Config.Image, addrs, outsideFence(fence, addrs)})
 		}
-		sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+		sort.Slice(rep.Containers, func(i, j int) bool { return rep.Containers[i].Name < rep.Containers[j].Name })
 	}
-	if asJSON {
-		return writeJSON(w, rows)
+	if o.json {
+		return writeJSON(w, rep)
+	}
+	return renderHost(w, rep, fence != nil)
+}
+
+func renderHost(w io.Writer, rep hostReport, fenceChecked bool) error {
+	if rep.Gate != "" {
+		fmt.Fprintf(w, "firewall gate: %s\n\n", rep.Gate)
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "CONTAINER\tSTATE\tRUNTIME\tPRIVILEGED")
-	for _, r := range rows {
+	hdr := "CONTAINER\tSTATE\tRUNTIME\tPRIVILEGED"
+	if fenceChecked {
+		hdr += "\tFENCE"
+	}
+	fmt.Fprintln(tw, hdr)
+	for _, r := range rep.Containers {
 		warn := ""
 		if r.Privileged {
 			warn = "  <- root on the host if a job starts a container against it"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%v%s\n", r.Name, r.State, r.Runtime, r.Privileged, warn)
+		fence := ""
+		if fenceChecked {
+			fence = "\tinside"
+			if r.Unfenced {
+				fence = "\tUNFENCED"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%v%s%s\n", r.Name, r.State, r.Runtime, r.Privileged, fence, warn)
 	}
 	return tw.Flush()
+}
+
+const bashCompletion = `_runners() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  case "$prev" in
+    --token-file|--gate-file) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+    completion) COMPREPLY=($(compgen -W "bash zsh" -- "$cur")); return ;;
+  esac
+  COMPREPLY=($(compgen -W "status slots jobs memory watch host completion version help --url --token-file --json --gate-file --fence -n -i" -- "$cur"))
+}
+complete -F _runners runners
+`
+
+const zshCompletion = `#compdef runners
+_runners() {
+  local -a cmds
+  cmds=(
+    'status:pools at a glance'
+    'slots:every slot with its resource use'
+    'jobs:queued, running and recent jobs'
+    'memory:memory used against the budget'
+    'watch:status, refreshed until interrupted'
+    'host:runner containers on this host'
+    'completion:print a shell completion script'
+    'version:print the version'
+  )
+  _arguments \
+    '--url[dashboard base URL]:url' \
+    '--token-file[file holding the dashboard token]:file:_files' \
+    '--json[machine-readable output]' \
+    '--gate-file[firewall gate file (host)]:file:_files' \
+    '--fence[fenced CIDR (host)]:cidr' \
+    '-n[recent jobs to show]:count' \
+    '-i[watch interval in seconds]:seconds' \
+    '1:command:->cmd' \
+    '2:shell:(bash zsh)'
+  [[ $state == cmd ]] && _describe command cmds
+}
+_runners "$@"
+`
+
+func printCompletion(w io.Writer, shell string) error {
+	switch shell {
+	case "bash":
+		_, err := io.WriteString(w, bashCompletion)
+		return err
+	case "zsh":
+		_, err := io.WriteString(w, zshCompletion)
+		return err
+	}
+	return fmt.Errorf("unknown shell %q (want bash or zsh)", shell)
 }

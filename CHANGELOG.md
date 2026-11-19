@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Added
+- Dashboard **Sessions** page: each user sees and can end their own logins (address, browser, sign-in time, last
+  activity); admins see and can end everyone's. API: `GET /api/sessions`, `POST /api/sessions/{id}/revoke`.
+- Dashboard **audit log**: login, failed-login, lockout, logout, password, user and session-revoke events are appended
+  to a size-bounded JSON-lines file (`DASHBOARD_AUDIT_FILE`, `DASHBOARD_AUDIT_MAX`; on by default next to the users
+  file, `off` to disable), with an admin-only **Audit** page (`GET /api/audit`).
+- `runners`: warns when the token file is readable by other users; `runners completion bash|zsh`; `runners host`
+  takes `--gate-file` and `--fence` to check the firewall gate and that containers sit inside the fenced range.
+- CI attaches `runners` binaries (linux and macOS, amd64 and arm64) and `SHA256SUMS` to each `v*` release.
+
 ### Changed
 - The firewall script falls back to the `FORWARD` chain when Docker has no `DOCKER-USER` chain (Docker's nftables
   backend), instead of failing. The example compose file logs to journald, so logs survive container removal.
@@ -14,6 +24,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
   equal), so a label change might not recreate the scale set. It now compares the two label sets.
 
 ### Tests
+- `ensureScaleSet` against a fake GitHub (create, unchanged, in-place update, recreate when the update is ignored).
 - Wire-format contract test for `internal/api`, and tests for the `cmd/runner-scaling` helpers.
 
 ## [0.7.0] - 2026-11-18

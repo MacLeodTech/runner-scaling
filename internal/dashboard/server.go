@@ -151,7 +151,7 @@ func (s *Server) openPath(p string) bool {
 	case "/", "/healthz", "/api/me", "/api/login", "/api/logout", "/api/password":
 		return true
 	}
-	return strings.HasPrefix(p, "/api/users")
+	return strings.HasPrefix(p, "/api/users") || strings.HasPrefix(p, "/api/sessions") || p == "/api/audit"
 }
 
 // sessionOK is a login session that is past its forced password change.
