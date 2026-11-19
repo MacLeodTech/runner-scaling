@@ -45,7 +45,7 @@ pre.lg{margin:6px 0 0;padding:8px;background:var(--bg);border:1px solid var(--li
 <div class="tiles" id="tiles"></div>
 <div class="m" id="gh" style="margin:-8px 0 16px"></div>
 <section><h2>Runners</h2><div id="slots"></div></section>
-<section><h2>Running</h2><div id="running"></div></section>
+<section id="orph" class="hide"><h2>Running (no runner slot)</h2><div id="running"></div></section>
 <section><h2>Queued</h2><div id="queued"></div></section>
 <section><h2>Recent jobs</h2><div id="recent"></div></section>
 </main></div>
@@ -57,7 +57,8 @@ const dur=ms=>{ms=Math.max(0,Math.round(ms/1000));const m=Math.floor(ms/60),s=ms
 const bytes=n=>{n=n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(n<10?1:0):n)+' '+u[i]};
 const usage=x=>x&&x.stats?`<span title="CPU, memory (runner + dind), processes">CPU <b>${x.stats.cpu_percent.toFixed(0)}%</b> · mem <b>${bytes(x.stats.mem_bytes)}</b> · ${x.stats.pids} procs</span><br><span title="since the containers started">net ↓${bytes(x.stats.net_rx_bytes)} ↑${bytes(x.stats.net_tx_bytes)} · disk r ${bytes(x.stats.blk_read_bytes)} w ${bytes(x.stats.blk_write_bytes)}</span>`:'';
 const ago=t=>t&&t>'1971'?dur(Date.now()+off-Date.parse(t))+' ago':'';
-const job=(j,right,u)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${j.run_id&&/^[\w.-]+\/[\w.-]+$/.test(j.repo)?`<a href="https://github.com/${esc(j.repo)}/actions/runs/${encodeURIComponent(j.run_id)}" target="_blank" rel="noopener noreferrer" title="Open this run on GitHub">${esc(j.name)} ↗</a>`:esc(j.name)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}${j.pool?' · <b>'+esc(j.pool)+'</b>':''}</div>${j.stalled?'<div class="warn">⚠ possibly stalled: '+esc(j.stall_note)+'</div>':''}${who(j)?'<div class="m">'+who(j)+'</div>':''}${prog(j)}${u?'<div class="m">'+u+'</div>':''}${steps(j)}</div><div class="r">${right}</div></div>`;
+const jtitle=j=>`${j.run_id&&/^[\w.-]+\/[\w.-]+$/.test(j.repo)?`<a href="https://github.com/${esc(j.repo)}/actions/runs/${encodeURIComponent(j.run_id)}" target="_blank" rel="noopener noreferrer" title="Open this run on GitHub">${esc(j.name)} ↗</a>`:esc(j.name)}`;
+const job=(j,right,u)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${jtitle(j)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}${j.pool?' · <b>'+esc(j.pool)+'</b>':''}</div>${j.stalled?'<div class="warn">⚠ possibly stalled: '+esc(j.stall_note)+'</div>':''}${who(j)?'<div class="m">'+who(j)+'</div>':''}${prog(j)}${u?'<div class="m">'+u+'</div>':''}${steps(j)}</div><div class="r">${right}</div></div>`;
 const list=(id,items,f)=>$(id).innerHTML=items.length?items.map(f).join(''):'<div class="empty">Nothing here.</div>';
 function merge(r){
  const pools=[r,...(r.peers||[])],m={name:r.name,version:r.version,now:r.now,max_slots:0,slots:[],queued:[],running:[],recent:[],stats:{},guard_error:'',pools:pools.length};
@@ -106,9 +107,12 @@ async function tick(){
   const byJob={};for(const j of s.running)if(j.runner)byJob[j.runner]=j;
   $('gh').innerHTML=ghline(raw);
   list('slots',s.slots,x=>{const j=byJob[x.runner_name];const state=x.starting?'starting':j?'running':x.runner_state==='running'?'idle':'failed';
-   const what=j?`<div class="t" style="font-weight:500">${esc(j.repo)} · ${esc(j.name)}${j.stalled?' <span class="warn">⚠ stalled</span>':''}</div><div class="m"><code>${esc(j.workflow)}</code> · ${esc(j.event)}${who(j)?' · '+who(j):''}</div>${prog(j)||'<div class="m">running '+dur(Date.now()+off-Date.parse(j.started||j.queued))+'</div>'}`:'';
+   const what=j?`<div class="t" style="font-weight:500">${esc(j.repo)} · ${jtitle(j)}${j.stalled?' <span class="warn">⚠ stalled</span>':''}</div><div class="m"><code>${esc(j.workflow)}</code> · ${esc(j.event)}${who(j)?' · '+who(j):''}</div>${j.stalled?'<div class="warn">'+esc(j.stall_note)+'</div>':''}${prog(j)||'<div class="m">running '+dur(Date.now()+off-Date.parse(j.started||j.queued))+'</div>'}${steps(j)}`:'';
    return `<div class="row"><div class="i ${state}"></div><div><div class="t">${x.pool?esc(x.pool)+' ':''}slot ${x.slot} <span class="m">${state}</span></div>${what}<div class="m">${esc(x.runner_name||'starting…')}${x.dind_state?' · dind '+esc(x.dind_state):''}</div></div><div class="r">${usage(x)}</div></div>`});
-  list('running',s.running,j=>job(j,'running '+dur(Date.now()+off-Date.parse(j.started||j.queued)),usage(byRunner[j.runner])));
+  const slotted=new Set(s.slots.map(x=>x.runner_name).filter(Boolean));
+  const orphans=s.running.filter(j=>!j.runner||!slotted.has(j.runner));
+  $('orph').classList.toggle('hide',!orphans.length);
+  list('running',orphans,j=>job(j,'running '+dur(Date.now()+off-Date.parse(j.started||j.queued)),usage(byRunner[j.runner])));
   list('queued',s.queued,j=>job(j,'waiting '+dur(Date.now()+off-Date.parse(j.queued))));
   list('recent',s.recent,j=>job(j,esc(j.state)+(j.started&&j.finished?' in '+dur(Date.parse(j.finished)-Date.parse(j.started)):'')+'<br>'+ago(j.finished)));
   $('dot').textContent='● live';$('dot').style.color='var(--ok)';
