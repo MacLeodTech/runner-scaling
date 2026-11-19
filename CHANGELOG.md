@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Changed
+- The firewall script falls back to the `FORWARD` chain when Docker has no `DOCKER-USER` chain (Docker's nftables
+  backend), instead of failing. The example compose file logs to journald, so logs survive container removal.
+
+### Fixed
+- The scaler compared scale-set labels in a way that let a duplicate label hide a change (`[x,y]` vs `[x,x]` counted as
+  equal), so a label change might not recreate the scale set. It now compares the two label sets.
+
+### Tests
+- Wire-format contract test for `internal/api`, and tests for the `cmd/runner-scaling` helpers.
+
 ## [0.7.0] - 2026-11-18
 
 ### Added

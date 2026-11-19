@@ -376,16 +376,21 @@ func ensureScaleSet(ctx context.Context, gh *scaleset.Client, name, group string
 	return gh.CreateRunnerScaleSet(ctx, spec)
 }
 
+// sameLabels reports whether a and b name the same set of labels, ignoring order and case.
 func sameLabels(a, b []scaleset.Label) bool {
-	if len(a) != len(b) {
+	set := func(ls []scaleset.Label) map[string]bool {
+		m := make(map[string]bool, len(ls))
+		for _, l := range ls {
+			m[strings.ToLower(l.Name)] = true
+		}
+		return m
+	}
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
 		return false
 	}
-	seen := map[string]bool{}
-	for _, l := range a {
-		seen[strings.ToLower(l.Name)] = true
-	}
-	for _, l := range b {
-		if !seen[strings.ToLower(l.Name)] {
+	for n := range sa {
+		if !sb[n] {
 			return false
 		}
 	}
