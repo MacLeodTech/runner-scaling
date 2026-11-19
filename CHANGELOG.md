@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Fixed
+- `runners host --gate-file` reported a gate it could not read (root-only Docker volume) as MISSING; it now says `unknown`. The token-file warning no longer suggests `chmod 600` on a file a container also reads.
+
 ## [0.8.0] - 2026-11-19
 
 ### Added

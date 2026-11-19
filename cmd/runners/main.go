@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -236,7 +237,7 @@ func tokenFileWarning(path string) string {
 		return ""
 	}
 	if m := fi.Mode().Perm(); m&0o077 != 0 {
-		return fmt.Sprintf("token file %s is mode %04o, readable by other users; run: chmod 600 %s", path, m, path)
+		return fmt.Sprintf("token file %s is mode %04o, readable by other users; keep a private copy with mode 600 (do not chmod a file a container also reads)", path, m)
 	}
 	return ""
 }
@@ -465,15 +466,21 @@ type hostReport struct {
 	Containers []hostRow `json:"containers"`
 }
 
-// gateStatus reports whether the firewall gate file exists. Empty path: not checked.
+// gateStatus reports whether the firewall gate file exists: "present", "MISSING" (it does not exist), or "unknown"
+// when this user cannot look (for example the file is in a Docker volume under root-only /var/lib/docker). Empty path:
+// not checked.
 func gateStatus(path string) string {
 	if path == "" {
 		return ""
 	}
-	if _, err := os.Stat(path); err != nil {
+	_, err := os.Stat(path)
+	switch {
+	case err == nil:
+		return "present"
+	case errors.Is(err, fs.ErrNotExist):
 		return "MISSING"
 	}
-	return "present"
+	return "unknown (" + errors.Unwrap(err).Error() + ")"
 }
 
 // outsideFence reports whether a running container has an address outside the fenced range. A container with no
