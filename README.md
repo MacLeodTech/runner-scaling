@@ -598,9 +598,9 @@ runners host --gate-file /gate/firewall-ok --fence 172.30.0.0/16   # on the Dock
 source <(runners completion bash)   # or: runners completion zsh
 ```
 
-- **Token file.** `runners` warns on stderr when the token file is readable by other users (anything beyond mode 0600).
+- **Token file.** `runners` warns on stderr when the token file is readable by other users (anything beyond mode 0600). If the file is also a container's secret, keep a private 0600 copy for the CLI instead of changing its mode.
 - **`runners host`.** It runs the `docker` CLI and lists the runner containers with their runtime and privilege. With
-  `--gate-file` (the guards' `require_file`) it also reports whether the firewall gate exists, and with `--fence`
+  `--gate-file` (the guards' `require_file`) it also reports whether the firewall gate exists (`unknown` when your user can't read that path, e.g. a gate in a Docker volume under `/var/lib/docker`: run as root, or put the gate on a host directory), and with `--fence`
   (the firewall's `FENCE_SRC`) it marks any container that has an address outside that range as `UNFENCED`.
   Both can also be set with `RUNNERS_GATE_FILE` and `RUNNERS_FENCE`.
 - **Release binaries.** Each `v*` tag attaches `runners` binaries for linux and macOS (amd64, arm64) to the GitHub

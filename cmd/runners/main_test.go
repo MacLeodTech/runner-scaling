@@ -144,7 +144,7 @@ func TestTokenFileWarning(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "tok")
 	os.WriteFile(f, []byte("x"), 0o644)
 	os.Chmod(f, 0o644)
-	if w := tokenFileWarning(f); !strings.Contains(w, "chmod 600") {
+	if w := tokenFileWarning(f); !strings.Contains(w, "mode 600") {
 		t.Errorf("0644 not flagged: %q", w)
 	}
 	os.Chmod(f, 0o600)
@@ -203,6 +203,15 @@ func TestHostChecks(t *testing.T) {
 	gate := filepath.Join(t.TempDir(), "ok")
 	if gateStatus("") != "" || gateStatus(gate) != "MISSING" {
 		t.Error("gate status")
+	}
+	// a file we are not allowed to look at is "unknown", not "MISSING"
+	locked := filepath.Join(t.TempDir(), "locked")
+	os.Mkdir(locked, 0o000)
+	defer os.Chmod(locked, 0o700)
+	if os.Getuid() != 0 {
+		if got := gateStatus(filepath.Join(locked, "ok")); !strings.HasPrefix(got, "unknown") {
+			t.Errorf("unreadable gate path reported as %q", got)
+		}
 	}
 	os.WriteFile(gate, nil, 0o600)
 	if gateStatus(gate) != "present" {
