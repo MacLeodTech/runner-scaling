@@ -1,0 +1,11 @@
+# PROPOSAL, not applied. Paths are under ~/docker/compose_includes/github-runners. Tags are examples: use what build.sh prints.
+--- a/guard-lite.yaml
++++ b/guard-lite.yaml
+@@ runner:
+-  image: myoung34/github-runner:ubuntu-noble@sha256:46c0ed292169f619594248cbfa6752d2c5760e170165bb401a2d132f71a2faf7 # pinned; bump deliberately
++  image: runner-ci:lite-20261119-05f9b7a5 # built by runner-scaling/images/build.sh; bump deliberately
+--- a/guard-sysbox.yaml
++++ b/guard-sysbox.yaml
+@@ runner:
+-  image: myoung34/github-runner:ubuntu-noble@sha256:46c0ed292169f619594248cbfa6752d2c5760e170165bb401a2d132f71a2faf7 # pinned; bump deliberately
++  image: runner-ci:sysbox-20261119-05f9b7a5 # built by runner-scaling/images/build.sh; bump deliberately

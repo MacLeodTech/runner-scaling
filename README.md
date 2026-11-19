@@ -314,6 +314,13 @@ scripts/check-runner-image.sh guard.yaml guard-lite.yaml   # exits 1 when behind
 To bump: pick a newer tag of your runner image, `docker pull` it, put its digest in every guard config's runner
 `image`, run `runner-scaling guard --check`, then restart the guards (running jobs keep their containers).
 
+### Prebuilt CI tool images (draft)
+
+`images/` holds a layered image family (`lite`, `sysbox`) that bakes in Go, Node, JDK, Maven, Rust, security scanners
+and Playwright so ephemeral runners stop re-downloading them. Versions and checksums come from the consuming repo's
+versions file. Build with `images/build.sh`, check staleness with `images/check.sh` (the counterpart of
+`scripts/check-runner-image.sh`, which still covers the runner version). See [images/README.md](images/README.md).
+
 ### Metrics
 
 With the [dashboard](#dashboard) on (`DASHBOARD_ADDR`), the scaler also serves `GET /metrics` in Prometheus text
