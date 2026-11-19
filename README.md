@@ -187,6 +187,23 @@ names. The guard decodes it and requires that:
 7. **Optional: a second pool without Docker.** See [Several pools](#operations) and
    [examples/guard-lite.yaml](examples/guard-lite.yaml).
 
+### Without an organization (repo-level scale set)
+
+Set `github_url` in `guard.yaml` to a repository URL (`https://github.com/<owner>/<repo>`) instead of an org URL. The
+rest of the setup is the same, with these differences:
+
+- **Credentials.** A PAT needs the `repo` scope, or a fine-grained token / GitHub App needs repo *Administration: read
+  and write* on that repository. The org permission *Self-hosted runners* does not apply.
+- **Runner group.** Repositories have no runner groups: leave `--runner-group` at `default`.
+- **Reach.** Only that repository can use the labels. Another repository needs its own scale set (its own guard and
+  scaler pair, with a different `prefix`, `subnet` and `--name`), which also keeps its caches apart.
+- **Public repositories.** A self-hosted runner executes whatever a pull request's workflow says. On a public repo that
+  means anyone who can open a PR can run code on your host, so don't point a public repo at it. The org runner group
+  that blocks public repos by default does not exist here, and the Free plan has no such setting either.
+
+This path has not been run end to end by the author; the org path is the tested one. Treat the list above as what the
+GitHub API requires, and report what differs.
+
 ### Firewall
 
 A job can talk to anything its network can reach. With the default Docker bridge setup that includes your LAN, the

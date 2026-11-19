@@ -8,6 +8,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 ### Fixed
 - `runners host --gate-file` reported a gate it could not read (root-only Docker volume) as MISSING; it now says `unknown`. The token-file warning no longer suggests `chmod 600` on a file a container also reads.
 
+### Documentation
+- README: a section on running a repo-level scale set, for setups without an organization (credentials, no runner groups, public-repo warning). Marked as not run end to end.
+
 ## [0.8.0] - 2026-11-19
 
 ### Added
