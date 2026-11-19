@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/actions/scaleset"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
+	"github.com/MacLeodTech/runner-scaling/internal/ghapi"
 )
 
 func base(id int64) scaleset.JobMessageBase {
@@ -114,5 +117,146 @@ func TestPeers(t *testing.T) {
 	}
 	if w := get(h, "/api/state?token=t&local=1"); strings.Contains(w.Body.String(), `"peers"`) {
 		t.Fatalf("local=1 returned peers")
+	}
+}
+
+// Live scale set messages carry runnerRequestId 0; jobs must still be told apart (once all collapsed into one).
+func TestJobsWithoutRequestID(t *testing.T) {
+	for _, byJobID := range []bool{true, false} {
+		mk := func(name string) scaleset.JobMessageBase {
+			b := base(0)
+			b.JobDisplayName = name
+			if byJobID {
+				b.JobID = "guid-" + name
+			}
+			return b
+		}
+		tr := NewTracker()
+		for _, n := range []string{"a", "b", "c"} {
+			tr.Observe(&scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: mk(n)}}})
+		}
+		if s := tr.Snapshot(); len(s.Queued) != 3 {
+			t.Fatalf("byJobID=%v queued: %+v", byJobID, s.Queued)
+		}
+		for _, n := range []string{"a", "b"} {
+			tr.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{RunnerName: "r-" + n, JobMessageBase: mk(n)}}})
+		}
+		if s := tr.Snapshot(); len(s.Running) != 2 || len(s.Queued) != 1 {
+			t.Fatalf("byJobID=%v running: %+v queued: %+v", byJobID, s.Running, s.Queued)
+		}
+		tr.Observe(&scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{Result: "succeeded", RunnerName: "r-a", JobMessageBase: mk("a")}}})
+		s := tr.Snapshot()
+		if len(s.Running) != 1 || s.Running[0].Runner != "r-b" || len(s.Recent) != 1 {
+			t.Fatalf("byJobID=%v after completion: running %+v recent %+v", byJobID, s.Running, s.Recent)
+		}
+	}
+}
+
+func TestApplyRunMatchesByRunnerAndName(t *testing.T) {
+	tr := NewTracker()
+	mk := func(name string) scaleset.JobMessageBase {
+		b := base(0)
+		b.JobDisplayName, b.OwnerName, b.RepositoryName, b.WorkflowRunID = name, "o", "r", 77
+		return b
+	}
+	tr.Observe(&scaleset.RunnerScaleSetMessage{
+		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: mk("queued-one")}},
+		JobStartedMessages:   []*scaleset.JobStarted{{RunnerName: "r-1", JobMessageBase: mk("building")}},
+	})
+	refs := tr.Wanted()
+	if len(refs) != 1 || refs[0] != (RunRef{"o", "r", 77}) {
+		t.Fatalf("wanted: %+v", refs)
+	}
+	t0 := time.Unix(5000, 0)
+	jobs := []ghapi.Job{
+		{ID: 1, Name: "building", RunnerName: "r-1", Status: "in_progress", HTMLURL: "u1", Steps: []ghapi.Step{
+			{Number: 1, Name: "Set up job", Status: "completed", Conclusion: "success"},
+			{Number: 2, Name: "setup-go", Status: "in_progress", StartedAt: t0},
+			{Number: 3, Name: "test", Status: "queued"}}},
+		{ID: 2, Name: "queued-one", Status: "queued"},
+	}
+	run := &ghapi.Run{DisplayTitle: "Fix thing", HTMLURL: "ru"}
+	run.TriggeringActor.Login = "octocat"
+	tr.ApplyRun(refs[0], run, jobs, t0)
+	s := tr.Snapshot()
+	d := s.Running[0].Detail
+	if d == nil || d.Step != "setup-go" || d.StepNumber != 2 || d.StepsTotal != 3 || d.Actor != "octocat" || d.Title != "Fix thing" || d.GitHubJobID != 1 || d.Final {
+		t.Fatalf("running detail: %+v", d)
+	}
+	if q := s.Queued[0].Detail; q == nil || q.GitHubJobID != 2 {
+		t.Fatalf("queued detail: %+v", q)
+	}
+
+	// completion: the final fetch is still wanted, then the failure log tail
+	tr.Observe(&scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{{Result: "failed", RunnerName: "r-1", JobMessageBase: mk("building")}}})
+	jobs[0].Status, jobs[0].Conclusion = "completed", "failure"
+	jobs[0].Steps[1].Status, jobs[0].Steps[1].Conclusion = "completed", "failure"
+	tr.ApplyRun(refs[0], run, jobs, t0)
+	if len(tr.NeedsLog()) != 1 {
+		t.Fatal("a failed finished job should need its log")
+	}
+	tr.SetLogTail(1, []string{"boom"})
+	if len(tr.NeedsLog()) != 0 {
+		t.Fatal("log already stored")
+	}
+	rec := tr.Snapshot().Recent[0].Detail
+	if !rec.Final || rec.FailedStep != "setup-go" || len(rec.LogTail) != 1 {
+		t.Fatalf("recent detail: %+v", rec)
+	}
+	for _, r := range tr.Wanted() {
+		if r.RunID == 77 && len(tr.Snapshot().Queued) == 0 {
+			t.Fatalf("a finalized run with nothing queued should not be polled: %+v", r)
+		}
+	}
+}
+
+func TestMarkStalled(t *testing.T) {
+	now := time.Unix(10000, 0)
+	job := func(runner string, in time.Duration) Job {
+		return Job{Runner: runner, State: "running", Detail: &Detail{Step: "setup-go", StepStarted: now.Add(-in)}}
+	}
+	slot := func(name string, cpu float64) api.Slot {
+		return api.Slot{RunnerName: name, Stats: &api.SlotStats{CPUPercent: cpu}}
+	}
+	running := []Job{job("idle-long", 20*time.Minute), job("busy-long", 20*time.Minute), job("idle-short", time.Minute), {Runner: "nodetail", State: "running"}}
+	slots := []api.Slot{slot("idle-long", 1), slot("busy-long", 90), slot("idle-short", 0), slot("nodetail", 0)}
+	if n := MarkStalled(running, slots, now, 10*time.Minute); n != 1 || !running[0].Stalled || running[1].Stalled || running[2].Stalled || running[3].Stalled {
+		t.Fatalf("n=%d %+v", n, running)
+	}
+}
+
+type fakeSrc struct {
+	jobs   map[int64][]ghapi.Job
+	err    error
+	calls  int
+	logErr error
+}
+
+func (f *fakeSrc) Run(context.Context, string, string, int64) (*ghapi.Run, error) {
+	return &ghapi.Run{DisplayTitle: "t"}, nil
+}
+func (f *fakeSrc) Jobs(_ context.Context, _, _ string, id int64) ([]ghapi.Job, error) {
+	f.calls++
+	return f.jobs[id], f.err
+}
+func (f *fakeSrc) LogTail(context.Context, string, string, int64, int) ([]string, error) {
+	return []string{"tail"}, f.logErr
+}
+func (f *fakeSrc) Status() ghapi.Status { return ghapi.Status{Enabled: true} }
+
+func TestEnricherBacksOffWhenDenied(t *testing.T) {
+	tr := NewTracker()
+	b := base(0)
+	b.OwnerName, b.RepositoryName, b.WorkflowRunID = "o", "r", 5
+	tr.Observe(&scaleset.RunnerScaleSetMessage{JobStartedMessages: []*scaleset.JobStarted{{RunnerName: "x", JobMessageBase: b}}})
+	src := &fakeSrc{err: &ghapi.APIError{Status: 403, Msg: "no"}}
+	e := &Enricher{Src: src, Tracker: tr, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	e.Once(context.Background())
+	e.Once(context.Background())
+	if src.calls != 1 {
+		t.Fatalf("asked GitHub %d times; a denied repo should be left alone for a while", src.calls)
+	}
+	if tr.Snapshot().Running[0].Detail != nil {
+		t.Fatal("no detail expected when denied")
 	}
 }

@@ -5,7 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Added
+- **Job detail from GitHub** on the dashboard, `/api/state`, `runners` and `/metrics`: each runner slot and job shows its repo, job, workflow, trigger, branch or PR, commit title and who triggered it; running jobs show the current step (`7/14`, name, time in it, progress bar) with an expandable step list; finished jobs keep their step timings and the failed step. Needs `Actions: read` on the App or on a token (`DASHBOARD_GITHUB_TOKEN[_FILE]`); without it the dashboard says so and carries on. See the README.
+- A **stalled** flag for a job that sits in one step for `DASHBOARD_STALL_AFTER` (10m) while its runner is idle, and `runner_scaling_jobs_stalled`.
+- Optional `DASHBOARD_FAILURE_LOGS=on`: the last 40 log lines of failed jobs.
+- `runners slots` shows repo, job, who and step per runner; `runners jobs` the same, and `-v` lists steps and failure logs.
+- Metrics `runner_scaling_github_up`, `runner_scaling_github_rate_remaining`, `runner_scaling_github_requests_total`.
+
 ### Fixed
+- Dashboard and `runners` showed busy runners as "idle" and listed no running or queued jobs. The tracker keyed jobs by `runnerRequestId`, which live scale set messages send as 0, so every job collapsed into one entry. Jobs are now keyed by the request id when set, else the job id, else repo, run and job name. The runners themselves were never affected.
 - `runners host --gate-file` reported a gate it could not read (root-only Docker volume) as MISSING; it now says `unknown`. The token-file warning no longer suggests `chmod 600` on a file a container also reads.
 
 ### Documentation

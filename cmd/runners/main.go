@@ -36,7 +36,7 @@ usage: runners [flags] <command>
 commands:
   status    pools at a glance: slots, queued and running jobs (default)
   slots     every slot with its resource use
-  jobs      queued, running and recent jobs        (-n N limits recent, default 10)
+  jobs      queued, running and recent jobs        (-n N limits recent, default 10; -v lists steps and failure logs)
   memory    memory used against the budget, per pool and per slot
   watch     status, refreshed until interrupted    (-i seconds, default 5)
   host      runner containers on THIS host with their runtime and privilege, and the firewall gate and fence checks
@@ -67,6 +67,7 @@ type opts struct {
 	json           bool
 	n              int
 	interval       int
+	verbose        bool
 }
 
 func run(args []string, out io.Writer) error {
@@ -80,6 +81,7 @@ func run(args []string, out io.Writer) error {
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.IntVar(&o.n, "n", 10, "")
 	fs.IntVar(&o.interval, "i", 5, "")
+	fs.BoolVar(&o.verbose, "v", false, "")
 	// flags may come before or after the command
 	var rest []string
 	for len(args) > 0 {
@@ -148,7 +150,7 @@ func run(args []string, out io.Writer) error {
 		if o.json {
 			return writeJSON(out, st)
 		}
-		printJobs(out, st, o.n)
+		printJobs(out, st, o.n, o.verbose)
 	case "memory":
 		m, err := c.metrics()
 		if err != nil {
@@ -342,8 +344,12 @@ func printStatus(w io.Writer, st dashboard.State) {
 
 func printSlots(w io.Writer, st dashboard.State) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "POOL\tSLOT\tRUNNER\tSTATE\tMEM\tCPU\tPIDS")
+	fmt.Fprintln(tw, "POOL\tSLOT\tRUNNER\tSTATE\tREPO\tJOB\tWHO\tSTEP\tMEM\tCPU\tPIDS")
 	for _, p := range pools(st) {
+		byRunner := map[string]dashboard.Job{}
+		for _, j := range p.Running {
+			byRunner[j.Runner] = j
+		}
 		for _, s := range p.Slots {
 			state := orDash(s.RunnerState)
 			if s.Starting {
@@ -353,16 +359,47 @@ func printSlots(w io.Writer, st dashboard.State) {
 			if s.Stats != nil {
 				mem, cpu, pids = human(s.Stats.MemBytes), fmt.Sprintf("%.0f%%", s.Stats.CPUPercent), strconv.FormatInt(s.Stats.PIDs, 10)
 			}
-			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", p.Name, s.Slot, orDash(s.RunnerName), state, mem, cpu, pids)
+			repo, job, who, step := "-", "-", "-", "-"
+			if j, ok := byRunner[s.RunnerName]; ok && s.RunnerName != "" {
+				state = "running"
+				repo, job, who, step = j.Repo, j.Name, whoOf(j), stepOf(st.Now, j)
+				if j.Stalled {
+					state = "STALLED"
+				}
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, s.Slot, orDash(s.RunnerName), state, repo, job, who, step, mem, cpu, pids)
 		}
 	}
 	tw.Flush()
 }
 
-func printJobs(w io.Writer, st dashboard.State, n int) {
+// whoOf says what a job is for: the PR or branch, and who triggered it when GitHub told us.
+func whoOf(j dashboard.Job) string {
+	ref := strings.TrimPrefix(j.Ref, "refs/heads/")
+	if rest, ok := strings.CutPrefix(j.Ref, "refs/pull/"); ok {
+		ref = "PR #" + strings.SplitN(rest, "/", 2)[0]
+	}
+	if j.Detail != nil && j.Detail.Actor != "" {
+		ref += " by " + j.Detail.Actor
+	}
+	return orDash(ref)
+}
+
+// stepOf is "7/14 setup-go 4m", or "-" when GitHub's step detail is not available.
+func stepOf(now time.Time, j dashboard.Job) string {
+	d := j.Detail
+	if d == nil || d.Step == "" {
+		return "-"
+	}
+	return fmt.Sprintf("%d/%d %s %s", d.StepNumber, d.StepsTotal, d.Step, age(now, d.StepStarted))
+}
+
+func printJobs(w io.Writer, st dashboard.State, n int, verbose bool) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "POOL\tSTATE\tREPO\tJOB\tREF\tAGE")
+	fmt.Fprintln(tw, "POOL\tSTATE\tREPO\tJOB\tWHO\tRUNNER\tSTEP\tAGE")
 	now := st.Now
+	var extra map[int]dashboard.Job // row number -> job, for -v
+	rows := 0
 	row := func(pool string, j dashboard.Job) {
 		t := j.Queued
 		if !j.Started.IsZero() {
@@ -371,23 +408,68 @@ func printJobs(w io.Writer, st dashboard.State, n int) {
 		if !j.Finished.IsZero() {
 			t = j.Finished
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", pool, j.State, j.Repo, j.Name, j.Ref, age(now, t))
+		state := j.State
+		if j.Stalled {
+			state = "STALLED"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", pool, state, j.Repo, j.Name, whoOf(j), orDash(j.Runner), stepOf(now, j), age(now, t))
+		rows++
+		if verbose && j.Detail != nil && (len(j.Detail.Steps) > 0 || len(j.Detail.LogTail) > 0) {
+			if extra == nil {
+				extra = map[int]dashboard.Job{}
+			}
+			extra[rows] = j
+		}
 	}
+	var order []dashboard.Job
+	collect := func(pool string, j dashboard.Job) { row(pool, j); order = append(order, j) }
 	for _, p := range pools(st) {
 		for _, j := range p.Queued {
-			row(p.Name, j)
+			collect(p.Name, j)
 		}
 		for _, j := range p.Running {
-			row(p.Name, j)
+			collect(p.Name, j)
 		}
 		for i, j := range p.Recent {
 			if i >= n {
 				break
 			}
-			row(p.Name, j)
+			collect(p.Name, j)
 		}
 	}
 	tw.Flush()
+	if !verbose {
+		return
+	}
+	for i, j := range order {
+		if _, ok := extra[i+1]; !ok {
+			continue
+		}
+		fmt.Fprintf(w, "\n%s / %s (%s)\n", j.Repo, j.Name, orDash(j.Detail.URL))
+		if j.Stalled {
+			fmt.Fprintf(w, "  ! %s\n", j.StallNote)
+		}
+		for _, s := range j.Detail.Steps {
+			mark, took := " ", ""
+			switch {
+			case s.Status == "in_progress":
+				mark, took = ">", age(now, s.Started)
+			case s.Conclusion == "success":
+				mark = "+"
+			case s.Conclusion == "failure":
+				mark = "x"
+			case s.Conclusion == "skipped":
+				mark = "-"
+			}
+			if s.Status != "in_progress" && !s.Started.IsZero() && !s.Completed.IsZero() {
+				took = s.Completed.Sub(s.Started).Round(time.Second).String()
+			}
+			fmt.Fprintf(w, "  %s %2d  %-50s %s\n", mark, s.Number, s.Name, took)
+		}
+		for _, l := range j.Detail.LogTail {
+			fmt.Fprintf(w, "  | %s\n", l)
+		}
+	}
 }
 
 func printMemory(w io.Writer, st dashboard.State, m map[string]float64) {

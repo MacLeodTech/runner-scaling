@@ -1,0 +1,20 @@
+{
+ "id": 44552049822,
+ "name": "ci",
+ "display_title": "Merge pull request #42 from example/feature",
+ "event": "push",
+ "status": "completed",
+ "conclusion": "cancelled",
+ "head_branch": "main",
+ "head_sha": "ab665eb114591465236ccca99ca36723e04b8a97",
+ "html_url": "https://github.com/example/repo/actions/runs/44552049822",
+ "run_attempt": 1,
+ "run_started_at": "2026-11-19T15:11:50Z",
+ "actor": {
+  "login": "octocat"
+ },
+ "triggering_actor": {
+  "login": "octocat"
+ },
+ "pull_requests": []
+}

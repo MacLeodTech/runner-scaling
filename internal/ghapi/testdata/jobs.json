@@ -1,0 +1,159 @@
+{
+ "total_count": 2,
+ "jobs": [
+  {
+   "id": 135658103060,
+   "run_id": 44552049822,
+   "workflow_name": "ci",
+   "head_branch": "main",
+   "run_url": "https://api.github.com/repos/example/repo/actions/runs/44552049822",
+   "run_attempt": 1,
+   "node_id": "CR_kwDOVW7cCc8AAAAfldphFA",
+   "head_sha": "ab665eb114591465236ccca99ca36723e04b8a97",
+   "url": "https://api.github.com/repos/example/repo/actions/jobs/135658103060",
+   "html_url": "https://github.com/example/repo/actions/runs/44552049822/job/135658103060",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-19T15:11:51Z",
+   "started_at": "2026-11-19T15:13:35Z",
+   "completed_at": "2026-11-19T15:26:31Z",
+   "name": "node agent (unit, conformance e2e) (22)",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1,
+     "started_at": "2026-11-19T15:13:36Z",
+     "completed_at": "2026-11-19T15:13:44Z"
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2,
+     "started_at": "2026-11-19T15:13:44Z",
+     "completed_at": "2026-11-19T15:13:50Z"
+    },
+    {
+     "name": "Run actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3,
+     "started_at": "2026-11-19T15:13:50Z",
+     "completed_at": "2026-11-19T15:18:00Z"
+    },
+    {
+     "name": "Run actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4,
+     "started_at": "2026-11-19T15:18:00Z",
+     "completed_at": "2026-11-19T15:25:51Z"
+    },
+    {
+     "name": "Run mkdir \"$RUNNER_TEMP/express5\"",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5,
+     "started_at": "2026-11-19T15:25:51Z",
+     "completed_at": "2026-11-19T15:26:03Z"
+    },
+    {
+     "name": "Run npm test",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6,
+     "started_at": "2026-11-19T15:26:03Z",
+     "completed_at": "2026-11-19T15:26:23Z"
+    }
+   ],
+   "check_run_url": "https://api.github.com/repos/example/repo/check-runs/135658103060",
+   "labels": [
+    "self-hosted",
+    "homelab-sysbox"
+   ],
+   "runner_id": 492,
+   "runner_name": "homelab-sysbox-6-f5thod",
+   "runner_group_id": 1,
+   "runner_group_name": "default"
+  },
+  {
+   "id": 135658103601,
+   "run_id": 44552049822,
+   "workflow_name": "ci",
+   "head_branch": "main",
+   "run_url": "https://api.github.com/repos/example/repo/actions/runs/44552049822",
+   "run_attempt": 1,
+   "node_id": "CR_kwDOVW7cCc8AAAAfldpjMQ",
+   "head_sha": "ab665eb114591465236ccca99ca36723e04b8a97",
+   "url": "https://api.github.com/repos/example/repo/actions/jobs/135658103601",
+   "html_url": "https://github.com/example/repo/actions/runs/44552049822/job/135658103601",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-19T15:11:51Z",
+   "started_at": "2026-11-19T15:18:27Z",
+   "completed_at": "2026-11-19T15:26:16Z",
+   "name": "fuzz (short run)",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1,
+     "started_at": "2026-11-19T15:18:28Z",
+     "completed_at": "2026-11-19T15:18:30Z"
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2,
+     "started_at": "2026-11-19T15:18:30Z",
+     "completed_at": "2026-11-19T15:18:37Z"
+    },
+    {
+     "name": "Run actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3,
+     "started_at": "2026-11-19T15:18:37Z",
+     "completed_at": "2026-11-19T15:22:04Z"
+    },
+    {
+     "name": "wire protocol",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4,
+     "started_at": "2026-11-19T15:22:04Z",
+     "completed_at": "2026-11-19T15:24:15Z"
+    },
+    {
+     "name": "output renderings (CEF, syslog, JSON)",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5,
+     "started_at": "2026-11-19T15:24:15Z",
+     "completed_at": "2026-11-19T15:24:38Z"
+    },
+    {
+     "name": "agent parsers",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6,
+     "started_at": "2026-11-19T15:24:38Z",
+     "completed_at": "2026-11-19T15:26:11Z"
+    }
+   ],
+   "check_run_url": "https://api.github.com/repos/example/repo/check-runs/135658103601",
+   "labels": [
+    "self-hosted",
+    "homelab-sysbox"
+   ],
+   "runner_id": 493,
+   "runner_name": "homelab-sysbox-3-boh4w8",
+   "runner_group_id": 1,
+   "runner_group_name": "default"
+  }
+ ]
+}

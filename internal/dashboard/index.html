@@ -29,6 +29,10 @@ button{cursor:pointer;background:var(--card)}button.pri{background:var(--q);bord
 .add{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--line);flex-wrap:wrap}.add input{flex:1;min-width:140px}
 .secret{margin:12px 14px;padding:12px;border:1px dashed var(--run);border-radius:6px}.secret code{font-size:16px;user-select:all}.hide{display:none}
 code{font:12px ui-monospace,monospace;background:var(--bg);padding:1px 5px;border-radius:4px}
+.bar2{height:4px;background:var(--line);border-radius:2px;margin:5px 0 2px;overflow:hidden}.bar2 i{display:block;height:100%;background:var(--run)}
+.warn{color:var(--bad);font-weight:600}details.st{margin-top:4px}details.st summary{cursor:pointer;color:var(--mut);font-size:12px}
+.stp{display:grid;grid-template-columns:18px 1fr auto;gap:6px;font-size:12px;padding:1px 0}.stp.cur{font-weight:600}.stp.failure{color:var(--bad)}.stp.skipped{color:var(--mut)}
+pre.lg{margin:6px 0 0;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:6px;font:11px/1.35 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto}
 </style></head><body>
 <div class="err" id="err"></div>
 <div id="auth" class="hide"></div>
@@ -39,6 +43,7 @@ code{font:12px ui-monospace,monospace;background:var(--bg);padding:1px 5px;borde
 <section id="sessions" class="hide"><h2>Sessions</h2><div id="slist"></div><div class="msg" id="smsg" style="padding:0 14px 10px"></div></section>
 <section id="audit" class="hide"><h2>Audit log</h2><div id="alist"></div><div class="msg" id="amsg2" style="padding:0 14px 10px"></div></section>
 <div class="tiles" id="tiles"></div>
+<div class="m" id="gh" style="margin:-8px 0 16px"></div>
 <section><h2>Runners</h2><div id="slots"></div></section>
 <section><h2>Running</h2><div id="running"></div></section>
 <section><h2>Queued</h2><div id="queued"></div></section>
@@ -52,7 +57,7 @@ const dur=ms=>{ms=Math.max(0,Math.round(ms/1000));const m=Math.floor(ms/60),s=ms
 const bytes=n=>{n=n||0;const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(n<10?1:0):n)+' '+u[i]};
 const usage=x=>x&&x.stats?`<span title="CPU, memory (runner + dind), processes">CPU <b>${x.stats.cpu_percent.toFixed(0)}%</b> · mem <b>${bytes(x.stats.mem_bytes)}</b> · ${x.stats.pids} procs</span><br><span title="since the containers started">net ↓${bytes(x.stats.net_rx_bytes)} ↑${bytes(x.stats.net_tx_bytes)} · disk r ${bytes(x.stats.blk_read_bytes)} w ${bytes(x.stats.blk_write_bytes)}</span>`:'';
 const ago=t=>t&&t>'1971'?dur(Date.now()+off-Date.parse(t))+' ago':'';
-const job=(j,right,u)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${j.run_id&&/^[\w.-]+\/[\w.-]+$/.test(j.repo)?`<a href="https://github.com/${esc(j.repo)}/actions/runs/${encodeURIComponent(j.run_id)}" target="_blank" rel="noopener noreferrer" title="Open this run on GitHub">${esc(j.name)} ↗</a>`:esc(j.name)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}${j.pool?' · <b>'+esc(j.pool)+'</b>':''}</div>${u?'<div class="m">'+u+'</div>':''}</div><div class="r">${right}</div></div>`;
+const job=(j,right,u)=>`<div class="row"><div class="i ${esc(j.state)}" title="${esc(j.state)}"></div><div><div class="t">${j.run_id&&/^[\w.-]+\/[\w.-]+$/.test(j.repo)?`<a href="https://github.com/${esc(j.repo)}/actions/runs/${encodeURIComponent(j.run_id)}" target="_blank" rel="noopener noreferrer" title="Open this run on GitHub">${esc(j.name)} ↗</a>`:esc(j.name)}</div><div class="m">${esc(j.repo)} · <code>${esc(j.workflow)}</code> · ${esc(j.event)}${j.ref?' · '+esc(j.ref.replace('refs/heads/','')):''}${j.runner?' · '+esc(j.runner):''}${j.pool?' · <b>'+esc(j.pool)+'</b>':''}</div>${j.stalled?'<div class="warn">⚠ possibly stalled: '+esc(j.stall_note)+'</div>':''}${who(j)?'<div class="m">'+who(j)+'</div>':''}${prog(j)}${u?'<div class="m">'+u+'</div>':''}${steps(j)}</div><div class="r">${right}</div></div>`;
 const list=(id,items,f)=>$(id).innerHTML=items.length?items.map(f).join(''):'<div class="empty">Nothing here.</div>';
 function merge(r){
  const pools=[r,...(r.peers||[])],m={name:r.name,version:r.version,now:r.now,max_slots:0,slots:[],queued:[],running:[],recent:[],stats:{},guard_error:'',pools:pools.length};
@@ -69,6 +74,24 @@ function merge(r){
  if(pools.length>1)m.name='Runners';
  return m;
 }
+
+const openK=new Set();function tg(e){e.open?openK.add(e.dataset.k):openK.delete(e.dataset.k)}
+const jkey=j=>[j.repo,j.run_id,j.name,j.runner||''].join('|');
+const sdur=(a,b)=>a&&b&&a>'1971'&&b>'1971'?dur(Date.parse(b)-Date.parse(a)):'';
+const sicon=x=>x.status==='in_progress'?'▶':x.conclusion==='success'?'✓':x.conclusion==='failure'?'✗':x.conclusion==='skipped'?'–':x.conclusion==='cancelled'?'■':'·';
+function prog(j){const d=j.detail;if(!d||!d.step)return '';const pct=d.steps_total?Math.round(100*(d.step_number-1)/d.steps_total):0;
+ return `<div class="m">step <b>${d.step_number}/${d.steps_total}</b> · ${esc(d.step)} · ${dur(Date.now()+off-Date.parse(d.step_started))}</div><div class="bar2"><i style="width:${pct}%"></i></div>`}
+function steps(j){const d=j.detail;if(!d||!d.steps||!d.steps.length)return '';const k=jkey(j);
+ const fin=j.state!=='running'&&j.state!=='queued';
+ return `<details class="st" data-k="${esc(k)}" ${openK.has(k)?'open':''} ontoggle="tg(this)"><summary>${d.steps.length} steps${d.failed_step?' · failed: '+esc(d.failed_step):''}${d.attempt>1?' · attempt '+d.attempt:''}</summary>`+
+  d.steps.map(x=>`<div class="stp ${x.status==='in_progress'?'cur':''} ${esc(x.conclusion)}"><span>${sicon(x)}</span><span>${esc(x.name)}</span><span class="m">${x.status==='in_progress'?dur(Date.now()+off-Date.parse(x.started)):sdur(x.started,x.completed)}</span></div>`).join('')+
+  (d.log_tail&&d.log_tail.length?`<pre class="lg">${esc(d.log_tail.join('\n'))}</pre>`:'')+'</details>'}
+function who(j){const d=j.detail||{};const ref=(j.ref||'').replace('refs/heads/','');const pr=/^refs\/pull\/(\d+)/.exec(j.ref||'');
+ const bits=[];if(pr)bits.push('PR #'+pr[1]);else if(ref)bits.push(esc(ref));
+ if(d.title)bits.push('“'+esc(d.title.split('\n')[0].slice(0,80))+'”');if(d.actor)bits.push('by '+esc(d.actor));if(d.sha)bits.push('<code>'+esc(d.sha.slice(0,7))+'</code>');
+ return bits.join(' · ')}
+function ghline(s){const g=[s,...(s.peers||[])].filter(p=>p&&p.github);if(!g.length)return '';
+ return g.map(p=>{const x=p.github;return x.error?`<span class="warn">GitHub job detail: ${esc(x.error)}</span>`:`GitHub job detail on · API ${x.rate_remaining}/${x.rate_limit} left`}).filter((v,i,a)=>a.indexOf(v)===i).join(' · ')}
 async function tick(){
  try{
   const r=await fetch('api/state'+location.search,{cache:'no-store'});if(r.status===401){boot();return}if(!r.ok)throw new Error(r.status);
@@ -80,8 +103,11 @@ async function tick(){
   for(const x of s.slots){if(x.stats){cpu+=x.stats.cpu_percent;mem+=x.stats.mem_bytes}if(x.runner_name)byRunner[x.runner_name]=x}
   $('tiles').innerHTML=[['Running',s.running.length],['Queued',s.queued.length],['Runners',`${s.slots.length} / ${s.max_slots}`],['Idle runners',st.idle_runners??0],['Registered',st.registered_runners??0],['CPU',(cpu/100).toFixed(2)+' cores'],['Memory',bytes(mem)]].map(([k,v])=>`<div class="tile"><b>${v}</b><small>${k}</small></div>`).join('');
   const busy=new Set(s.running.map(j=>j.runner));
-  list('slots',s.slots,x=>{const state=x.starting?'starting':busy.has(x.runner_name)?'running':x.runner_state==='running'?'idle':'failed';
-   return `<div class="row"><div class="i ${state}"></div><div><div class="t">${x.pool?esc(x.pool)+' ':''}slot ${x.slot} <span class="m">${state}</span></div><div class="m">${esc(x.runner_name||'starting…')}${x.dind_state?' · dind '+esc(x.dind_state):''}</div></div><div class="r">${usage(x)}</div></div>`});
+  const byJob={};for(const j of s.running)if(j.runner)byJob[j.runner]=j;
+  $('gh').innerHTML=ghline(raw);
+  list('slots',s.slots,x=>{const j=byJob[x.runner_name];const state=x.starting?'starting':j?'running':x.runner_state==='running'?'idle':'failed';
+   const what=j?`<div class="t" style="font-weight:500">${esc(j.repo)} · ${esc(j.name)}${j.stalled?' <span class="warn">⚠ stalled</span>':''}</div><div class="m"><code>${esc(j.workflow)}</code> · ${esc(j.event)}${who(j)?' · '+who(j):''}</div>${prog(j)||'<div class="m">running '+dur(Date.now()+off-Date.parse(j.started||j.queued))+'</div>'}`:'';
+   return `<div class="row"><div class="i ${state}"></div><div><div class="t">${x.pool?esc(x.pool)+' ':''}slot ${x.slot} <span class="m">${state}</span></div>${what}<div class="m">${esc(x.runner_name||'starting…')}${x.dind_state?' · dind '+esc(x.dind_state):''}</div></div><div class="r">${usage(x)}</div></div>`});
   list('running',s.running,j=>job(j,'running '+dur(Date.now()+off-Date.parse(j.started||j.queued)),usage(byRunner[j.runner])));
   list('queued',s.queued,j=>job(j,'waiting '+dur(Date.now()+off-Date.parse(j.queued))));
   list('recent',s.recent,j=>job(j,esc(j.state)+(j.started&&j.finished?' in '+dur(Date.parse(j.finished)-Date.parse(j.started)):'')+'<br>'+ago(j.finished)));

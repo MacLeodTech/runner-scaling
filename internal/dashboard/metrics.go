@@ -112,6 +112,20 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 
 	gauge("runner_scaling_jobs", "Jobs known to the scaler by state.")
 	fmt.Fprintf(&b, "runner_scaling_jobs{%sstate=\"queued\"} %d\nrunner_scaling_jobs{%sstate=\"running\"} %d\n", pool, len(snap.Queued), pool, len(snap.Running))
+	if s.GitHub != nil {
+		gs := s.GitHub.Status()
+		up := 1
+		if gs.Error != "" {
+			up = 0
+		}
+		gauge("runner_scaling_github_up", "1 if the last GitHub job-detail call worked.")
+		fmt.Fprintf(&b, "runner_scaling_github_up%s %d\n", p, up)
+		gauge("runner_scaling_github_rate_remaining", "GitHub API requests left in the current window.")
+		fmt.Fprintf(&b, "runner_scaling_github_rate_remaining%s %d\n", p, gs.Remaining)
+		counter("runner_scaling_github_requests_total", "GitHub API requests made for job detail, by outcome.")
+		fmt.Fprintf(&b, "runner_scaling_github_requests_total{%soutcome=\"ok\"} %d\nrunner_scaling_github_requests_total{%soutcome=\"not_modified\"} %d\nrunner_scaling_github_requests_total{%soutcome=\"error\"} %d\n",
+			pool, gs.Requests-gs.NotModified-gs.Errors, pool, gs.NotModified, pool, gs.Errors)
+	}
 	gauge("runner_scaling_scale_set", "The scale set's own counters from GitHub.")
 	for _, kv := range []struct {
 		k string
@@ -158,6 +172,11 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		}
 		gauge("runner_scaling_memory_used_bytes", "Working set of this pool's runners.")
 		fmt.Fprintf(&b, "runner_scaling_memory_used_bytes%s %d\n", p, mem)
+		if s.GitHub != nil {
+			running := append([]Job(nil), snap.Running...)
+			gauge("runner_scaling_jobs_stalled", "Running jobs stuck in one step while their runner is idle.")
+			fmt.Fprintf(&b, "runner_scaling_jobs_stalled%s %d\n", p, MarkStalled(running, slots, time.Now(), s.StallAfter))
+		}
 	}
 
 	if t := s.Tracker; t != nil {
