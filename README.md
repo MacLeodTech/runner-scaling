@@ -231,6 +231,8 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
 | | `DASHBOARD_ADDR` | off | e.g. `127.0.0.1:8080`: serve the [dashboard](#dashboard) |
 | | `DASHBOARD_PEERS` | none | `name=http://host:port,...`: fold other scalers (pools) into this dashboard; they must share the token |
 | | `DASHBOARD_TOKEN[_FILE]` | none | if set, the dashboard requires it (bearer, `?token=`, or basic-auth password) |
+| | `DASHBOARD_AUDIT_FILE` | `audit.jsonl` next to the users file | where the [audit log](#dashboard-accounts) goes; `off` disables it |
+| | `DASHBOARD_AUDIT_MAX` | `5M` | size at which the audit log rotates (`5M`, `512K`, bytes) |
 | | `DASHBOARD_USERS_FILE` | none | turns on [accounts](#dashboard-accounts): a login page instead of the token for browsers. The file is created on first start; its directory must be writable |
 | | `CACHE_TRUSTED_REFS` | `refs/heads/main` | refs whose push/schedule/dispatch/release jobs keep their caches; `none` wipes always |
 | | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -405,6 +407,16 @@ the token. Meant for a dashboard on a private network that a few people look at.
   admin password: stop the scaler, delete the file, start again, and you are back to `admin`/`admin`.
 - **Sessions:** a random cookie (HttpOnly, SameSite=Strict, `Secure` behind an HTTPS proxy), 12 hours, kept in memory so a
   restart logs everyone out. Changing a password logs the account out of its other sessions.
+- **Sessions page:** **Sessions** lists your active logins (browser, address, when you signed in, last activity) and
+  lets you sign out any of them. Admins see everyone's and can end any of them. Last activity is kept in memory with the
+  rest of the session, so a restart clears the list.
+- **Audit log:** an admin-only **Audit** page shows the 200 most recent account events: logins (including failed ones
+  and lockouts), logouts, password changes and resets, users created and deleted, and sessions ended, each with who did
+  it and from which address. It is a JSON-lines file (mode 0600, default `audit.jsonl` next to the users file) that
+  survives restarts. It rotates at `DASHBOARD_AUDIT_MAX` (default 5 MB) into one `.1` backup, so it keeps between one and
+  two times that much history. Passwords are never written to it. Behind a reverse proxy the recorded address is the
+  proxy's; the `X-Forwarded-For` value is stored next to it as an unverified hint. Anyone who can reach the login page
+  can add failed-login lines, so a flood can push older entries out; the size cap is what keeps the file bounded.
 - **Abuse limits:** five wrong passwords for a name lock that name for five minutes (the change-password form counts too).
   State-changing requests must be JSON and, when the browser sends an `Origin`, from the same host.
 - **Machines still use the token.** Peer scalers, the `runners` CLI and Prometheus send `DASHBOARD_TOKEN` as a bearer
@@ -580,7 +592,19 @@ runners jobs -n 20 # queued, running and the 20 most recent jobs
 runners memory     # memory used against memory_budget, per slot
 runners watch -i 2 # status, refreshed every 2 seconds
 runners status --json   # status, slots, jobs and memory also have --json
+
+runners host --gate-file /gate/firewall-ok --fence 172.30.0.0/16   # on the Docker host (needs Docker access)
+
+source <(runners completion bash)   # or: runners completion zsh
 ```
+
+- **Token file.** `runners` warns on stderr when the token file is readable by other users (anything beyond mode 0600).
+- **`runners host`.** It runs the `docker` CLI and lists the runner containers with their runtime and privilege. With
+  `--gate-file` (the guards' `require_file`) it also reports whether the firewall gate exists, and with `--fence`
+  (the firewall's `FENCE_SRC`) it marks any container that has an address outside that range as `UNFENCED`.
+  Both can also be set with `RUNNERS_GATE_FILE` and `RUNNERS_FENCE`.
+- **Release binaries.** Each `v*` tag attaches `runners` binaries for linux and macOS (amd64, arm64) to the GitHub
+  release, with a `SHA256SUMS` file.
 
 ## Development
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -136,5 +137,80 @@ func TestDefaultTokenFile(t *testing.T) {
 	os.WriteFile(filepath.Join(cfg, "runners", "token"), []byte("s3cret\n"), 0o600)
 	if _, err := runCLI(t, "--url", srv.URL); err != nil {
 		t.Fatalf("default token file not used: %v", err)
+	}
+}
+
+func TestTokenFileWarning(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "tok")
+	os.WriteFile(f, []byte("x"), 0o644)
+	os.Chmod(f, 0o644)
+	if w := tokenFileWarning(f); !strings.Contains(w, "chmod 600") {
+		t.Errorf("0644 not flagged: %q", w)
+	}
+	os.Chmod(f, 0o600)
+	if w := tokenFileWarning(f); w != "" {
+		t.Errorf("0600 flagged: %q", w)
+	}
+	if w := tokenFileWarning(f + "-missing"); w != "" {
+		t.Errorf("missing file flagged: %q", w)
+	}
+}
+
+func TestTokenFileWarningPrinted(t *testing.T) {
+	srv := fake(t, "s3cret")
+	defer srv.Close()
+	var warn bytes.Buffer
+	old := warnOut
+	warnOut = &warn
+	defer func() { warnOut = old }()
+	f := filepath.Join(t.TempDir(), "tok")
+	os.WriteFile(f, []byte("s3cret\n"), 0o600)
+	os.Chmod(f, 0o640)
+	if _, err := runCLI(t, "--url", srv.URL, "--token-file", f); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warn.String(), "warning") || strings.Contains(warn.String(), "s3cret") {
+		t.Errorf("warning output: %q", warn.String())
+	}
+}
+
+func TestCompletion(t *testing.T) {
+	for _, sh := range []string{"bash", "zsh"} {
+		out, err := runCLI(t, "completion", sh)
+		if err != nil || !strings.Contains(out, "runners") || !strings.Contains(out, "--gate-file") {
+			t.Errorf("%s: %q %v", sh, out, err)
+		}
+	}
+	if _, err := runCLI(t, "completion", "fish"); err == nil {
+		t.Error("unknown shell accepted")
+	}
+	if _, err := runCLI(t, "completion"); err == nil {
+		t.Error("missing shell accepted")
+	}
+}
+
+func TestHostChecks(t *testing.T) {
+	_, fence, _ := net.ParseCIDR("172.41.0.0/16")
+	if outsideFence(fence, []string{"172.41.3.2"}) {
+		t.Error("inside address flagged")
+	}
+	if !outsideFence(fence, []string{"172.41.3.2", "172.17.0.5"}) {
+		t.Error("outside address not flagged")
+	}
+	if outsideFence(nil, []string{"172.17.0.5"}) {
+		t.Error("no fence given must not flag")
+	}
+	gate := filepath.Join(t.TempDir(), "ok")
+	if gateStatus("") != "" || gateStatus(gate) != "MISSING" {
+		t.Error("gate status")
+	}
+	os.WriteFile(gate, nil, 0o600)
+	if gateStatus(gate) != "present" {
+		t.Error("gate present not seen")
+	}
+	var b bytes.Buffer
+	renderHost(&b, hostReport{Gate: "MISSING", Containers: []hostRow{{Name: "a", Runtime: "runc", Unfenced: true}}}, true)
+	if !strings.Contains(b.String(), "MISSING") || !strings.Contains(b.String(), "UNFENCED") {
+		t.Errorf("render: %s", b.String())
 	}
 }

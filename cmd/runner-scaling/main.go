@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -254,6 +255,18 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 				log.Warn("dashboard accounts created with the default login admin:admin; it must change its password at first login", "file", uf)
 			}
 			dash.Auth = dashboard.NewAuth(accts, log.WithGroup("auth"))
+			// The audit trail lives next to the users file unless told otherwise; "off" turns it off.
+			switch af := env("DASHBOARD_AUDIT_FILE", filepath.Join(filepath.Dir(uf), "audit.jsonl")); af {
+			case "off":
+				log.Info("dashboard audit log is off")
+			default:
+				max, err := parseSize(env("DASHBOARD_AUDIT_MAX", ""))
+				if err != nil {
+					return fmt.Errorf("DASHBOARD_AUDIT_MAX: %w", err)
+				}
+				dash.Auth.Audit = dashboard.NewAudit(af, max, log.WithGroup("audit"))
+				log.Info("dashboard audit log", "file", af)
+			}
 		}
 		ds := &http.Server{Addr: addr, ReadHeaderTimeout: 10 * time.Second, Handler: dash.Handler()}
 		go func() {
@@ -266,6 +279,28 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 	}
 	// Deliberately no scale set deletion on exit: queued jobs keep waiting for it while the scaler restarts.
 	return l.Run(ctx, s)
+}
+
+// parseSize reads a byte count with an optional K, M or G suffix ("5M"). Empty means 0 (use the default).
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(strings.TrimSuffix(strings.TrimSpace(strings.ToUpper(s)), "B")))
+	if s == "" {
+		return 0, nil
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'K':
+		mult, s = 1<<10, s[:len(s)-1]
+	case 'M':
+		mult, s = 1<<20, s[:len(s)-1]
+	case 'G':
+		mult, s = 1<<30, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("want a size like 5M, got %q", s)
+	}
+	return n * mult, nil
 }
 
 func atoi(s string) int { n, _ := strconv.Atoi(s); return n }

@@ -1,10 +1,21 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/actions/scaleset"
 
@@ -130,5 +141,183 @@ func TestDashboardPeers(t *testing.T) {
 func TestRunHealthFailsWithoutGuard(t *testing.T) {
 	if err := runHealth([]string{"-socket", filepath.Join(t.TempDir(), "none.sock")}); err == nil {
 		t.Error("health must fail when no guard answers on the socket")
+	}
+}
+
+// fakeGitHub answers the few GitHub and Actions-service calls ensureScaleSet makes. The scaleset client treats a
+// non-github.com host as GitHub Enterprise Server, so the API lives under /api/v3 on the test server.
+type fakeGitHub struct {
+	t           *testing.T
+	mu          sync.Mutex
+	sets        map[int]scaleset.RunnerScaleSet
+	nextID      int
+	ignorePatch bool // accept a PATCH but leave the labels alone, as the real service has been seen to do
+	calls       []string
+}
+
+func newFakeGitHub(t *testing.T) (*fakeGitHub, *scaleset.Client) {
+	f := &fakeGitHub{t: t, sets: map[int]scaleset.RunnerScaleSet{}, nextID: 100}
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		reply := func(v any) { json.NewEncoder(w).Encode(v) }
+		switch p := r.URL.Path; {
+		case p == "/api/v3/orgs/acme/actions/runners/registration-token":
+			w.WriteHeader(http.StatusCreated)
+			reply(map[string]any{"token": "reg", "expires_at": time.Now().Add(time.Hour)})
+		case p == "/api/v3/actions/runner-registration":
+			// The client only reads the expiry from this token, without verifying it.
+			claims := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix())))
+			hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+			reply(map[string]string{"url": srv.URL + "/actions", "token": hdr + "." + claims + ".sig"})
+		case strings.HasPrefix(p, "/actions/_apis/runtime/runnerscalesets"):
+			f.scaleSets(w, r, strings.TrimPrefix(p, "/actions/_apis/runtime/runnerscalesets"))
+		default:
+			f.t.Errorf("unexpected request %s %s", r.Method, p)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	gh, err := scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
+		GitHubConfigURL: srv.URL + "/acme", PersonalAccessToken: "pat", SystemInfo: systemInfo(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, gh
+}
+
+func (f *fakeGitHub) scaleSets(w http.ResponseWriter, r *http.Request, rest string) {
+	f.calls = append(f.calls, r.Method)
+	reply := func(v any) { json.NewEncoder(w).Encode(v) }
+	id, _ := strconv.Atoi(strings.TrimPrefix(rest, "/"))
+	switch r.Method {
+	case http.MethodGet:
+		var out []scaleset.RunnerScaleSet
+		for _, s := range f.sets {
+			if s.Name == r.URL.Query().Get("name") {
+				out = append(out, s)
+			}
+		}
+		reply(map[string]any{"count": len(out), "value": out})
+	case http.MethodPost:
+		var s scaleset.RunnerScaleSet
+		json.NewDecoder(r.Body).Decode(&s)
+		f.nextID++
+		s.ID = f.nextID
+		f.sets[s.ID] = s
+		reply(s)
+	case http.MethodPatch:
+		var s scaleset.RunnerScaleSet
+		json.NewDecoder(r.Body).Decode(&s)
+		cur := f.sets[id]
+		if !f.ignorePatch {
+			cur.Labels = s.Labels
+			f.sets[id] = cur
+		}
+		reply(cur)
+	case http.MethodDelete:
+		delete(f.sets, id)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func labelNames(ls []scaleset.Label) []string {
+	var n []string
+	for _, l := range ls {
+		n = append(n, l.Name)
+	}
+	sort.Strings(n)
+	return n
+}
+
+func TestEnsureScaleSet(t *testing.T) {
+	ctx := context.Background()
+	want := []string{"homelab-sysbox", "self-hosted"}
+
+	t.Run("creates a missing scale set", func(t *testing.T) {
+		f, gh := newFakeGitHub(t)
+		ss, err := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"self-hosted", "homelab-sysbox"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(f.sets) != 1 || ss.Name != "homelab-sysbox" || !reflect.DeepEqual(labelNames(ss.Labels), want) {
+			t.Errorf("got %+v, sets %+v", ss, f.sets)
+		}
+		if !ss.RunnerSetting.DisableUpdate {
+			t.Error("the runner must be created with DisableUpdate set")
+		}
+	})
+
+	t.Run("leaves matching labels alone", func(t *testing.T) {
+		f, gh := newFakeGitHub(t)
+		first, err := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"self-hosted", "homelab-sysbox"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.calls = nil
+		// same set, different order and case: no write calls
+		again, err := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"HOMELAB-SYSBOX", "self-hosted"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.ID != first.ID || len(f.sets) != 1 {
+			t.Errorf("id %d -> %d, sets %d", first.ID, again.ID, len(f.sets))
+		}
+		for _, c := range f.calls {
+			if c != http.MethodGet {
+				t.Errorf("unexpected %s call for unchanged labels", c)
+			}
+		}
+	})
+
+	t.Run("updates changed labels in place", func(t *testing.T) {
+		f, gh := newFakeGitHub(t)
+		first, _ := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"self-hosted", "old"})
+		got, err := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"self-hosted", "homelab-sysbox"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != first.ID || !reflect.DeepEqual(labelNames(got.Labels), want) || len(f.sets) != 1 {
+			t.Errorf("got %+v, sets %+v", got, f.sets)
+		}
+	})
+
+	t.Run("recreates the set when GitHub ignores the label update", func(t *testing.T) {
+		f, gh := newFakeGitHub(t)
+		f.ignorePatch = true
+		first, _ := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"self-hosted", "old"})
+		got, err := ensureScaleSet(ctx, gh, "homelab-sysbox", scaleset.DefaultRunnerGroup, []string{"self-hosted", "homelab-sysbox"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID == first.ID || len(f.sets) != 1 || !reflect.DeepEqual(labelNames(f.sets[got.ID].Labels), want) {
+			t.Errorf("not recreated: first %d, got %+v, sets %+v", first.ID, got, f.sets)
+		}
+	})
+
+	t.Run("a duplicate label cannot hide a change", func(t *testing.T) {
+		f, gh := newFakeGitHub(t)
+		first, _ := ensureScaleSet(ctx, gh, "x", scaleset.DefaultRunnerGroup, []string{"self-hosted", "x"})
+		got, err := ensureScaleSet(ctx, gh, "x", scaleset.DefaultRunnerGroup, []string{"x", "x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != first.ID || !reflect.DeepEqual(labelNames(f.sets[got.ID].Labels), []string{"x", "x"}) {
+			t.Errorf("labels not updated: %+v", f.sets)
+		}
+	})
+}
+
+func TestParseSize(t *testing.T) {
+	for in, want := range map[string]int64{"": 0, "1024": 1024, "5M": 5 << 20, "5MB": 5 << 20, "2k": 2 << 10, "1G": 1 << 30, " 3m ": 3 << 20} {
+		if got, err := parseSize(in); err != nil || got != want {
+			t.Errorf("parseSize(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"x", "0", "-5M", "M"} {
+		if _, err := parseSize(in); err == nil {
+			t.Errorf("parseSize(%q) accepted", in)
+		}
 	}
 }
