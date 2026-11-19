@@ -26,6 +26,7 @@ import (
 	"github.com/actions/scaleset/listener"
 
 	"github.com/MacLeodTech/runner-scaling/internal/dashboard"
+	"github.com/MacLeodTech/runner-scaling/internal/ghapi"
 	"github.com/MacLeodTech/runner-scaling/internal/guard"
 	"github.com/MacLeodTech/runner-scaling/internal/scaler"
 )
@@ -268,6 +269,22 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 				log.Info("dashboard audit log", "file", af)
 			}
 		}
+		if gh, err := githubAPI(); err != nil {
+			return fmt.Errorf("job detail from GitHub: %w", err)
+		} else if gh != nil {
+			poll, err := time.ParseDuration(env("DASHBOARD_GITHUB_POLL", "20s"))
+			if err != nil || poll < 5*time.Second {
+				return fmt.Errorf("DASHBOARD_GITHUB_POLL: want a duration of at least 5s, got %q", env("DASHBOARD_GITHUB_POLL", ""))
+			}
+			stall, err := time.ParseDuration(env("DASHBOARD_STALL_AFTER", "10m"))
+			if err != nil || stall <= 0 {
+				return fmt.Errorf("DASHBOARD_STALL_AFTER: want a duration like 10m, got %q", env("DASHBOARD_STALL_AFTER", ""))
+			}
+			en := &dashboard.Enricher{Src: gh, Tracker: s.Dash, Every: poll, FailureLogs: env("DASHBOARD_FAILURE_LOGS", "off") == "on", Log: log.WithGroup("github")}
+			dash.GitHub, dash.StallAfter = en, stall
+			go en.Loop(ctx)
+			log.Info("job detail from GitHub", "poll", poll, "stall_after", stall, "failure_logs", en.FailureLogs)
+		}
 		ds := &http.Server{Addr: addr, ReadHeaderTimeout: 10 * time.Second, Handler: dash.Handler()}
 		go func() {
 			if err := ds.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
@@ -279,6 +296,40 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 	}
 	// Deliberately no scale set deletion on exit: queued jobs keep waiting for it while the scaler restarts.
 	return l.Run(ctx, s)
+}
+
+// githubAPI builds the client behind the dashboard's job detail (steps, who triggered a run, failure logs). It
+// prefers a dedicated read-only token (DASHBOARD_GITHUB_TOKEN[_FILE], e.g. a fine-grained token with Actions: read),
+// then the GitHub App, then the personal access token. DASHBOARD_GITHUB=off turns it off. It returns nil when off.
+func githubAPI() (*ghapi.Client, error) {
+	if env("DASHBOARD_GITHUB", "auto") == "off" {
+		return nil, nil
+	}
+	base := env("GITHUB_API_URL", "")
+	if tok, err := secret("DASHBOARD_GITHUB_TOKEN"); err != nil {
+		return nil, err
+	} else if tok != "" {
+		return ghapi.New(base, ghapi.TokenAuth(tok)), nil
+	}
+	key, err := secret("GITHUB_APP_PRIVATE_KEY")
+	if err != nil {
+		return nil, err
+	}
+	if id, _ := strconv.ParseInt(os.Getenv("GITHUB_APP_INSTALLATION_ID"), 10, 64); key != "" && os.Getenv("GITHUB_APP_CLIENT_ID") != "" && id != 0 {
+		k, err := ghapi.ParseKey([]byte(key))
+		if err != nil {
+			return nil, err
+		}
+		return ghapi.New(base, &ghapi.AppAuth{Base: base, ClientID: os.Getenv("GITHUB_APP_CLIENT_ID"), InstallationID: id, Key: k}), nil
+	}
+	tok, err := secret("GITHUB_TOKEN")
+	if err != nil {
+		return nil, err
+	}
+	if tok == "" {
+		return nil, nil
+	}
+	return ghapi.New(base, ghapi.TokenAuth(tok)), nil
 }
 
 // parseSize reads a byte count with an optional K, M or G suffix ("5M"). Empty means 0 (use the default).

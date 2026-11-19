@@ -223,3 +223,27 @@ func TestHostChecks(t *testing.T) {
 		t.Errorf("render: %s", b.String())
 	}
 }
+
+func TestSlotsAndJobsShowWhatEachRunnerIsDoing(t *testing.T) {
+	now := time.Unix(100000, 0)
+	job := dashboard.Job{Repo: "o/app", Name: "go (collector)", Ref: "refs/pull/42/merge", Runner: "p-1-abc", State: "running", Started: now.Add(-5 * time.Minute),
+		Stalled: true, StallNote: "step stuck",
+		Detail: &dashboard.Detail{Actor: "octocat", Step: "setup-go", StepNumber: 2, StepsTotal: 9, StepStarted: now.Add(-3 * time.Minute),
+			Steps: []dashboard.Step{{Number: 1, Name: "Set up job", Status: "completed", Conclusion: "success", Started: now.Add(-5 * time.Minute), Completed: now.Add(-4 * time.Minute)}, {Number: 2, Name: "setup-go", Status: "in_progress", Started: now.Add(-3 * time.Minute)}}}}
+	st := dashboard.State{Name: "p", Now: now, Snapshot: dashboard.Snapshot{Running: []dashboard.Job{job}},
+		Slots: []api.Slot{{Slot: 1, RunnerName: "p-1-abc", RunnerState: "running"}, {Slot: 2, RunnerName: "p-2-def", RunnerState: "running"}}}
+	var b strings.Builder
+	printSlots(&b, st)
+	for _, want := range []string{"o/app", "go (collector)", "PR #42 by octocat", "2/9 setup-go 3m", "STALLED"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("slots output lacks %q:\n%s", want, b.String())
+		}
+	}
+	b.Reset()
+	printJobs(&b, st, 5, true)
+	for _, want := range []string{"STALLED", "! step stuck", "> ", "setup-go", "Set up job"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("jobs -v output lacks %q:\n%s", want, b.String())
+		}
+	}
+}

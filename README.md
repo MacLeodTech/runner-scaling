@@ -250,6 +250,12 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
 | | `DASHBOARD_TOKEN[_FILE]` | none | if set, the dashboard requires it (bearer, `?token=`, or basic-auth password) |
 | | `DASHBOARD_AUDIT_FILE` | `audit.jsonl` next to the users file | where the [audit log](#dashboard-accounts) goes; `off` disables it |
 | | `DASHBOARD_AUDIT_MAX` | `5M` | size at which the audit log rotates (`5M`, `512K`, bytes) |
+| | `DASHBOARD_GITHUB` | `auto` | `off` disables [job detail from GitHub](#job-detail-from-github) (steps, who triggered a job, failure logs) |
+| | `DASHBOARD_GITHUB_TOKEN[_FILE]` | none | a read-only token (fine-grained, `Actions: read`) for job detail; used before the App and `GITHUB_TOKEN` |
+| | `DASHBOARD_GITHUB_POLL` | `20s` | how often job detail is refreshed (at least `5s`) |
+| | `DASHBOARD_STALL_AFTER` | `10m` | flag a job that stays in one step this long while its runner is idle |
+| | `DASHBOARD_FAILURE_LOGS` | `off` | `on`: keep the last 40 log lines of failed jobs on the dashboard |
+| | `GITHUB_API_URL` | `https://api.github.com` | for GitHub Enterprise Server |
 | | `DASHBOARD_USERS_FILE` | none | turns on [accounts](#dashboard-accounts): a login page instead of the token for browsers. The file is created on first start; its directory must be writable |
 | | `CACHE_TRUSTED_REFS` | `refs/heads/main` | refs whose push/schedule/dispatch/release jobs keep their caches; `none` wipes always |
 | | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -327,6 +333,10 @@ scrape_configs:
 | `runner_scaling_jobs{state}` | gauge | jobs queued and running, as the scaler knows them |
 | `runner_scaling_scale_set{stat}` | gauge | GitHub's own scale set counters (available, acquired, assigned, running, busy and idle runners) |
 | `runner_scaling_slots{state}` | gauge | slots by runner state (`running`, `starting`, `exited`, ...) |
+| `runner_scaling_jobs_stalled` | gauge | running jobs stuck in one step while their runner is idle (needs [job detail](#job-detail-from-github)) |
+| `runner_scaling_github_up` | gauge | 1 if the last GitHub job-detail call worked |
+| `runner_scaling_github_rate_remaining` | gauge | GitHub API requests left in the current window |
+| `runner_scaling_github_requests_total{outcome}` | counter | job-detail requests: `ok`, `not_modified`, `error` |
 | `runner_scaling_max_slots` | gauge | the guard's `max_slots` |
 | `runner_scaling_memory_used_bytes` | gauge | working set of this pool's runners |
 | `runner_scaling_memory_budget_bytes` | gauge | `memory_budget` (shared by every pool on the host) |
@@ -408,6 +418,32 @@ workflow, event, branch, result, duration). It refreshes every few seconds from 
   without TLS.
 - In a container, listen on `0.0.0.0:8080` and publish the port on loopback only (`ports: ["127.0.0.1:8080:8080"]`).
   `/healthz` is always open.
+
+### Job detail from GitHub
+
+The scale set only says that a job started or finished. With a credential that can read Actions, the scaler also asks
+GitHub's REST API about the runs it is serving and shows, for every runner slot and job:
+
+- **what the runner is for**: repo, job, workflow, trigger (push, pull request, schedule), branch or PR number,
+  commit title, who triggered it and the commit;
+- **where it is**: step `7/14`, its name and how long it has been in it, a progress bar, and a list of every step
+  with its duration (open it from the job row);
+- **what went wrong**: the failed step of a finished job and, with `DASHBOARD_FAILURE_LOGS=on`, the last 40 log lines;
+- **a stall flag**: a job that has sat in one step longer than `DASHBOARD_STALL_AFTER` while its runner uses under 5% CPU
+  is marked, and counted in `runner_scaling_jobs_stalled`.
+
+`runners slots` and `runners jobs` show the same (`runners jobs -v` lists every step and the failure log lines).
+
+It needs the **Actions: Read-only** repository permission, and nothing else: on the GitHub App, or on a fine-grained
+token given as `DASHBOARD_GITHUB_TOKEN` (the App is used when there is no such token, then `GITHUB_TOKEN`). An org owner
+has to accept a changed App permission on the installation. Without it everything else works; the page shows a line
+saying the credential cannot read workflow runs, and the scaler retries each repo every five minutes.
+
+It only asks about runs that have a queued or running job here, plus the ones that finished in the last 15 minutes. Calls
+are conditional (ETag), so an unchanged poll costs no rate limit, and polling pauses when fewer than 200 requests
+remain in the window. `runner_scaling_github_up`, `_github_rate_remaining` and `_github_requests_total` show its health.
+Log lines come from GitHub already secret-masked, but they can still hold private output: leave failure logs off unless
+the dashboard is only seen by people who may read the logs.
 
 ### Dashboard accounts
 

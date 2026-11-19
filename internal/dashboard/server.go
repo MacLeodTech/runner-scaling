@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
+	"github.com/MacLeodTech/runner-scaling/internal/ghapi"
 )
 
 //go:embed index.html
@@ -31,6 +32,8 @@ type State struct {
 	MaxSlots int        `json:"max_slots"`
 	Slots    []api.Slot `json:"slots"`
 	GuardErr string     `json:"guard_error,omitempty"`
+	// GitHub is the health of the job-detail poller (rate limit, missing permission); nil when it is off.
+	GitHub *ghapi.Status `json:"github,omitempty"`
 	Snapshot
 	// Peers are the other scalers' own states (one per pool), so one page can show every pool.
 	Peers []State `json:"peers,omitempty"`
@@ -49,9 +52,11 @@ type Server struct {
 	Info          api.Info
 	Guard         Slots
 	Tracker       *Tracker
-	Peers         []Peer // other pools to fold into this page; they must share Token
-	Token         string // if set, required as a bearer token, ?token= or the password of basic auth
-	Auth          *Auth  // if set, a login session is accepted instead of the token, and the account API is served
+	GitHub        *Enricher     // optional: steps and run details from GitHub
+	StallAfter    time.Duration // see MarkStalled; default DefaultStallAfter
+	Peers         []Peer        // other pools to fold into this page; they must share Token
+	Token         string        // if set, required as a bearer token, ?token= or the password of basic auth
+	Auth          *Auth         // if set, a login session is accepted instead of the token, and the account API is served
 }
 
 func (s *Server) Handler() http.Handler {
@@ -78,6 +83,11 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	} else if slots != nil {
 		st.Slots = slots
 	}
+	if s.GitHub != nil {
+		gs := s.GitHub.Status()
+		st.GitHub = &gs
+	}
+	MarkStalled(st.Running, st.Slots, st.Now, s.StallAfter)
 	if r.URL.Query().Get("local") == "" { // peers answer with local=1, so peers never chain
 		st.Peers = s.peerStates(ctx)
 	}
