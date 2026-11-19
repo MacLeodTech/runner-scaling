@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Changed
+- Dashboard: one **Runners** section. Each slot now carries the job it is running (repo, trigger, who, step progress, step list, stall flag) next to its CPU and memory, so the separate **Running** list is gone; it only appears, as "Running (no runner slot)", for a job with no matching slot (for example just after a scaler restart).
+
 ### Added
 - **Job detail from GitHub** on the dashboard, `/api/state`, `runners` and `/metrics`: each runner slot and job shows its repo, job, workflow, trigger, branch or PR, commit title and who triggered it; running jobs show the current step (`7/14`, name, time in it, progress bar) with an expandable step list; finished jobs keep their step timings and the failed step. Needs `Actions: read` on the App or on a token (`DASHBOARD_GITHUB_TOKEN[_FILE]`); without it the dashboard says so and carries on. See the README.
 - A **stalled** flag for a job that sits in one step for `DASHBOARD_STALL_AFTER` (10m) while its runner is idle, and `runner_scaling_jobs_stalled`.
