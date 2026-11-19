@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-19
+
 ### Added
 - Dashboard **Sessions** page: each user sees and can end their own logins (address, browser, sign-in time, last
   activity); admins see and can end everyone's. API: `GET /api/sessions`, `POST /api/sessions/{id}/revoke`.
