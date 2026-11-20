@@ -1502,3 +1502,150 @@ func TestCacheMaxTrimsKeptCaches(t *testing.T) {
 		t.Error("cache_max without cache_dirs accepted")
 	}
 }
+
+func TestParseMemAvailable(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"MemTotal:       14000000 kB\nMemFree: 1 kB\nMemAvailable:    9437184 kB\nBuffers: 2 kB\n", 9437184 * 1024, true},
+		{"MemTotal: 1 kB\n", 0, false},
+		{"MemAvailable: lots kB\n", 0, false},
+		{"MemAvailable: -5 kB\n", 0, false},
+		{"", 0, false},
+	} {
+		got, err := parseMemAvailable(c.in)
+		if (err == nil) != c.ok || got != c.want {
+			t.Errorf("parseMemAvailable(%q) = %d, %v", c.in, got, err)
+		}
+	}
+}
+
+func TestHostHeadroomConfig(t *testing.T) {
+	for _, c := range []struct {
+		name, extra string
+		ok          bool
+	}{
+		{"headroom with budget", "memory_budget: 8G\nmemory_host_headroom: 3G", true},
+		{"headroom needs budget", "memory_host_headroom: 3G", false},
+		{"bad headroom", "memory_budget: 8G\nmemory_host_headroom: lots", false},
+		{"zero headroom", "memory_budget: 8G\nmemory_host_headroom: 0", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "g.yaml")
+			os.WriteFile(p, []byte(strings.Replace(testConfig, "prefix: ci", "prefix: ci\n"+c.extra, 1)), 0o600)
+			if _, err := LoadConfig(p); (err == nil) != c.ok {
+				t.Errorf("err=%v, want ok=%v", err, c.ok)
+			}
+		})
+	}
+}
+
+func hostGuard(t *testing.T, headroom string, avail int64, availErr error) (*Guard, *fakeDocker) {
+	t.Helper()
+	g, f := newGuard(t)
+	g.cfg.MemoryBudget, g.cfg.MemoryReserve, g.cfg.MemoryHostHeadroom = "8G", "1G", headroom
+	if err := g.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f.mem = map[string]int64{}
+	g.hostAvail = func() (int64, error) { return avail, availErr }
+	return g, f
+}
+
+func TestHostHeadroomAdmission(t *testing.T) {
+	// Budget 8G, reserve 1G, headroom 3G. Runners use 2G (measured). Spare = avail + 2G - 3G.
+	for _, c := range []struct {
+		name   string
+		avail  int64
+		err    error
+		ok     bool
+		wantIn string
+	}{
+		{"plenty of host memory: the plain budget", 12 * gib, nil, true, ""},
+		{"game server took most: 5G free leaves 4G, runners 2G+1G reserve fits", 5 * gib, nil, true, ""},
+		{"2G free leaves 1G: refused", 2 * gib, nil, false, "the host has 2G free and keeps 3G"},
+		{"nothing free: refused", 0, nil, false, "the host has"},
+		{"unreadable host memory fails open", 0, errors.New("no meminfo"), true, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g, f := hostGuard(t, "3G", c.avail, c.err)
+			f.containers["ci-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: "ci", labelSlot: "2", labelRole: "runner"}}}
+			f.mem["ci-runner-2"] = 2 * gib
+			err := startSlot(t, g, 1)
+			if (err == nil) != c.ok {
+				t.Fatalf("err=%v, want ok=%v", err, c.ok)
+			}
+			if err != nil && (!errors.Is(err, ErrNotReady) || !strings.Contains(err.Error(), c.wantIn)) {
+				t.Errorf("err: %v", err)
+			}
+		})
+	}
+}
+
+func TestHostHeadroomNeverRaisesTheBudget(t *testing.T) {
+	g, f := hostGuard(t, "3G", 64*gib, nil)
+	f.containers["ci-runner-2"] = &fakeContainer{state: "running", spec: ContainerSpec{Labels: map[string]string{labelInstance: "ci", labelSlot: "2", labelRole: "runner"}}}
+	f.mem["ci-runner-2"] = 7*gib + 1
+	if err := startSlot(t, g, 1); err == nil {
+		t.Fatal("a roomy host must not lift the configured 8G budget")
+	}
+}
+
+func TestHostPressureBackstop(t *testing.T) {
+	ctx := context.Background()
+	setup := func(avail *int64) (*Guard, *fakeDocker) {
+		target := *avail
+		*avail = 16 * gib // a roomy host while the slots start
+		g, f := hostGuard(t, "4G", 0, nil)
+		g.hostAvail = func() (int64, error) { return *avail, nil }
+		defer func() { *avail = target }()
+		for _, n := range []int{1, 2} {
+			if err := startSlot(t, g, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.containers["ci-runner-1"].created = time.Now().Add(-time.Hour)
+		f.containers["ci-runner-2"].created = time.Now().Add(-time.Minute)
+		f.mem["ci-runner-1"], f.mem["ci-runner-2"] = gib, gib // far below the 8G budget
+		return g, f
+	}
+	t.Run("host below half the headroom for 3 ticks reaps the newest", func(t *testing.T) {
+		avail := 1 * gib // under 2G
+		g, f := setup(&avail)
+		g.Reap(ctx)
+		g.Reap(ctx)
+		if f.containers["ci-runner-2"] == nil {
+			t.Fatal("killed before 3 ticks")
+		}
+		g.Reap(ctx)
+		if f.containers["ci-runner-1"] == nil || f.containers["ci-runner-2"] != nil {
+			t.Fatalf("want only the newest killed: %v", f.containers)
+		}
+	})
+	t.Run("a dip above half the headroom kills nothing", func(t *testing.T) {
+		avail := 3 * gib // under the headroom (admission waits) but not under half of it
+		g, f := setup(&avail)
+		for i := 0; i < 6; i++ {
+			g.Reap(ctx)
+		}
+		if f.containers["ci-runner-1"] == nil || f.containers["ci-runner-2"] == nil {
+			t.Fatal("a running job was reaped for a mild dip")
+		}
+	})
+	t.Run("recovery resets the count", func(t *testing.T) {
+		avail := 1 * gib
+		g, f := setup(&avail)
+		g.Reap(ctx)
+		g.Reap(ctx)
+		avail = 6 * gib
+		g.Reap(ctx)
+		avail = 1 * gib
+		g.Reap(ctx)
+		g.Reap(ctx)
+		if f.containers["ci-runner-2"] == nil {
+			t.Fatal("killed despite recovery")
+		}
+	})
+}
