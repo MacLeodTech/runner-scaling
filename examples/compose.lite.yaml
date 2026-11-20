@@ -48,7 +48,7 @@ services:
   # another image). Even a fully compromised guard can then do no more than guard-lite.yaml says. No network.
   docker-policy:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.10
+    image: ghcr.io/macleodtech/runner-scaling:0.11
     user: "65533:65532"        # not root: it only needs the socket's group. 65532 is the group the guard shares with it.
     group_add: ["${DOCKER_GID:?set it in .env: stat -c %g /var/run/docker.sock}"]
     network_mode: none
@@ -67,7 +67,7 @@ services:
   # Docker only through docker-policy.
   guard-lite:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest (`docker buildx imagetools inspect <image>`) once it works
+    image: ghcr.io/macleodtech/runner-scaling:0.11   # pin a digest (`docker buildx imagetools inspect <image>`) once it works
     user: "65532:65532"
     network_mode: none
     mem_limit: 64m
@@ -89,7 +89,7 @@ services:
   # Talks to GitHub (outbound only) and asks the guard for slots. Holds the GitHub App key; has no Docker access.
   scaler-lite:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.10
+    image: ghcr.io/macleodtech/runner-scaling:0.11
     mem_limit: 128m
     pids_limit: 64
     command: [scaler, --name, ci-lite, --labels, "self-hosted,linux,x64,ci-lite"]

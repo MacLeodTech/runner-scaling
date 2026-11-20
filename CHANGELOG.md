@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-20
+
 ### Added
 - `runner-scaling docker-policy`: an optional **Docker policy proxy** between the guard and the Docker socket. It loads the guard's
   config and refuses any Docker call that is not exactly one the guard's templates produce: container creates are compared
@@ -228,6 +230,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.11.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.11.0
 [0.10.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.10.0
 [0.9.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.9.0
 [0.6.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.6.0

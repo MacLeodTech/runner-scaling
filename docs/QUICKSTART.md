@@ -159,7 +159,7 @@ Then edit:
 Validate the config before starting anything (this runs the guard's own checker, nothing is started):
 
 ```
-docker run --rm -v "$PWD/guard-lite.yaml:/c.yaml:ro" ghcr.io/macleodtech/runner-scaling:0.10 guard --check --config /c.yaml
+docker run --rm -v "$PWD/guard-lite.yaml:/c.yaml:ro" ghcr.io/macleodtech/runner-scaling:0.11 guard --check --config /c.yaml
 ```
 
 **Check:** it prints `…: ok (prefix ci-lite, 4 slots, tenant pinned: false)`. A bad key or value is named in the
@@ -251,13 +251,13 @@ If the LAN line says `LAN REACHABLE`, **stop**: the fence is not working. Do not
 3. **Pin the images.** The example uses tags so it works first time. A tag can change under you, and the guard image holds
    the Docker socket, so pin by digest (the docker:28-dind image too):
    ```
-   docker pull ghcr.io/macleodtech/runner-scaling:0.10
-   docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/macleodtech/runner-scaling:0.10   # prints name@sha256:…
+   docker pull ghcr.io/macleodtech/runner-scaling:0.11
+   docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/macleodtech/runner-scaling:0.11   # prints name@sha256:…
    ```
    Put that `…@sha256:…` value in `compose.yaml` (both services), the same for the
    `docker:28-dind` image, and for `runner.image` in `guard-lite.yaml`
    (`docker pull ghcr.io/actions/actions-runner:<tag>`, then use the digest `docker inspect` reports under `RepoDigests`).
-   Verify where the runner-scaling image came from (needs `gh` 2.49 or newer): `gh attestation verify oci://ghcr.io/macleodtech/runner-scaling:0.10 -R MacLeodTech/runner-scaling`.
+   Verify where the runner-scaling image came from (needs `gh` 2.49 or newer): `gh attestation verify oci://ghcr.io/macleodtech/runner-scaling:0.11 -R MacLeodTech/runner-scaling`.
    A passing check means the image was built by this repo's CI from a tagged commit.
 4. **Keep the runner image current.** GitHub stops accepting runners that are too old, and then jobs just wait. Run
    `scripts/check-runner-image.sh guard-lite.yaml` now and then (it exits 1 when you are behind); the bump routine is
