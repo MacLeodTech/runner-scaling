@@ -1,33 +1,68 @@
 # PROPOSAL, not applied. Paths are under ~/docker/compose_includes/github-runners. Tags are examples: use what build.sh prints.
-# Both guards: the image, and RUNNER_TOOL_CACHE pointing at the toolcache baked into the image. The per-slot
-# /opt/hostedtoolcache bind is dropped (it would only hide nothing now, and a persistent toolcache is what the image replaces),
-# and so is its cache_dirs entry. Verify with ./autoscale.sh check before restarting any guard.
+# Two changes, both guards:
+#  1. The image, with RUNNER_TOOL_CACHE (and AGENT_TOOLSDIRECTORY) pointing at the toolcache baked into it. The per-slot
+#     /opt/hostedtoolcache bind and its cache_dirs entry go: a persistent toolcache is what the image replaces.
+#  2. One cache root, ${USERDIR}/runner-scaling/cache/<pool>-<slot>/, replacing the scattered lite-N / sbx-N dirs:
+#        files/    -> /cache in the runner (go-build go-mod npm pip cargo maven gradle node-gyp xdg)
+#        docker/   -> the dind /var/lib/docker (sysbox only; kept out of /cache so jobs cannot read the engine's store)
+#     Every directory under it is in cache_dirs, so the same wipe rule covers it (all but trusted main runs).
+#     The old lite-N / sbx-N dirs are not migrated: they are disposable. Delete them after the switch.
+#     The per-slot `work` dir stays where the guard puts it.
+# Verify with ./autoscale.sh check before restarting any guard.
 --- a/guard-lite.yaml
 +++ b/guard-lite.yaml
 @@ cache_dirs:
 -  - ${USERDIR}/runner-scaling/lite-{slot}/toolcache
-   - ${USERDIR}/runner-scaling/lite-{slot}/cache
+-  - ${USERDIR}/runner-scaling/lite-{slot}/cache
++  - ${USERDIR}/runner-scaling/cache/lite-{slot}/files
 @@ runner:
 -  image: myoung34/github-runner:ubuntu-noble@sha256:46c0ed292169f619594248cbfa6752d2c5760e170165bb401a2d132f71a2faf7 # pinned; bump deliberately
-+  image: runner-ci:lite-20261119-617562fe # built by runner-scaling/images/build.sh; bump deliberately
++  image: runner-ci:lite-20261120-6e52d98f # built by runner-scaling/images/build.sh; bump deliberately
 @@ env:
 -    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
 +    RUNNER_TOOL_CACHE: /opt/ci/toolcache # baked into the image: setup-go, setup-node and setup-python find their tools there
 +    AGENT_TOOLSDIRECTORY: /opt/ci/toolcache # the runner image sets this to /opt/hostedtoolcache and setup-python honours it, so set both
+     GOCACHE: /cache/go-build
+     GOMODCACHE: /cache/go-mod
+     PIP_CACHE_DIR: /cache/pip
+     npm_config_cache: /cache/npm
++    npm_config_devdir: /cache/node-gyp # node-gyp's Node headers, for native addons
++    CARGO_HOME: /cache/cargo # registry, git checkouts and `cargo install` output; rustup and the toolchains stay in the image (RUSTUP_HOME)
++    MAVEN_ARGS: -Dmaven.repo.local=/cache/maven # Maven 3.9+ reads this; replaces ~/.m2/repository
++    GRADLE_USER_HOME: /cache/gradle
++    XDG_CACHE_HOME: /cache/xdg # catch-all for tools that use ~/.cache (golangci-lint, pre-commit, trivy, ...)
 @@ binds:
 -    - ${USERDIR}/runner-scaling/lite-{slot}/toolcache:/opt/hostedtoolcache
-     - ${USERDIR}/runner-scaling/lite-{slot}/cache:/cache
+-    - ${USERDIR}/runner-scaling/lite-{slot}/cache:/cache
++    - ${USERDIR}/runner-scaling/cache/lite-{slot}/files:/cache
 --- a/guard-sysbox.yaml
 +++ b/guard-sysbox.yaml
 @@ cache_dirs:
 -  - ${USERDIR}/runner-scaling/sbx-{slot}/toolcache
-   - ${USERDIR}/runner-scaling/sbx-{slot}/cache
+-  - ${USERDIR}/runner-scaling/sbx-{slot}/cache
+-  - ${USERDIR}/runner-scaling/sbx-{slot}/docker
++  - ${USERDIR}/runner-scaling/cache/sbx-{slot}/files
++  - ${USERDIR}/runner-scaling/cache/sbx-{slot}/docker
 @@ runner:
 -  image: myoung34/github-runner:ubuntu-noble@sha256:46c0ed292169f619594248cbfa6752d2c5760e170165bb401a2d132f71a2faf7 # pinned; bump deliberately
-+  image: runner-ci:sysbox-20261119-617562fe # built by runner-scaling/images/build.sh; bump deliberately
++  image: runner-ci:sysbox-20261120-6e52d98f # built by runner-scaling/images/build.sh; bump deliberately
 @@ env:
 -    RUNNER_TOOL_CACHE: /opt/hostedtoolcache
 +    RUNNER_TOOL_CACHE: /opt/ci/toolcache
 +    AGENT_TOOLSDIRECTORY: /opt/ci/toolcache
+     GOCACHE: /cache/go-build
+     GOMODCACHE: /cache/go-mod
+     PIP_CACHE_DIR: /cache/pip
+     npm_config_cache: /cache/npm
++    npm_config_devdir: /cache/node-gyp
++    CARGO_HOME: /cache/cargo
++    MAVEN_ARGS: -Dmaven.repo.local=/cache/maven
++    GRADLE_USER_HOME: /cache/gradle
++    XDG_CACHE_HOME: /cache/xdg
 @@ binds:
 -    - ${USERDIR}/runner-scaling/sbx-{slot}/toolcache:/opt/hostedtoolcache
+-    - ${USERDIR}/runner-scaling/sbx-{slot}/cache:/cache
++    - ${USERDIR}/runner-scaling/cache/sbx-{slot}/files:/cache
+@@ dind binds:
+-    - ${USERDIR}/runner-scaling/sbx-{slot}/docker:/var/lib/docker # image + layer cache, one per slot
++    - ${USERDIR}/runner-scaling/cache/sbx-{slot}/docker:/var/lib/docker # image + layer cache, one per slot

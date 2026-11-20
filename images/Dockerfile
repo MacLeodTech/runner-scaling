@@ -111,7 +111,7 @@ RUN if [ -n "${PLAYWRIGHT_VERSION:-}" ]; then \
       && rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
 # cargo install puts binaries in CARGO_HOME/bin; GitHub-hosted images have it on PATH, so do the same.
-ENV PATH=/opt/ci/cargo/bin:${PATH}
+ENV PATH=/opt/ci/cargo/bin:${PATH}:/cache/cargo/bin
 LABEL org.opencontainers.image.title="runner-scaling CI runner (lite)"
 
 # ---- sysbox ----

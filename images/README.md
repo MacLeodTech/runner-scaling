@@ -42,11 +42,48 @@ In `guard-lite.yaml` and `guard-sysbox.yaml`, `runner.image` changes from the pi
 `runner-ci:lite-<date>-<hash>` / `runner-ci:sysbox-<date>-<hash>`; then `autoscale.sh check` and restart that guard.
 See `guard-image.diff` for the exact lines.
 
+## Caches
+
+Tools are baked in the image; everything a job downloads or compiles goes to one per-slot cache root, so it is easy to
+see, size and wipe:
+
+```
+~/runner-state/runner-scaling/cache/<pool>-<slot>/
+  files/    -> /cache in the runner: go-build go-mod npm pip cargo maven gradle node-gyp xdg
+  docker/   -> dind /var/lib/docker (sysbox only; not under /cache, so jobs cannot read the engine's store)
+```
+
+| Use case | Env var (set in the guard) | Directory |
+|---|---|---|
+| Go build + fuzz cache | `GOCACHE` | `go-build` |
+| Go modules, `go run pkg@ver` (govulncheck, gitleaks) | `GOMODCACHE` | `go-mod` |
+| npm (`npm ci`) | `npm_config_cache` | `npm` |
+| Node headers for native addons | `npm_config_devdir` | `node-gyp` |
+| pip / pytest deps | `PIP_CACHE_DIR` | `pip` |
+| Cargo registry, git, `cargo install` | `CARGO_HOME` | `cargo` (rustup and toolchains stay in the image) |
+| Maven | `MAVEN_ARGS=-Dmaven.repo.local=...` | `maven` |
+| Gradle | `GRADLE_USER_HOME` | `gradle` |
+| Anything using `~/.cache` (golangci-lint, pre-commit, trivy) | `XDG_CACHE_HOME` | `xdg` |
+| Docker layers and buildkit (sysbox) | dind bind | `docker` |
+| Playwright browsers, scanners, JDKs, Go/Node/Python | baked in the image | not a cache |
+
+Every directory is listed in the guard's `cache_dirs`, so the existing rule applies unchanged: kept only after a trusted
+`main` run, wiped otherwise, capped by `cache_max`. `/cache/cargo/bin` is on the image PATH after the image's own bins.
+Tested in a throwaway container with the lite limits: a cold run of Go build, `go mod download`, `npm ci`, pip, `cargo
+fetch --locked` and Maven resolve over the Assay repo put everything under `/cache` (cold 57s Go build, then 0-1s warm
+for all but pip, 11s) and nothing in `~/.cache`, `~/.m2`, `~/.cargo`, `~/go`, `~/.npm` or the image's cargo dir; a
+`cargo install` binary is found on PATH. `cache-report.sh` lists sizes per slot and kind. The old `lite-N`/`sbx-N`
+directories are not migrated (caches are disposable): delete them after the switch.
+
+Not cached, by design: tools a job installs with `setup-*` or apt (the toolcache is in the image layer, so they
+re-download per job), and caches for PR and branch jobs (the guard wipes them).
+
 ## Open questions
 
 - A locally built image has no registry digest, so it cannot be pinned by digest until it is pushed. The guard must
   accept a plain tag for now (verify with `autoscale.sh check`).
 - The per-slot persistent toolcache bind is gone in the proposal; anything not baked in is downloaded per job.
+- Untested: the new cache root on the real guards (the guard must create `cache/<pool>-<slot>/files`; `autoscale.sh check` first), and a trusted `main` run keeping caches under the new paths.
 - Chromium: sandboxed launch works under the lite caps and 3G (no `--no-sandbox`). `/dev/shm` is Docker's default 64M;
   Chrome falls back to /tmp, so a larger shm is optional (`shm_size`, if the guard supports it) not required.
 - Jobs still need to stop installing what the image has (Assay's `toolchain` action already skips when `mvn`/`rustup`
