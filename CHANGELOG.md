@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-20
+
 ### Multi-pool: one guard, one policy proxy and one scaler for any number of pools
 - `guard.yaml` can hold several pools under `pools:`: settings above it are shared, a pool's own keys replace them, the prefix
   defaults to `<prefix>-<name>` and the labels to `self-hosted, linux, <arch>, <name>`. A file without `pools:` is one pool, as before.
@@ -269,6 +271,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.12.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.12.0
 [0.11.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.11.0
 [0.10.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.10.0
 [0.9.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.9.0
