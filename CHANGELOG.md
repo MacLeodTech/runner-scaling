@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-20
+
 ### Added
 - **`memory_host_headroom`**: keep a share of the host's memory for other services (a game server, say). Admission uses the smaller of `memory_budget` and the host's available memory plus current runner use minus the headroom, so new runners wait while something else holds the memory. A running job is reaped only if the host's available memory stays below half the headroom for three checks. Needs `memory_budget`; fails open if `/proc/meminfo` cannot be read.
 
@@ -193,6 +195,7 @@ preview: GitHub may change them.
   version.
 - The firewall script needs Docker's iptables backend with the `DOCKER-USER` chain.
 
+[0.10.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.10.0
 [0.9.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.9.0
 [0.6.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.6.0
 [0.5.0]: https://github.com/MacLeodTech/runner-scaling/releases/tag/v0.5.0
