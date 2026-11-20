@@ -740,6 +740,23 @@ func (g *Guard) trimCaches(ctx context.Context, slot int) error {
 	return nil
 }
 
+// dindStoreWiped reports whether the slot's dind data will be emptied right after teardown: caches are being wiped and
+// one of dind's binds is a cache_dirs entry (typically /var/lib/docker).
+func (g *Guard) dindStoreWiped(slot int, wipeCaches bool) bool {
+	if !wipeCaches || g.cfg.Dind == nil {
+		return false
+	}
+	for _, b := range g.cfg.Dind.Binds {
+		host, _, _ := strings.Cut(g.cfg.Expand(b, slot), ":")
+		for _, d := range g.cfg.CacheDirs {
+			if g.cfg.Expand(d, slot) == host {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (g *Guard) teardown(ctx context.Context, slot int, prune, wipeCaches bool) error {
 	runnerName, dindName, _, volName := g.names(slot)
 	var errs []error
@@ -754,7 +771,8 @@ func (g *Guard) teardown(ctx context.Context, slot int, prune, wipeCaches bool) 
 					g.log.Warn("teardown", "slot", slot, "err", err)
 				}
 			}
-			if prune {
+			// Pruning a store that is about to be emptied is wasted time with the slot held.
+			if prune && !g.dindStoreWiped(slot, wipeCaches) {
 				for _, cmd := range g.cfg.Dind.PruneOnStop {
 					if code, err := g.d.Exec(pctx, dindName, cmd); err != nil || code != 0 {
 						g.log.Warn("prune command failed", "slot", slot, "cmd", cmd, "code", code, "err", err)
@@ -862,6 +880,7 @@ func (g *Guard) Reap(ctx context.Context) {
 	}
 	g.watchGate(slots)
 	reaped := map[int]bool{}
+	var wg sync.WaitGroup // teardowns can take minutes (prune, wipes): run them side by side, not one after another
 	for _, s := range slots {
 		if s.Starting {
 			continue
@@ -878,12 +897,15 @@ func (g *Guard) Reap(ctx context.Context) {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
 			g.count.add(CounterReapedPrefix + reason + "_total")
 			reaped[s.Slot] = true
-			if err := g.teardown(ctx, s.Slot, true, !g.takeKeep(s.Slot)); err != nil {
-				g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
-			}
-			g.release(s.Slot)
+			wg.Go(func() {
+				if err := g.teardown(ctx, s.Slot, true, !g.takeKeep(s.Slot)); err != nil {
+					g.log.Error("reap: teardown", "slot", s.Slot, "err", err)
+				}
+				g.release(s.Slot)
+			})
 		}
 	}
+	wg.Wait()
 	g.memoryBackstop(ctx, slots, starts, reaped)
 }
 

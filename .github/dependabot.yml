@@ -1,0 +1,13 @@
+# Keeps the SHA-pinned actions, the digest-pinned base images and the Go modules from going stale.
+# This repo builds the image that holds the Docker socket, so updates arrive as PRs to review, never automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}
