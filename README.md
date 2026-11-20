@@ -26,7 +26,8 @@ flowchart LR
     subgraph host["Docker host"]
         direction LR
         S["<b>scaler</b><br/>holds the GitHub credential<br/>no Docker access"]:::net
-        G["<b>guard</b><br/>holds the Docker socket<br/>no network, no GitHub credential"]:::priv
+        G["<b>guard</b><br/>builds containers from guard.yaml<br/>no network, no GitHub credential,<br/>no Docker socket, not root"]:::net
+        P["<b>docker-policy</b><br/>holds the Docker socket<br/>refuses any call that is not<br/>exactly what guard.yaml builds"]:::priv
         D[("docker.sock")]:::priv
         subgraph slot["slot N (network &lt;prefix&gt;-slot-N)"]
             R["&lt;prefix&gt;-runner-N"]:::job
@@ -35,7 +36,8 @@ flowchart LR
     end
     S -- "long poll, outbound only" --> GH
     S -- "unix socket API" --> G
-    G --> D
+    G -- "unix socket" --> P
+    P --> D
     G -. "builds every container<br/>from guard.yaml" .-> slot
     R -- "register with JIT config" --> GH
     R --- DIND
@@ -48,12 +50,18 @@ flowchart LR
     style slot fill:#16a34a22,stroke:#16a34a,stroke-dasharray:4 3
 ```
 
-The software has two parts, both in one small image (`runner-scaling guard` / `runner-scaling scaler`):
+The software has three parts, all in one small image (`runner-scaling scaler` / `guard` / `docker-policy`):
 
 - **The scaler** registers a runner scale set, receives job messages, and asks GitHub for a single-use
   just-in-time (JIT) runner config whenever it needs a runner. It hands that config to the guard. It never
   touches Docker.
-- **The guard** owns the Docker socket and exposes six calls to the scaler, on a unix socket:
+- **`docker-policy`** is the only container that holds the Docker socket. It sits between the guard and Docker, reads
+  every request body, and forwards a call only if it is exactly one the guard's config produces (the container the
+  config describes for that slot, the config's exec commands, this pool's networks and volumes, its images). Anything
+  else, including a privileged flag or an extra mount, is refused with a 403 and a `DENY` line. See
+  [the posture document](docs/SECURITY-POSTURE.md#the-docker-policy-proxy). It is optional only in the sense that
+  `guard` can still be pointed straight at the socket (`DOCKER_SOCKET`), which gives up this layer; the examples use it.
+- **The guard** builds containers from its config, talks to Docker only through `docker-policy`, and exposes six calls to the scaler, on a unix socket:
 
   | Call | What it does |
   |---|---|
@@ -132,8 +140,10 @@ names. The guard decodes it and requires that:
 - the config stays under 64 KiB.
 
 **Not solved by this tool. Know these before you use it:**
-- **The guard itself is root-equivalent**, because it holds the Docker socket. It is kept small: no network, no
-  credentials, a fixed six-call API, read-only filesystem, all capabilities dropped.
+- **`docker-policy` is root-equivalent**, because it holds the Docker socket. It is kept small: no network, no
+  credentials, runs as an unprivileged user with only the socket's group, read-only filesystem, all capabilities
+  dropped. The guard no longer holds the socket; a taken-over guard can do only what `guard.yaml` allows. If you run the
+  guard without `docker-policy`, the guard is root-equivalent again.
 - **With a privileged dind sidecar, any job is root on the host.** (Sysbox narrows this route; see below.) The sidecar is privileged, so a job can start a
   `--privileged` container against it and mount the host's disk. The guard's API limits what a taken-over *scaler*
   can ask for; it does not limit what a *job* can do. Anyone who can get a workflow onto a repo that uses these

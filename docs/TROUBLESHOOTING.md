@@ -1,12 +1,12 @@
 # Troubleshooting
 
 Find your symptom, read the cause, do the fix. First, the three commands that answer most questions (run them from the
-directory that holds your `compose.yaml`; with the example file the services are `firewall`, `guard-lite` and `scaler-lite`):
+directory that holds your `compose.yaml`; with the example file the services are `firewall`, `docker-policy`, `guard-lite` and `scaler-lite`):
 
 ```
 docker compose ps                                          # is everything up and healthy?
-docker compose logs --tail 80 guard-lite scaler-lite       # what did they last say?
-docker compose logs guard-lite | grep -E 'DENY|ERROR'      # what did the guard refuse, and why?
+docker compose logs --tail 80 docker-policy guard-lite scaler-lite   # what did they last say?
+docker compose logs guard-lite docker-policy | grep -E 'DENY|ERROR'  # what was refused, and why?
 ```
 
 If you log to journald (the example does), logs also survive a `docker compose down`:
@@ -40,6 +40,18 @@ would hide the shared work directory from the job. Use another path, such as `/h
 **The guard says `network "…" exists but is not on subnet …; remove it so it can be recreated`.** A Docker network
 with the guard's name already exists on a different range, so it would sit outside the firewall's fence. Remove it
 (`docker network rm <name>`, after removing any container on it) and let the guard recreate it.
+
+**`docker-policy` exits or is unhealthy: `permission denied` on `/var/run/docker.sock`.** It runs as an unprivileged user and
+reaches the socket through the group in `DOCKER_GID`. Set it in `.env` to the socket's real group: `stat -c %g /var/run/docker.sock`,
+then `docker compose up -d`. (A rootless or remapped Docker puts the socket elsewhere; mount that path instead.)
+
+**The guard says `docker …: 403 … runner-scaling docker policy: …`, or `docker-policy` logs `DENY`.** The policy refused a call.
+The text after `why=` says which field or call. Normal operation never triggers it, so first check what changed:
+- *you edited `guard.yaml` (or pinned `tenant_url`) and only restarted one container.* Both read the file once at start:
+  `docker compose restart docker-policy guard-lite`.
+- *the guard and the policy see different files.* Both must mount the same config.
+- *the guard image is newer than the policy's image,* so it sends something the old policy does not know. Run both at the same version.
+- otherwise something other than the guard is talking to the policy socket, or the guard is misbehaving: **investigate before changing anything.**
 
 **The scaler repeats `waiting for guard`.** The guard is still pulling images (normal on first start; the runner image is
 about 2.4 GB) or it is unhealthy. Watch `docker compose logs -f guard-lite`.
@@ -148,6 +160,8 @@ it") to slow a job instead of killing it.
 | `503 … is missing (is the firewall up?)` | the firewall gate file is absent | start or fix the firewall container |
 | `503 … memory budget: … in use of …` | the memory budget is full | wait, or raise the budget / lower limits |
 | `409 … slot N is in use / starting` | a race between the scaler and the guard | harmless; it retries |
+| `docker-policy … DENY … differs from the guard's template at /…` | a create request differs from what the config builds, at the named field | see [above](#nothing-starts); if you changed nothing, investigate |
+| `docker-policy … DENY … is not an API call the guard makes` | something asked Docker for a call outside the guard's list | investigate who can reach the policy socket |
 | `DENY … no such endpoint` | something called the guard with an unknown request | investigate who has access to the guard socket |
 | `GATE WITHDRAWN` | the firewall gate vanished while runners ran | check the firewall container immediately |
 | `warning: … image … is not pinned by digest` | you use a tag | fine at first; pin digests ([QUICKSTART step 7](QUICKSTART.md#7-make-it-permanent-and-safe)) |

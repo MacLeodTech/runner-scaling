@@ -167,6 +167,12 @@ func (d *SocketDocker) ImageExists(ctx context.Context, ref string) (bool, error
 }
 
 func (d *SocketDocker) ImagePull(ctx context.Context, ref string) error {
+	_, err := d.do(ctx, http.MethodPost, "/images/create", pullQuery(ref), nil, nil)
+	return err
+}
+
+// pullQuery is the query of the one image-pull call the guard makes.
+func pullQuery(ref string) url.Values {
 	q := url.Values{}
 	if name, digest, ok := strings.Cut(ref, "@"); ok {
 		// name may carry a tag too (docker:28-dind@sha256:...); the digest wins.
@@ -178,8 +184,20 @@ func (d *SocketDocker) ImagePull(ctx context.Context, ref string) error {
 	} else {
 		q.Set("fromImage", ref)
 	}
-	_, err := d.do(ctx, http.MethodPost, "/images/create", q, nil, nil)
-	return err
+	return q
+}
+
+// networkCreateBody and volumeCreateBody are the only bodies the guard sends to the networks and volumes endpoints.
+func networkCreateBody(name, subnet string, labels map[string]string) map[string]any {
+	body := map[string]any{"Name": name, "Driver": "bridge", "Labels": labels, "CheckDuplicate": true}
+	if subnet != "" {
+		body["IPAM"] = map[string]any{"Config": []map[string]string{{"Subnet": subnet}}}
+	}
+	return body
+}
+
+func volumeCreateBody(name string, labels map[string]string) map[string]any {
+	return map[string]any{"Name": name, "Labels": labels}
 }
 
 func (d *SocketDocker) NetworkEnsure(ctx context.Context, name, subnet string, labels map[string]string) error {
@@ -203,16 +221,12 @@ func (d *SocketDocker) NetworkEnsure(ctx context.Context, name, subnet string, l
 	} else if !errors.Is(err, ErrNotFound) {
 		return err
 	}
-	body := map[string]any{"Name": name, "Driver": "bridge", "Labels": labels, "CheckDuplicate": true}
-	if subnet != "" {
-		body["IPAM"] = map[string]any{"Config": []map[string]string{{"Subnet": subnet}}}
-	}
-	_, err := d.do(ctx, http.MethodPost, "/networks/create", nil, body, nil)
+	_, err := d.do(ctx, http.MethodPost, "/networks/create", nil, networkCreateBody(name, subnet, labels), nil)
 	return err
 }
 
 func (d *SocketDocker) VolumeCreate(ctx context.Context, name string, labels map[string]string) error {
-	_, err := d.do(ctx, http.MethodPost, "/volumes/create", nil, map[string]any{"Name": name, "Labels": labels}, nil)
+	_, err := d.do(ctx, http.MethodPost, "/volumes/create", nil, volumeCreateBody(name, labels), nil)
 	return err
 }
 
