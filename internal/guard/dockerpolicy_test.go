@@ -279,7 +279,7 @@ func TestPolicyAllowsEverythingTheGuardDoes(t *testing.T) {
 			if d := r.denies(t); d != "" {
 				t.Fatalf("the policy refused calls the guard makes:\n%s", d)
 			}
-			if !r.d.saw("POST /"+apiVersion+"/containers/create") {
+			if !r.d.saw("POST /" + apiVersion + "/containers/create") {
 				t.Fatal("nothing reached the daemon")
 			}
 		})
