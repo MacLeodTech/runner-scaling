@@ -27,7 +27,7 @@ x-hardened: &hardened
 # compose.lite.yaml for the explanation). The guards themselves have no socket and are not root.
 x-policy: &policy
   <<: *hardened
-  image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
+  image: ghcr.io/macleodtech/runner-scaling:0.11   # pin a digest
   user: "65533:65532"
   group_add: ["${DOCKER_GID:?set it in .env: stat -c %g /var/run/docker.sock}"]
   network_mode: none
@@ -39,7 +39,7 @@ x-policy: &policy
 
 x-guard: &guard
   <<: *hardened
-  image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
+  image: ghcr.io/macleodtech/runner-scaling:0.11   # pin a digest
   user: "65532:65532"
   network_mode: none         # needs no network: it talks to Docker (via docker-policy) and the scaler over unix sockets
   environment:
@@ -52,7 +52,7 @@ x-guard: &guard
 
 x-scaler: &scaler
   <<: *hardened
-  image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
+  image: ghcr.io/macleodtech/runner-scaling:0.11   # pin a digest
   mem_limit: 128m
   pids_limit: 64
   env_file: [.env]
