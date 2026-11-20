@@ -19,7 +19,8 @@ github_url: https://github.com/YOUR-ORG
 prefix: ci-lite               # containers ci-lite-runner-N, networks ci-lite-slot-N
 max_slots: 4
 subnet: 172.30.2{slot}.0/24   # next to guard.yaml's 172.30.{slot}.0/24; both sit inside the 172.30.0.0/16 fence
-require_file: /gate/firewall-ok   # see firewall.sh: no slot starts until the fence is up
+require_file: /gate/firewall-ok   # see the firewall service: no slot starts until the fence is up
+# gate_loss: stop   # also remove RUNNING slots if the gate is gone for gate_grace (default 10s); default "warn" only logs
 max_runtime: 6h
 
 # Every guard of every pool on the host should carry the same values: the budget is shared.

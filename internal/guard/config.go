@@ -94,6 +94,13 @@ type Config struct {
 	// RequireFile, if set, must exist before the guard starts any slot: a gate for something that must happen first,
 	// such as a host firewall that fences the slot subnets. Put it on a tmpfs so it is gone after a reboot.
 	RequireFile string `yaml:"require_file"`
+	// GateLoss is what happens to RUNNING slots when require_file disappears (the firewall lost its rules):
+	// "warn" (default) logs GATE WITHDRAWN and leaves jobs alone; "stop" removes every running slot once the file has
+	// been gone for GateGrace, so no job keeps running unfenced. A stopped job fails; GitHub re-queues nothing.
+	GateLoss string `yaml:"gate_loss"`
+	// GateGrace is how long the file may be gone before "stop" acts (default 10s), so a firewall that repairs itself
+	// within seconds costs no jobs.
+	GateGrace *Duration `yaml:"gate_grace"`
 	// StartTimeout bounds how long a slot may take to come up (dind health included).
 	StartTimeout Duration `yaml:"start_timeout"`
 	// MaxRuntime, if set, is how long a runner container may run before the reaper removes it (0 = no limit).
@@ -265,6 +272,17 @@ func (c *Config) Validate() error {
 		if h := c.Expand(d, 1); !path.IsAbs(h) || path.Clean(h) != h || h == "/" || strings.Contains(h, ":") || !strings.Contains(d, "{slot}") {
 			errs = append(errs, fmt.Errorf("cache_dirs entry %q must be a clean absolute host path containing {slot}", d))
 		}
+	}
+	switch c.GateLoss {
+	case "", "warn", "stop":
+	default:
+		errs = append(errs, errors.New(`gate_loss must be "warn" or "stop"`))
+	}
+	if c.GateLoss == "stop" && c.RequireFile == "" {
+		errs = append(errs, errors.New("gate_loss: stop needs require_file"))
+	}
+	if c.GateGrace != nil && c.GateGrace.Duration < 0 {
+		errs = append(errs, errors.New("gate_grace must not be negative"))
 	}
 	if c.MaxRuntime.Duration < 0 || (c.MaxRuntime.Duration > 0 && c.MaxRuntime.Duration < time.Minute) {
 		errs = append(errs, errors.New("max_runtime must be 0 (disabled) or at least 1m"))

@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Added
+- `runner-scaling firewall`: the fence is now part of the image. It speaks nftables over netlink (no `iptables` or `nft` binary), keeps
+  its own table `inet gh_runners` (so `ufw`, `firewalld` and `iptables -F` do not touch it), covers IPv4 and, with `FENCE_SRC6`,
+  IPv6, reads the kernel's ruleset back every 3 seconds and replaces it atomically if anything differs, and exports Prometheus
+  metrics (`FENCE_METRICS`). More destinations are blocked: loopback, `0/8`, multicast, `240/4`, `192.0.0.0/24`, `198.18/15`.
+  `--check` and `--remove` flags.
+- Guard `gate_loss: stop` and `gate_grace`: remove running slots when the firewall's gate file has been gone longer than the grace
+  period (default stays `warn`: log only).
+
+### Changed
+- The example compose files run the firewall from the runner-scaling image (`command: [firewall]`, `user: 0:0`, only `NET_ADMIN`)
+  instead of `docker:dind` with `firewall.sh`. **Migrating:** replace the `firewall` service as in `examples/compose.yaml`; the old
+  `GH_RUNNERS` iptables rules are no longer maintained, so remove them (`iptables -D DOCKER-USER -s <range> -j GH_RUNNERS`,
+  `iptables -D INPUT -s <range> -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP`, `iptables -F GH_RUNNERS; iptables -X GH_RUNNERS`) after the new fence is up.
+  `examples/firewall.sh` is now `examples/firewall-iptables.sh` for kernels without nf_tables.
+
 ## [0.11.0] - 2026-11-20
 
 ### Added

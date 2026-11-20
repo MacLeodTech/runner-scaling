@@ -106,11 +106,10 @@ dind failing its health check: wrong `runtime:` name (`docker info --format '{{j
 
 **Jobs fail pulling images, or cannot resolve names.** The fence blocks private ranges, so a LAN DNS server (for example a
 Pi-hole at 192.168.x.x) is unreachable from runners. The lite example sets public resolvers (`dns: [1.1.1.1, 9.9.9.9]`);
-do the same for yours, or add an allow rule for your resolver in `firewall.sh`.
+do the same for yours, or run the pool with a resolver on a public address.
 
 **A job needs something on your LAN (an artifact server, NAS, internal registry).** By design it cannot reach it. Put the
-service on a public address or add a narrow allow rule above the drop rules in `firewall.sh`. Decide this deliberately: every
-hole you open is reachable by every job.
+service on a public address. Decide this deliberately: every hole you open is reachable by every job.
 
 **Docker commands inside a job fail on the no-Docker pool.** That pool has no Docker. Use a Docker pool
 ([QUICKSTART](QUICKSTART.md#add-a-pool-that-has-docker)) for those repos.
@@ -124,16 +123,18 @@ Do not run real jobs until this is fixed: it is the control that keeps a job awa
 
 1. Is the container up? `docker compose ps firewall` and `docker compose logs firewall`. A healthy run logs
    `firewall in place; runners allowed` or `firewall applied; runners allowed`.
-2. `firewall apply FAILED` in its log: the container needs `network_mode: host`, `NET_ADMIN` and `NET_RAW`, and an
-   `iptables` that works on this kernel (`sudo iptables -L -n`). Some minimal kernels lack the `iptables` modules.
+2. `fence apply FAILED` in its log: the container needs `network_mode: host` and `NET_ADMIN`, and a kernel with nf_tables
+   (`sudo nft list tables`). On a host with only legacy iptables use `examples/firewall-iptables.sh`.
 3. The rules exist but the test still reaches the LAN: check the fence covers your slot networks. `FENCE_SRC` in
    `compose.yaml` must contain every guard's `subnet`. `docker network inspect ci-lite-slot-1` shows the real range.
-4. Docker's **nftables** backend (no `DOCKER-USER` chain) is handled by hooking `FORWARD` instead, but that fallback is tested on the
-   iptables-nft variant only. Confirm with the `curl` test from QUICKSTART step 6.
-5. IPv6 is **not** fenced. If you enabled IPv6 in Docker (`ipv6: true` in `daemon.json`), runners may reach IPv6 LAN addresses. Leave
-   it off for the runner networks.
-6. If the rules are flushed while jobs run (a firewall reload, `ufw`, `firewalld`), runners are unfenced for up to 30 seconds. The guard logs
-   `GATE WITHDRAWN` once, and counts it in the `gate_withdrawn_total` metric. Alert on it, and do not run other tools that rewrite iptables wholesale on this host.
+   `docker run --rm --net host --cap-add NET_ADMIN <image> firewall --src <your range> --check` says whether the installed rules match.
+4. Show what is installed: `sudo nft list table inet gh_runners` (counters show what was dropped).
+5. IPv6: if you enabled IPv6 on the runner networks (`ipv6: true`), set `FENCE_SRC6` to their range; otherwise runners may reach IPv6 LAN
+   addresses. The sidecar warns when the host forwards IPv6 and `FENCE_SRC6` is empty.
+6. If the rules are deleted while jobs run (a firewall reload, `nft flush ruleset`), the sidecar notices within its interval
+   (3 seconds) and puts them back; `runner_fence_reapplied_total` counts it. The guard logs `GATE WITHDRAWN` once and counts
+   `gate_withdrawn_total`. Alert on both. Set `gate_loss: stop` in the guard config to remove running slots instead of only warning.
+   Note `nft flush ruleset` and `iptables-restore` of a whole ruleset delete our table too; the sidecar restores it.
 
 ## Memory and disk
 

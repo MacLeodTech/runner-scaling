@@ -4,6 +4,7 @@
 //	runner-scaling guard  --config guard.yaml   holds the Docker socket; builds containers only from its config
 //	runner-scaling docker-policy --config ...  optional: sits between the guard and the Docker socket and refuses any
 //	                                            Docker call that is not exactly one the guard's config produces
+//	runner-scaling firewall --src ...           fences the runner networks (nftables) and keeps the gate file while it holds
 //	runner-scaling scaler                       talks to GitHub; asks the guard for slots over a unix socket
 //	runner-scaling health --socket ...          exits 0 if the guard answers (for container healthchecks)
 package main
@@ -16,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 	"github.com/actions/scaleset/listener"
 
 	"github.com/MacLeodTech/runner-scaling/internal/dashboard"
+	"github.com/MacLeodTech/runner-scaling/internal/fence"
 	"github.com/MacLeodTech/runner-scaling/internal/ghapi"
 	"github.com/MacLeodTech/runner-scaling/internal/guard"
 	"github.com/MacLeodTech/runner-scaling/internal/scaler"
@@ -51,6 +54,8 @@ func main() {
 		err = runGuard(ctx, log, os.Args[2:])
 	case "docker-policy":
 		err = runDockerPolicy(ctx, log, os.Args[2:])
+	case "firewall":
+		err = runFirewall(ctx, log, os.Args[2:])
 	case "scaler":
 		err = runScaler(ctx, log, os.Args[2:])
 	case "health":
@@ -67,7 +72,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: runner-scaling guard|scaler|health|version [flags]")
+	fmt.Fprintln(os.Stderr, "usage: runner-scaling guard|docker-policy|scaler|firewall|health|version [flags]")
 	os.Exit(2)
 }
 
@@ -561,4 +566,83 @@ func dashboardPeers() []dashboard.Peer {
 		}
 	}
 	return out
+}
+
+// runFirewall keeps the runner networks fenced off private address space: an nftables table of its own, read back
+// every few seconds and re-applied if anything changed it, and a gate file the guards wait for.
+func runFirewall(ctx context.Context, log *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("firewall", flag.ExitOnError)
+	src := fs.String("src", env("FENCE_SRC", ""), "comma-separated IPv4 runner networks to fence (must contain every guard's subnet), e.g. 172.30.0.0/16")
+	src6 := fs.String("src6", env("FENCE_SRC6", ""), "comma-separated IPv6 runner networks to fence (only if you enabled IPv6 on them)")
+	also := fs.String("also-block", env("FENCE_ALSO_BLOCK", ""), "extra destination networks to block, IPv4 and IPv6, beyond the built-in private/reserved ranges")
+	gate := fs.String("gate", env("GATE", "/gate/firewall-ok"), "file present only while the fence is verified in place (guards' require_file)")
+	every := fs.Duration("interval", 3*time.Second, "how often the kernel's ruleset is read back")
+	metrics := fs.String("metrics", env("FENCE_METRICS", ""), "serve Prometheus metrics on this address, e.g. 127.0.0.1:9102 (host network: pick a port you own)")
+	remove := fs.Bool("remove", false, "delete the fence table and exit")
+	check := fs.Bool("check", false, "verify the installed fence against these flags and exit 0 if it is in place")
+	fs.Parse(args)
+
+	if *remove {
+		return fence.Remove()
+	}
+	spec := fence.Spec{}
+	var err error
+	if spec.Src4, err = prefixes(*src, true); err != nil {
+		return err
+	}
+	if spec.Src6, err = prefixes(*src6, false); err != nil {
+		return err
+	}
+	if extra, err := prefixes(*also, true); err != nil {
+		return err
+	} else if len(extra) > 0 {
+		spec.Block4 = append(append(spec.Block4, fence.DefaultBlock4...), extra...)
+	}
+	if extra, err := prefixes(*also, false); err != nil {
+		return err
+	} else if len(extra) > 0 {
+		spec.Block6 = append(append(spec.Block6, fence.DefaultBlock6...), extra...)
+	}
+	if err := spec.Normalize(); err != nil {
+		return err
+	}
+	if *check {
+		st, err := spec.Verify()
+		if err != nil {
+			return err
+		}
+		if !st.OK {
+			return errors.New(st.Problem)
+		}
+		fmt.Println("fence in place")
+		return nil
+	}
+	r := &fence.Runner{Spec: spec, Gate: *gate, Interval: *every, Log: log}
+	if *metrics != "" {
+		go func() {
+			if err := r.Metrics(ctx, *metrics); err != nil {
+				log.Error("metrics", "err", err)
+			}
+		}()
+	}
+	log.Info("firewall starting", "src", *src, "src6", *src6, "gate", *gate, "interval", every.String(), "version", version)
+	return r.Run(ctx)
+}
+
+// prefixes parses a comma-separated list of networks, keeping only the IPv4 (v4=true) or IPv6 ones.
+func prefixes(s string, v4 bool) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", f, err)
+		}
+		if p.Addr().Is4() == v4 {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }

@@ -506,6 +506,42 @@ func TestGateWithdrawnIsCountedOnceAndRunnersSurvive(t *testing.T) {
 	}
 }
 
+func TestGateLossStopRemovesRunningSlotsAfterGrace(t *testing.T) {
+	g, f := newGuard(t)
+	ctx := context.Background()
+	g.cfg.RequireFile = filepath.Join(t.TempDir(), "firewall-ok")
+	g.cfg.GateLoss = "stop"
+	grace := Duration{Duration: time.Hour}
+	g.cfg.GateGrace = &grace
+	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
+	if err := g.Start(ctx, 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(g.cfg.RequireFile)
+	g.Reap(ctx)
+	if f.containers["ci-runner-1"] == nil {
+		t.Fatal("slot removed inside the grace period")
+	}
+	grace.Duration = 0 // grace over
+	g.Reap(ctx)
+	if f.containers["ci-runner-1"] != nil || f.containers["ci-dind-1"] != nil {
+		t.Fatal("running slot survived a lost gate with gate_loss: stop")
+	}
+	if n := g.Counters()[CounterReapedPrefix+"gate_lost_total"]; n != 1 {
+		t.Fatalf("gate_lost reaps = %d", n)
+	}
+}
+
+func TestGateLossConfigValidation(t *testing.T) {
+	for _, bad := range []string{"gate_loss: kill\n", "gate_loss: stop\n"} { // unknown mode; stop without require_file
+		p := filepath.Join(t.TempDir(), "guard.yaml")
+		os.WriteFile(p, []byte(bad+testConfig), 0o600)
+		if _, err := LoadConfig(p); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
 func TestConfigExpandsBracedEnvOnly(t *testing.T) {
 	t.Setenv("RS_TEST_DIR", "/big")
 	cfg := strings.Replace(testConfig, `"/srv/runners/{slot}/cache:/cache"`, `"${RS_TEST_DIR}/{slot}/cache:/cache"`, 1)

@@ -57,6 +57,7 @@ type Guard struct {
 	cpuPrev    map[string]cpuSample // container id -> last CPU reading, for the dashboard's CPU %
 	overMem    int                  // consecutive reap ticks over memory_budget; only touched by Reap
 	gateDown   bool                 // require_file was missing at the last reap tick; only touched by Reap
+	gateSince  time.Time            // when it went missing; only touched by Reap
 	nameRE     *regexp.Regexp
 	count      counters
 	hostAvail  func() (int64, error) // the host's available memory; a test seam, /proc/meminfo in production
@@ -929,7 +930,7 @@ func (g *Guard) Reap(ctx context.Context) {
 			starts = nil
 		}
 	}
-	g.watchGate(slots)
+	gateLost := g.watchGate(slots)
 	reaped := map[int]bool{}
 	var wg sync.WaitGroup // teardowns can take minutes (prune, wipes): run them side by side, not one after another
 	for _, s := range slots {
@@ -939,10 +940,14 @@ func (g *Guard) Reap(ctx context.Context) {
 		reason := "runner_exited"
 		if s.RunnerState == "running" || s.RunnerState == "created" || s.RunnerState == "restarting" {
 			t, ok := starts[s.Slot]
-			if g.cfg.MaxRuntime.Duration <= 0 || !ok || time.Since(t) <= g.cfg.MaxRuntime.Duration {
+			switch {
+			case gateLost:
+				reason = "gate_lost"
+			case g.cfg.MaxRuntime.Duration <= 0 || !ok || time.Since(t) <= g.cfg.MaxRuntime.Duration:
 				continue
+			default:
+				reason = "max_runtime"
 			}
-			reason = "max_runtime"
 		}
 		if g.claim(s.Slot) {
 			g.log.Info("reaping slot", "slot", s.Slot, "runner", s.RunnerName, "runner_state", s.RunnerState, "reason", reason)
@@ -963,25 +968,41 @@ func (g *Guard) Reap(ctx context.Context) {
 // watchGate notices when require_file disappears while slots are running. The gate only stops new slots from
 // starting; a runner that is already up keeps running, and may be unfenced if the rules that the file vouches for
 // were flushed. The guard cannot repair that (it has no network and no firewall), so it makes it loud: one ERROR
-// line and one count per outage, and an INFO line when the file is back. Never touches a running job.
-func (g *Guard) watchGate(slots []api.Slot) {
+// line and one count per outage, and an INFO line when the file is back. It touches a running job only with
+// gate_loss: stop, once the file has been gone for gate_grace; it then returns true and Reap removes the running slots.
+func (g *Guard) watchGate(slots []api.Slot) (stop bool) {
 	if g.cfg.RequireFile == "" {
-		return
+		return false
 	}
 	if _, err := os.Stat(g.cfg.RequireFile); err == nil {
 		if g.gateDown {
 			g.gateDown = false
 			g.log.Info("gate restored", "file", g.cfg.RequireFile)
 		}
-		return
+		return false
 	}
-	if g.gateDown {
-		return
+	if !g.gateDown {
+		g.gateDown = true
+		g.gateSince = time.Now()
+		g.count.add(CounterGateWithdrawn)
+		g.log.Error("GATE WITHDRAWN: require_file is gone, new slots are refused and running slots may be unfenced",
+			"file", g.cfg.RequireFile, "running_slots", len(slots), "gate_loss", g.gateLossMode())
 	}
-	g.gateDown = true
-	g.count.add(CounterGateWithdrawn)
-	g.log.Error("GATE WITHDRAWN: require_file is gone, new slots are refused and running slots may be unfenced",
-		"file", g.cfg.RequireFile, "running_slots", len(slots))
+	if g.cfg.GateLoss != "stop" || len(slots) == 0 {
+		return false
+	}
+	grace := 10 * time.Second
+	if g.cfg.GateGrace != nil {
+		grace = g.cfg.GateGrace.Duration
+	}
+	return time.Since(g.gateSince) >= grace
+}
+
+func (g *Guard) gateLossMode() string {
+	if g.cfg.GateLoss == "stop" {
+		return "stop"
+	}
+	return "warn"
 }
 
 // ReapLoop runs Reap until ctx ends.

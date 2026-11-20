@@ -63,7 +63,7 @@ org see the [README](../README.md#without-an-organization-repo-level-scale-set))
 | Docker Engine 25 or newer | the guard speaks Engine API v1.44 | `docker version --format '{{.Server.Version}} (api {{.Server.APIVersion}})'` | API `1.44` or higher |
 | Docker Compose v2 | runs the stack | `docker compose version` | `v2.x` or newer |
 | A normal (rootful) Docker | the guard needs the real socket; rootless Docker is untested | `docker info --format '{{.SecurityOptions}}'` | does **not** list `rootless` |
-| `iptables` working in the kernel | the firewall sidecar fences the runners | `sudo iptables -L -n \| head -3` | prints chains, no error |
+| `nf_tables` in the kernel | the firewall sidecar fences the runners | `sudo nft list tables` (or `sudo iptables -L -n \| head -3`) | no error |
 | cgroup v2 (recommended) | only `memory_high` needs it; the memory budget works on v1 | `stat -fc %T /sys/fs/cgroup` | `cgroup2fs` |
 | Correct clock | the GitHub App signs short-lived tokens; a skewed clock is rejected | `timedatectl \| grep synchronized` | `System clock synchronized: yes` |
 | Outbound HTTPS (443) | the scaler and runners reach GitHub and GHCR | `curl -sI https://api.github.com \| head -1` and `curl -sI https://ghcr.io \| head -1` | an `HTTP` status line |
@@ -142,7 +142,6 @@ the Client ID and installation ID for the next step.
 |---|---|---|
 | `compose.lite.yaml` | `compose.yaml` | the firewall, docker-policy, guard and scaler containers |
 | `guard-lite.yaml` | `guard-lite.yaml` | **the one config that decides what a runner is** |
-| `firewall.sh` | `firewall.sh` | the firewall sidecar's script |
 | `env.example` | `.env` | your GitHub App identifiers and the Docker socket's group id |
 
 Then edit:

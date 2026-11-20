@@ -226,27 +226,37 @@ GitHub API requires, and report what differs.
 A job can talk to anything its network can reach. With the default Docker bridge setup that includes your LAN, the
 host's own services and the other slots. The fence closes that: runner networks reach the internet and nothing else.
 
-[examples/firewall.sh](examples/firewall.sh) is a small sidecar that does it with `iptables` and is wired into
+`runner-scaling firewall` is a small sidecar (the same image, no extra binary) that does it with **nftables** and is wired into
 [examples/compose.yaml](examples/compose.yaml):
 
-- **Rules.** A chain `GH_RUNNERS` is hooked into `DOCKER-USER` (traffic the runners send through the host) and
-  `INPUT` (traffic aimed at the host itself). Traffic from the fenced range to private and link-local addresses
-  (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`) is dropped, and the rest goes through to Docker's
-  normal handling. Replies to connections the host opened still work.
+- **Rules.** Its own table, `inet gh_runners`, with a `forward` chain (traffic the runners send through the host) and an
+  `input` chain (traffic aimed at the host itself), both at priority -5, ahead of Docker's, `ufw`'s and `firewalld`'s default
+  chains. Traffic from the fenced range to private, link-local, shared (CGNAT), loopback, multicast, reserved and benchmarking
+  addresses is dropped (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `127/8`, `0/8`, `192.0.0.0/24`,
+  `198.18/15`, `224/4`, `240/4`), and the rest goes through to Docker's normal handling. Replies to connections the host
+  opened still work. The table is separate from everyone else's, so a firewall reload, `ufw`, `firewalld` or `iptables -F`
+  does not touch it.
+- **IPv4 and IPv6.** One `inet` table covers both. IPv6 is fenced when you give the runner networks IPv6 and list them in
+  `FENCE_SRC6` (then `fc00::/7`, `fe80::/10`, `ff00::/8`, `::1`, IPv4-mapped and the NAT64 prefix are dropped). The guard creates
+  IPv4-only networks, so by default there is nothing to fence; the sidecar logs a warning if the host forwards IPv6 and no
+  IPv6 range is listed.
 - **Range.** `FENCE_SRC` (default `172.30.0.0/16`) must contain every guard's `subnet`. This is why `subnet` has a
   fixed value: with `subnet` empty Docker picks ranges the fence can't know about.
-- **Gate.** After the rules are in place the script creates a file (`/gate/firewall-ok`, on a tmpfs volume).
+- **Gate.** Once the rules are verified the sidecar creates a file (`/gate/firewall-ok`, on a tmpfs volume).
   Set `require_file` to it in every guard: no slot starts without it, so a reboot can't start an unfenced runner
   before the rules are back.
-- **Upkeep.** Every 30 seconds it re-checks the rules and re-applies any that are missing. If it can't, it removes the
-  gate, so no new slot starts. Runners that are already running stay unfenced until the rules return (up to 30
-  seconds after something flushes them). The guard watches the gate file too: when it vanishes while the guard is
-  running it logs one `GATE WITHDRAWN` error and counts `gate_withdrawn_total` (see Metrics), so you hear about the
-  gap. It doesn't kill running jobs over it.
-- **Limits.** It needs host networking, `NET_ADMIN` and an `iptables` binary. It hooks the `DOCKER-USER` chain. Under
-  Docker's nftables backend that chain doesn't exist, so it hooks `FORWARD` instead (Docker's rules are in a separate
-  table, so a drop there still applies). The fallback is tested on the iptables-nft variant only; check it on your
-  Docker version with the `curl` test below.
+- **Upkeep.** Every 3 seconds it reads the kernel's ruleset back (the table, both chains' hook, priority and policy, and every
+  rule in order) and compares it with what it expects. Anything different is replaced in one atomic transaction (there is no
+  moment without rules), and the gate is withdrawn while it is in doubt. So the unfenced window after something deletes the
+  rules is at most the interval, not 30 seconds. The guard watches the gate too: it logs one `GATE WITHDRAWN` error and
+  counts `gate_withdrawn_total`. With `gate_loss: stop` in the guard config it also **removes running slots** after
+  `gate_grace` (default 10s) of no gate, so nothing keeps running unfenced; the default `warn` leaves jobs alone.
+- **Metrics.** `FENCE_METRICS=127.0.0.1:9102` serves `runner_fence_ok`, `runner_fence_reapplied_total`,
+  `runner_fence_apply_failures_total` and `runner_fence_dropped_packets{chain}` for Prometheus. A rising `reapplied` means
+  something keeps changing your rules: find it.
+- **Limits.** It needs host networking and `NET_ADMIN` (root in the container, with every other capability dropped) and a
+  kernel with nf_tables. Hosts that only have legacy iptables can use [examples/firewall-iptables.sh](examples/firewall-iptables.sh).
+  It cannot stop a job sending data to the internet.
 
 Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` should time out, and
 `curl https://github.com` should work.

@@ -61,15 +61,16 @@ services:
   # Fences the runner networks and creates /gate/firewall-ok, which both guards wait for (require_file).
   firewall:
     <<: *hardened
-    image: docker:28-dind       # pin a digest; only used for its iptables
+    image: ghcr.io/macleodtech/runner-scaling:0.11   # same image; `firewall` is one of its roles (pin a digest)
     network_mode: host
-    cap_add: [NET_ADMIN, NET_RAW]
-    entrypoint: [/bin/sh, /fw/firewall.sh]
-    tmpfs: [/run]               # iptables' lock file
+    user: "0:0"                 # root, but with every capability dropped except the one netlink needs
+    cap_add: [NET_ADMIN]
+    command: [firewall]
     environment:
       FENCE_SRC: 172.30.0.0/16  # must contain every guard's `subnet` range
+      # FENCE_SRC6: fd00:a::/48 # only if you gave the runner networks IPv6 (the guard does not by default)
+      # FENCE_METRICS: 127.0.0.1:9102   # Prometheus: runner_fence_ok, runner_fence_reapplied_total, ...
     volumes:
-      - ./firewall.sh:/fw/firewall.sh:ro
       - gate:/gate
     mem_limit: 32m
     pids_limit: 32

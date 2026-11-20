@@ -3,7 +3,6 @@
 #
 #   compose.lite.yaml   (this file, copied as compose.yaml if you like)
 #   guard-lite.yaml     edit github_url (and later tenant_url)
-#   firewall.sh
 #   .env                GITHUB_APP_CLIENT_ID, GITHUB_APP_INSTALLATION_ID and DOCKER_GID (see env.example)
 #   secrets/github_app.pem   the App's private key, owned by uid 65532, mode 0400 (see QUICKSTART, step 3)
 #
@@ -30,15 +29,16 @@ services:
   # The guard starts no slot until that file exists.
   firewall:
     <<: *hardened
-    image: docker:28-dind       # only used for its iptables; pin a digest once it works
+    image: ghcr.io/macleodtech/runner-scaling:0.11   # same image; `firewall` is one of its roles (pin a digest)
     network_mode: host
-    cap_add: [NET_ADMIN, NET_RAW]
-    entrypoint: [/bin/sh, /fw/firewall.sh]
-    tmpfs: [/run]
+    user: "0:0"                 # root, but with every capability dropped except the one netlink needs
+    cap_add: [NET_ADMIN]
+    command: [firewall]
     environment:
       FENCE_SRC: 172.30.0.0/16  # must contain every guard's `subnet` range
+      # FENCE_SRC6: fd00:a::/48 # only if you gave the runner networks IPv6 (the guard does not by default)
+      # FENCE_METRICS: 127.0.0.1:9102   # Prometheus: runner_fence_ok, runner_fence_reapplied_total, ...
     volumes:
-      - ./firewall.sh:/fw/firewall.sh:ro
       - gate:/gate
     mem_limit: 32m
     pids_limit: 32

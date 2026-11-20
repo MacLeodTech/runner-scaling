@@ -11,8 +11,9 @@ github_url: https://github.com/YOUR-ORG          # or https://github.com/OWNER/R
 
 prefix: ci                    # names containers ci-runner-N, ci-dind-N, networks ci-slot-N, runners ci-N-xxxxxx
 max_slots: 2
-subnet: 172.30.{slot}.0/24    # fixed per-slot subnets, so the host firewall (firewall.sh) can fence them
-require_file: /gate/firewall-ok   # the guard starts no slot until firewall.sh has put the fence up; drop it if you run no fence
+subnet: 172.30.{slot}.0/24    # fixed per-slot subnets, so the host firewall (`runner-scaling firewall`) can fence them
+require_file: /gate/firewall-ok   # the guard starts no slot until the firewall has put the fence up; drop it if you run no fence
+# gate_loss: stop   # also remove RUNNING slots if the gate is gone for gate_grace (default 10s); default "warn" only logs
 module_blocklist: [dummy, ifb, nlmon, bonding, team, geneve, bareudp, gtp, amt, netdevsim, macsec, ipvlan, vxlan]  # optional: stop jobs from making the host kernel load these modules (README, "Kernel module autoload"); only list modules your host never uses
 max_runtime: 6h             # optional: the reaper removes a runner that has run longer than this (min 1m, default off)
 memory_budget: 8G           # optional: cap on the memory working set of ALL runner-scaling containers on this host.

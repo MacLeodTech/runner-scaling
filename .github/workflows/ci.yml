@@ -26,6 +26,10 @@ jobs:
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+      - name: Fence tests against the real kernel (own network namespace, never the runner's)
+        run: |
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/fence.test" ./internal/fence
+          docker run --rm --cap-add NET_ADMIN -v "$RUNNER_TEMP/fence.test:/t:ro" -e FENCE_TEST=1 alpine:3 /t -test.v
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 && govulncheck ./...
 
   image:
