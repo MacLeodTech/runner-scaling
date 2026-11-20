@@ -24,7 +24,21 @@ type Guard interface {
 }
 
 // GuardClient talks to the guard over its unix socket.
-type GuardClient struct{ c *http.Client }
+type GuardClient struct {
+	c    *http.Client
+	base string // "" for the socket root, or /v1/pools/<name> for one pool
+}
+
+// Pool returns a client for one pool of a multi-pool guard; it shares the connection.
+func (g *GuardClient) Pool(name string) *GuardClient {
+	return &GuardClient{c: g.c, base: "/v1/pools/" + name}
+}
+
+// Pools lists the pools the guard runs, with their labels.
+func (g *GuardClient) Pools(ctx context.Context) ([]api.Info, error) {
+	var out []api.Info
+	return out, g.do(ctx, http.MethodGet, "/v1/pools", nil, &out, http.StatusOK)
+}
 
 func NewGuardClient(socket string) *GuardClient {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -53,7 +67,7 @@ func (g *GuardClient) do(ctx context.Context, method, path string, body, out any
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, "http://guard"+path, rd)
+	req, err := http.NewRequestWithContext(ctx, method, "http://guard"+g.base+path, rd)
 	if err != nil {
 		return err
 	}

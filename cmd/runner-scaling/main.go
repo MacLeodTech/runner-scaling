@@ -32,6 +32,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 
+	"github.com/MacLeodTech/runner-scaling/internal/api"
 	"github.com/MacLeodTech/runner-scaling/internal/dashboard"
 	"github.com/MacLeodTech/runner-scaling/internal/fence"
 	"github.com/MacLeodTech/runner-scaling/internal/ghapi"
@@ -117,37 +118,28 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	check := fs.Bool("check", false, "validate the config and exit")
 	fs.Parse(args)
 
-	cfg, err := guard.LoadConfig(*cfgPath)
+	cfgs, err := guard.LoadConfigs(*cfgPath)
 	if err != nil {
 		return err
 	}
 	if *check {
-		fmt.Printf("%s: ok (prefix %s, %d slots, tenant pinned: %v)\n", *cfgPath, cfg.Prefix, cfg.MaxSlots, cfg.TenantURL != "")
+		for _, c := range cfgs {
+			fmt.Printf("%s: ok (pool %s, prefix %s, %d slots, tenant pinned: %v)\n", *cfgPath, c.Key(), c.Prefix, c.MaxSlots, c.TenantURL != "")
+		}
 		return nil
 	}
-	g := guard.New(cfg, guard.NewSocketDocker(*dockerSock), log)
-
-	pctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-	err = g.EnsureImages(pctx)
-	cancel()
-	if err != nil {
+	pools := guard.NewPools(cfgs, guard.NewSocketDocker(*dockerSock), log)
+	if err := pools.Setup(ctx); err != nil {
 		return err
 	}
-	wctx, wcancel := context.WithTimeout(ctx, 15*time.Minute)
-	g.WipeStale(wctx)
-	wcancel()
-	mctx, mcancel := context.WithTimeout(ctx, 2*time.Minute)
-	_ = g.ApplyModuleBlocklist(mctx) // logs and counts its own failure; the pool still runs without it
-	mcancel()
-	go g.ReapLoop(ctx)
 
 	ln, err := listenUnix(*socket, *mode, *gid)
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: g.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
+	srv := &http.Server{Handler: pools.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
 	go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
-	log.Info("guard listening", "socket", *socket, "prefix", cfg.Prefix, "max_slots", cfg.MaxSlots, "version", version)
+	log.Info("guard listening", "socket", *socket, "pools", pools.Keys(), "version", version)
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -191,12 +183,14 @@ func runDockerPolicy(ctx context.Context, log *slog.Logger, args []string) error
 	check := fs.Bool("check", false, "validate the config and exit")
 	fs.Parse(args)
 
-	cfg, err := guard.LoadConfig(*cfgPath)
+	cfgs, err := guard.LoadConfigs(*cfgPath)
 	if err != nil {
 		return err
 	}
 	if *check {
-		fmt.Printf("%s: ok (policy for prefix %s, %d slots)\n", *cfgPath, cfg.Prefix, cfg.MaxSlots)
+		for _, c := range cfgs {
+			fmt.Printf("%s: ok (policy for pool %s, prefix %s, %d slots)\n", *cfgPath, c.Key(), c.Prefix, c.MaxSlots)
+		}
 		return nil
 	}
 	ln, err := listenUnix(*listen, *mode, *gid)
@@ -204,10 +198,10 @@ func runDockerPolicy(ctx context.Context, log *slog.Logger, args []string) error
 		return err
 	}
 	srv := &http.Server{
-		Handler: guard.NewProxy(cfg, *dockerSock, log), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second,
+		Handler: guard.NewProxy(cfgs, *dockerSock, log), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second,
 	}
 	go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
-	log.Info("docker policy listening", "socket", *listen, "docker", *dockerSock, "prefix", cfg.Prefix, "version", version)
+	log.Info("docker policy listening", "socket", *listen, "docker", *dockerSock, "pools", len(cfgs), "version", version)
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -224,95 +218,121 @@ func runHealth(args []string) error {
 	if *policy != "" {
 		return guard.PingDocker(ctx, *policy)
 	}
-	_, err := scaler.NewGuardClient(*socket).Info(ctx)
+	pools, err := scaler.NewGuardClient(*socket).Pools(ctx)
+	if err == nil && len(pools) == 0 {
+		err = errors.New("guard runs no pools")
+	}
 	return err
 }
 
 func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("scaler", flag.ExitOnError)
 	socket := fs.String("socket", env("GUARD_SOCKET", defaultSocket), "guard API socket")
-	name := fs.String("name", env("SCALE_SET_NAME", ""), "scale set name (default: the guard's prefix)")
-	labels := fs.String("labels", env("SCALE_SET_LABELS", ""), "comma-separated labels workflows target (default: the name)")
+	name := fs.String("name", env("SCALE_SET_NAME", ""), "scale set name (single-pool guard only; default: the pool's prefix)")
+	labels := fs.String("labels", env("SCALE_SET_LABELS", ""), "comma-separated labels (single-pool guard only; default: the pool's labels, else the name)")
 	group := fs.String("runner-group", env("RUNNER_GROUP", scaleset.DefaultRunnerGroup), "runner group")
-	minR := fs.Int("min-runners", atoi(env("MIN_RUNNERS", "0")), "runners kept warm")
-	maxR := fs.Int("max-runners", atoi(env("MAX_RUNNERS", "0")), "runner limit (default and ceiling: the guard's max_slots)")
-	del := fs.Bool("delete-scale-set", false, "delete the scale set from GitHub and exit (stop the guard's runners first)")
+	minR := fs.Int("min-runners", atoi(env("MIN_RUNNERS", "0")), "runners kept warm per pool")
+	maxR := fs.Int("max-runners", atoi(env("MAX_RUNNERS", "0")), "runner limit per pool (default and ceiling: the pool's max_slots)")
+	del := fs.Bool("delete-scale-set", false, "delete the scale sets from GitHub and exit (stop the guard's runners first)")
 	fs.Parse(args)
 
 	gc := scaler.NewGuardClient(*socket)
-	var info, err = gc.Info(ctx)
-	for err != nil { // the guard may still be pulling images
+	infos, err := gc.Pools(ctx)
+	for err != nil || len(infos) == 0 { // the guard may still be pulling images
 		log.Info("waiting for guard", "err", err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(5 * time.Second):
 		}
-		info, err = gc.Info(ctx)
+		infos, err = gc.Pools(ctx)
 	}
-	if *name == "" {
-		*name = info.Prefix
-	}
-	if *maxR <= 0 || *maxR > info.MaxSlots {
-		*maxR = info.MaxSlots
-	}
-	if *minR < 0 || *minR > *maxR {
-		return fmt.Errorf("min-runners must be 0..%d", *maxR)
+	if len(infos) > 1 && (*name != "" || *labels != "") {
+		return errors.New("--name and --labels (SCALE_SET_NAME, SCALE_SET_LABELS) only apply to a guard with one pool: set `labels:` per pool in guard.yaml")
 	}
 
-	gh, err := githubClient(info.GitHubURL)
-	if err != nil {
-		return err
+	type pool struct {
+		info     api.Info
+		gc       *scaler.GuardClient
+		gh       *scaleset.Client
+		name     string
+		labels   []string
+		min, max int
+		s        *scaler.Scaler
 	}
-	if *del {
-		return deleteScaleSet(ctx, log, gh, *name, *group)
-	}
-	ss, err := ensureScaleSet(ctx, gh, *name, *group, splitLabels(*labels, *name))
-	if err != nil {
-		return err
-	}
-	gh.SetSystemInfo(systemInfo(ss.ID))
-	var got []string
-	for _, l := range ss.Labels {
-		got = append(got, l.Name)
-	}
-	log.Info("scale set ready", "name", ss.Name, "id", ss.ID, "labels", got, "min", *minR, "max", *maxR)
-
-	host, _ := os.Hostname()
-	var session *scaleset.MessageSessionClient
-	for {
-		session, err = gh.MessageSessionClient(ctx, ss.ID, info.Prefix+"-"+host)
-		if err == nil {
-			break
+	var pools []*pool
+	for _, info := range infos {
+		p := &pool{info: info, gc: gc.Pool(info.Name), name: *name, min: *minR, max: *maxR}
+		if p.name == "" {
+			p.name = info.Prefix
 		}
-		if !errors.Is(err, scaleset.ConflictError) {
+		if len(infos) == 1 {
+			p.labels = splitLabels(*labels, p.name)
+			if *labels == "" && len(info.Labels) > 0 {
+				p.labels = info.Labels
+			}
+		} else {
+			p.labels = info.Labels
+			if len(p.labels) == 0 {
+				p.labels = []string{info.Name}
+			}
+		}
+		if p.max <= 0 || p.max > info.MaxSlots {
+			p.max = info.MaxSlots
+		}
+		if p.min < 0 || p.min > p.max {
+			return fmt.Errorf("pool %s: min-runners must be 0..%d", info.Name, p.max)
+		}
+		if p.gh, err = githubClient(info.GitHubURL); err != nil {
 			return err
 		}
-		// A previous scaler's session hasn't expired yet.
-		log.Info("another session is open for this scale set; retrying in 30s")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(30 * time.Second):
+		pools = append(pools, p)
+	}
+	if *del {
+		for _, p := range pools {
+			if err := deleteScaleSet(ctx, log, p.gh, p.name, *group); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(pools) == 1 {
+		pools[0].gc = gc // a single-pool guard still answers on the unprefixed paths
+	}
+
+	for _, p := range pools {
+		ss, err := ensureScaleSet(ctx, p.gh, p.name, *group, p.labels)
+		if err != nil {
+			return fmt.Errorf("pool %s: %w", p.info.Name, err)
+		}
+		p.gh.SetSystemInfo(systemInfo(ss.ID))
+		var got []string
+		for _, l := range ss.Labels {
+			got = append(got, l.Name)
+		}
+		log.Info("scale set ready", "pool", p.info.Name, "name", ss.Name, "id", ss.ID, "labels", got, "min", p.min, "max", p.max)
+		p.s = &scaler.Scaler{
+			Log: log.With("pool", p.info.Name), Guard: p.gc, GitHub: p.gh, ScaleSetID: ss.ID, Info: p.info, Min: p.min, Max: p.max,
+			TrustedRefs: trustedRefs(),
 		}
 	}
-	defer session.Close(context.WithoutCancel(ctx))
 
-	l, err := listener.New(session, listener.Config{ScaleSetID: ss.ID, MaxRunners: *maxR, Logger: log.WithGroup("listener")})
-	if err != nil {
-		return err
-	}
-	s := &scaler.Scaler{
-		Log: log, Guard: gc, GitHub: gh, Session: session, ScaleSetID: ss.ID, Info: info, Min: *minR, Max: *maxR,
-		TrustedRefs: trustedRefs(),
-	}
 	if addr := env("DASHBOARD_ADDR", ""); addr != "" {
 		token, err := secret("DASHBOARD_TOKEN")
 		if err != nil {
 			return err
 		}
-		s.Dash = dashboard.NewTracker()
-		dash := &dashboard.Server{Name: ss.Name, Version: version, Info: info, Guard: gc, Tracker: s.Dash, Token: token, Peers: dashboardPeers()}
+		var servers []*dashboard.Server
+		for i, p := range pools {
+			p.s.Dash = dashboard.NewTracker()
+			d := &dashboard.Server{Name: p.name, Version: version, Info: p.info, Guard: p.gc, Tracker: p.s.Dash, Token: token}
+			if i == 0 {
+				d.Peers = dashboardPeers()
+			}
+			servers = append(servers, d)
+		}
+		dash := servers[0]
+		dash.Locals = servers[1:]
 		if uf := env("DASHBOARD_USERS_FILE", ""); uf != "" { // opt-in accounts: login for browsers, the token stays for machines
 			accts, fresh, err := dashboard.OpenAccounts(uf)
 			if err != nil {
@@ -346,10 +366,12 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 			if err != nil || stall <= 0 {
 				return fmt.Errorf("DASHBOARD_STALL_AFTER: want a duration like 10m, got %q", env("DASHBOARD_STALL_AFTER", ""))
 			}
-			en := &dashboard.Enricher{Src: gh, Tracker: s.Dash, Every: poll, FailureLogs: env("DASHBOARD_FAILURE_LOGS", "off") == "on", Log: log.WithGroup("github")}
-			dash.GitHub, dash.StallAfter = en, stall
-			go en.Loop(ctx)
-			log.Info("job detail from GitHub", "poll", poll, "stall_after", stall, "failure_logs", en.FailureLogs)
+			for _, d := range servers { // one poller per pool: each follows its own tracker
+				en := &dashboard.Enricher{Src: gh, Tracker: d.Tracker, Every: poll, FailureLogs: env("DASHBOARD_FAILURE_LOGS", "off") == "on", Log: log.WithGroup("github")}
+				d.GitHub, d.StallAfter = en, stall
+				go en.Loop(ctx)
+			}
+			log.Info("job detail from GitHub", "poll", poll, "stall_after", stall, "failure_logs", env("DASHBOARD_FAILURE_LOGS", "off") == "on")
 		}
 		ds := &http.Server{Addr: addr, ReadHeaderTimeout: 10 * time.Second, Handler: dash.Handler()}
 		go func() {
@@ -361,6 +383,49 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 		log.Info("dashboard listening", "addr", addr, "token", token != "")
 	}
 	// Deliberately no scale set deletion on exit: queued jobs keep waiting for it while the scaler restarts.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errc := make(chan error, len(pools))
+	for _, p := range pools {
+		go func() { errc <- runPool(ctx, log, p.gh, p.s, p.info, p.max) }()
+	}
+	var first error
+	for range pools {
+		if err := <-errc; err != nil && first == nil && !errors.Is(err, context.Canceled) {
+			first = err
+		}
+		cancel() // one pool stopping stops them all: the supervisor restarts the scaler as a whole
+	}
+	return first
+}
+
+// runPool opens the pool's message session and feeds its scaler until ctx ends.
+func runPool(ctx context.Context, log *slog.Logger, gh *scaleset.Client, s *scaler.Scaler, info api.Info, maxR int) error {
+	host, _ := os.Hostname()
+	var session *scaleset.MessageSessionClient
+	var err error
+	for {
+		session, err = gh.MessageSessionClient(ctx, s.ScaleSetID, info.Prefix+"-"+host)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, scaleset.ConflictError) {
+			return err
+		}
+		// A previous scaler's session hasn't expired yet.
+		log.Info("another session is open for this scale set; retrying in 30s", "pool", info.Name)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(30 * time.Second):
+		}
+	}
+	defer session.Close(context.WithoutCancel(ctx))
+	s.Session = session
+	l, err := listener.New(session, listener.Config{ScaleSetID: s.ScaleSetID, MaxRunners: maxR, Logger: log.With("pool", info.Name).WithGroup("listener")})
+	if err != nil {
+		return err
+	}
 	return l.Run(ctx, s)
 }
 

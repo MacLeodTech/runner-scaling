@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +33,11 @@ type Config struct {
 	TenantURL string `yaml:"tenant_url"`
 	// SharedHosts may appear in JIT configs with any path. Defaults to broker.actions.githubusercontent.com.
 	SharedHosts []string `yaml:"shared_hosts"`
+	// Name is the pool's name (the key under `pools:`); empty in a single-pool config. Set by the loader.
+	Name string `yaml:"-"`
+	// Labels are the scale set's labels, i.e. what a workflow puts in runs-on to reach this pool. Default: [name]
+	// (or the prefix in a single-pool config). GitHub adds self-hosted, Linux and X64 itself.
+	Labels []string `yaml:"labels"`
 	// Prefix names everything the guard creates (containers, networks, volumes) and is the start of every runner
 	// name. Lowercase letters, digits and dashes.
 	Prefix string `yaml:"prefix"`
@@ -198,6 +205,23 @@ func expandEnv(b []byte) ([]byte, error) {
 
 // LoadConfig reads and validates a config file. ${NAME} is replaced from the environment. Unknown keys are errors.
 func LoadConfig(file string) (*Config, error) {
+	cs, err := LoadConfigs(file)
+	if err != nil {
+		return nil, err
+	}
+	if len(cs) != 1 {
+		return nil, fmt.Errorf("%s defines %d pools; this caller handles one", file, len(cs))
+	}
+	return cs[0], nil
+}
+
+// LoadConfigs reads a guard config and returns one Config per pool.
+//
+// A file without `pools:` is one pool (every example before 0.12). A file with `pools:` is the shared settings at the top
+// level plus one block per pool; a key in a pool replaces the shared key of the same name (not a deep merge: a pool's
+// `runner:` is the whole runner section). Unless a pool sets its own `prefix`, it is <top prefix>-<pool name>, and its
+// labels default to its name. Everything that must not collide across pools (prefix, name, subnets, host paths) is checked.
+func LoadConfigs(file string) ([]*Config, error) {
 	raw, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
@@ -206,19 +230,173 @@ func LoadConfig(file string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", file, err)
 	}
-	dec := yaml.NewDecoder(bytes.NewReader(raw))
-	dec.KnownFields(true)
-	var c Config
-	if err := dec.Decode(&c); err != nil {
+	var top map[string]any
+	if err := yaml.Unmarshal(raw, &top); err != nil {
 		return nil, fmt.Errorf("%s: %w", file, err)
 	}
-	if err := c.Validate(); err != nil {
+	pools, multi := top["pools"]
+	var docs []namedDoc
+	if !multi {
+		docs = []namedDoc{{"", raw}}
+	} else {
+		pm, ok := pools.(map[string]any)
+		if !ok || len(pm) == 0 {
+			return nil, fmt.Errorf("%s: pools must be a map of pool name to settings, with at least one pool", file)
+		}
+		delete(top, "pools")
+		names := make([]string, 0, len(pm))
+		for n := range pm {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			if !poolNameRE.MatchString(n) {
+				return nil, fmt.Errorf("%s: pool name %q must be 1-24 lowercase letters, digits or dashes", file, n)
+			}
+			over, ok := pm[n].(map[string]any)
+			if !ok && pm[n] != nil {
+				return nil, fmt.Errorf("%s: pool %q must be a map of settings", file, n)
+			}
+			merged := map[string]any{}
+			for k, v := range top {
+				merged[k] = v
+			}
+			for k, v := range over {
+				if k == "pools" {
+					return nil, fmt.Errorf("%s: pool %q: pools cannot nest", file, n)
+				}
+				merged[k] = v
+			}
+			if _, set := over["prefix"]; !set {
+				if tp, _ := top["prefix"].(string); tp != "" {
+					merged["prefix"] = tp + "-" + n
+				} else {
+					merged["prefix"] = n
+				}
+			}
+			if _, set := merged["labels"]; !set || over["labels"] == nil && top["labels"] == nil {
+				merged["labels"] = []string{n}
+			}
+			b, err := yaml.Marshal(merged)
+			if err != nil {
+				return nil, err
+			}
+			docs = append(docs, namedDoc{n, b})
+		}
+	}
+	var out []*Config
+	for _, d := range docs {
+		dec := yaml.NewDecoder(bytes.NewReader(d.data))
+		dec.KnownFields(true)
+		var c Config
+		if err := dec.Decode(&c); err != nil {
+			return nil, fmt.Errorf("%s%s: %w", file, d.label(), err)
+		}
+		c.Name = d.name
+		if err := c.Validate(); err != nil {
+			return nil, fmt.Errorf("%s%s: %w", file, d.label(), err)
+		}
+		out = append(out, &c)
+	}
+	if err := crossCheck(out); err != nil {
 		return nil, fmt.Errorf("%s: %w", file, err)
 	}
-	for _, n := range c.Notices() {
-		fmt.Fprintf(os.Stderr, "notice: %s\n", n)
+	for _, c := range out {
+		for _, n := range c.Notices() {
+			fmt.Fprintf(os.Stderr, "notice: %s%s\n", c.poolTag(), n)
+		}
 	}
-	return &c, nil
+	return out, nil
+}
+
+type namedDoc struct {
+	name string
+	data []byte
+}
+
+func (d namedDoc) label() string {
+	if d.name == "" {
+		return ""
+	}
+	return " (pool " + d.name + ")"
+}
+
+func (c *Config) poolTag() string {
+	if c.Name == "" {
+		return ""
+	}
+	return "pool " + c.Name + ": "
+}
+
+var poolNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$`)
+
+// crossCheck rejects pools that would touch each other's containers, networks or host paths.
+func crossCheck(cs []*Config) error {
+	if len(cs) < 2 {
+		return nil
+	}
+	var errs []error
+	seenPrefix, seenLabel := map[string]string{}, map[string]string{}
+	paths := map[string]string{}
+	type sub struct {
+		pool string
+		slot int
+		p    netip.Prefix
+	}
+	var subs []sub
+	for _, c := range cs {
+		if o, dup := seenPrefix[c.Prefix]; dup {
+			errs = append(errs, fmt.Errorf("pools %s and %s share prefix %q", o, c.Name, c.Prefix))
+		}
+		seenPrefix[c.Prefix] = c.Name
+		// A prefix that is another's prefix plus "-something" would make names ambiguous only if the suffix looks like
+		// a role; the policy matches names exactly, so this is safe, but two prefixes must still differ.
+		for _, l := range c.Labels {
+			if o, dup := seenLabel[strings.ToLower(l)]; dup {
+				errs = append(errs, fmt.Errorf("pools %s and %s both carry label %q: GitHub could not tell them apart", o, c.Name, l))
+			}
+			seenLabel[strings.ToLower(l)] = c.Name
+		}
+		pats := []string{}
+		if c.WorkBind != "" {
+			pats = append(pats, c.WorkBind)
+		}
+		pats = append(pats, c.CacheDirs...)
+		for _, t := range []*Template{&c.Runner, c.Dind} {
+			if t == nil {
+				continue
+			}
+			for _, b := range t.Binds {
+				if h, _, ok := strings.Cut(b, ":"); ok && strings.Contains(h, "{slot}") {
+					pats = append(pats, h)
+				}
+			}
+		}
+		for _, pat := range pats {
+			key := c.Expand(pat, 1)
+			if o, dup := paths[key]; dup && o != c.Name {
+				errs = append(errs, fmt.Errorf("pools %s and %s use the same host path %s: a job in one could read the other's files", o, c.Name, pat))
+			}
+			paths[key] = c.Name
+		}
+		if c.Subnet != "" {
+			for n := 1; n <= c.MaxSlots; n++ {
+				if p, err := netip.ParsePrefix(c.subnetOf(n)); err == nil {
+					subs = append(subs, sub{c.Name, n, p})
+				}
+			}
+		}
+	}
+	for i := range subs {
+		for j := i + 1; j < len(subs); j++ {
+			if subs[i].p.Overlaps(subs[j].p) {
+				errs = append(errs, fmt.Errorf("subnet %s (pool %s slot %d) overlaps %s (pool %s slot %d)", subs[i].p, subs[i].pool, subs[i].slot, subs[j].p, subs[j].pool, subs[j].slot))
+				i = len(subs)
+				break
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Validate fills defaults and checks the config. The guard refuses to start on a bad config.
@@ -494,4 +672,20 @@ func (c *Config) Notices() []string {
 			c.MaxSlots, fmtBytes(limit*int64(c.MaxSlots)), fmtBytes(c.memBudget))}
 	}
 	return nil
+}
+
+// subnetOf is the network of a slot, "" if the config sets no subnet.
+func (c *Config) subnetOf(slot int) string {
+	if c.Subnet == "" {
+		return ""
+	}
+	return c.Expand(c.Subnet, slot)
+}
+
+// Key is how the pool is addressed on the socket and in logs: its name, or its prefix in a single-pool config.
+func (c *Config) Key() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return c.Prefix
 }

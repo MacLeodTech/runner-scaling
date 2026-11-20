@@ -5,10 +5,15 @@ package api
 
 // Info is GET /v1/info.
 type Info struct {
-	Prefix    string `json:"prefix"`
-	MaxSlots  int    `json:"max_slots"`
-	WorkDir   string `json:"work_dir"`
-	GitHubURL string `json:"github_url"`
+	// Name addresses the pool on the guard's socket (/v1/pools/{name}/...): the pool's name, or its prefix in a
+	// single-pool config.
+	Name string `json:"name,omitempty"`
+	// Labels are the scale set's labels from the guard's config; empty means the scaler picks (name or flags).
+	Labels    []string `json:"labels,omitempty"`
+	Prefix    string   `json:"prefix"`
+	MaxSlots  int      `json:"max_slots"`
+	WorkDir   string   `json:"work_dir"`
+	GitHubURL string   `json:"github_url"`
 	// MemoryBudget is the guard's memory_budget in bytes, 0 when none is set.
 	MemoryBudget int64 `json:"memory_budget,omitempty"`
 }

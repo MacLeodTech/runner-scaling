@@ -73,7 +73,7 @@ func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
 }
 
 func (g *Guard) Info() api.Info {
-	return api.Info{Prefix: g.cfg.Prefix, MaxSlots: g.cfg.MaxSlots, WorkDir: g.cfg.WorkDir, GitHubURL: g.cfg.GitHubURL, MemoryBudget: g.cfg.memBudget}
+	return api.Info{Name: g.cfg.Key(), Labels: g.cfg.Labels, Prefix: g.cfg.Prefix, MaxSlots: g.cfg.MaxSlots, WorkDir: g.cfg.WorkDir, GitHubURL: g.cfg.GitHubURL, MemoryBudget: g.cfg.memBudget}
 }
 
 func (g *Guard) names(slot int) (runner, dind, network, volume string) {
@@ -330,10 +330,7 @@ func (g *Guard) labels(slot int, role, runner string) map[string]string {
 
 // slotSubnet is the slot's network range, "" when Docker picks one.
 func (g *Guard) slotSubnet(slot int) string {
-	if g.cfg.Subnet == "" {
-		return ""
-	}
-	return g.cfg.Expand(g.cfg.Subnet, slot)
+	return g.cfg.subnetOf(slot)
 }
 
 // slotWork is the work_dir bind of a slot: a per-slot volume, or work_bind.
