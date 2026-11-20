@@ -11,6 +11,12 @@ every job root on the host. Read [SECURITY-POSTURE.md](SECURITY-POSTURE.md) for 
 
 ## 1. Check your host can run it
 
+> **Ubuntu 22.04 LTS.** Its `docker.io` package is Docker 24 (API 1.43), which is too old for the guard (it needs API 1.44, Docker 25
+> or newer): install `docker-ce` and the Compose plugin from [Docker's apt repository](https://docs.docker.com/engine/install/ubuntu/)
+> first, and `doctor` will say so if you did not. 22.04's kernel (5.15, or 6.x with the HWE stack), cgroup v2 and nftables are all
+> enough for the fence, and 22.04 is on Sysbox's supported list. This tool's own steps have not been run on 22.04 by the author: tell
+> us what differs.
+
 ```
 runner-scaling doctor --sysbox
 ```
@@ -61,14 +67,16 @@ fixed subnet inside the fenced range (`init` picks a free one), so a clash only 
 
 ## 3. Add the pool
 
-Use [`examples/guard-sysbox.yaml`](../examples/guard-sysbox.yaml) and the second `docker-policy` / `guard` / `scaler` trio
-from [`examples/compose.yaml`](../examples/compose.yaml) (QUICKSTART, "Add a pool that has Docker"). Its dind section
+Either set the stack up with it from the start (`runner-scaling init --pools lite,sysbox`), or add the `sysbox` block of
+[`examples/guard-pools.yaml`](../examples/guard-pools.yaml) to the `pools:` of your `guard.yaml` and run
+`docker compose restart docker-policy guard scaler` (QUICKSTART, "Add a pool that has Docker"). No new containers are needed: the
+one guard, one `docker-policy` and one scaler serve every pool. The pool's dind section
 already says `runtime: sysbox-runc` and is not privileged. The policy proxy refuses any container that deviates, so a
 config that quietly asks for `privileged: true` is the one thing to review.
 
 ## 4. Prove it works, and that it contains a job
 
-Run a job on the new pool (`runs-on: [self-hosted, ci-sysbox]`) with these steps. The last one must **fail** to touch the host:
+Run a job on the new pool (`runs-on: [self-hosted, sysbox]`) with these steps. The last one must **fail** to touch the host:
 
 ```yaml
 - run: |

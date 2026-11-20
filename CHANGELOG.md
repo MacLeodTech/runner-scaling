@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Multi-pool: one guard, one policy proxy and one scaler for any number of pools
+- `guard.yaml` can hold several pools under `pools:`: settings above it are shared, a pool's own keys replace them, the prefix
+  defaults to `<prefix>-<name>` and the labels to `self-hosted, linux, <arch>, <name>`. A file without `pools:` is one pool, as before.
+  The loader refuses pools that share a prefix, a subnet, a host path, or have no label of their own. `x-...` top-level keys are ignored (for YAML anchors).
+- The guard serves `GET /v1/pools` and each pool's API under `/v1/pools/{pool}/...` on its one socket (a guard with a single pool still answers `/v1/...`).
+  `docker-policy` loads every pool and allows a request only if one pool's policy allows it whole. The scaler asks the guard for its
+  pools and keeps one scale set per pool (named by the pool's prefix, so existing scale sets are reused); `--name` and `--labels` apply to a single-pool guard only.
+  The dashboard and `/metrics` of that one scaler cover every pool (`pool="..."` label).
+- The whole stack is four containers (firewall, docker-policy, guard, scaler) however many pools you run. `examples/compose.yaml` is that stack and
+  `examples/guard-pools.yaml` has a `lite` and a `sysbox` pool; `compose.lite.yaml`, `guard-lite.yaml` and `guard-sysbox.yaml` are gone.
+- `init --pools lite,sysbox`; `doctor` checks every pool and requires Sysbox when a pool uses it, and says what Ubuntu 22.04's `docker.io` (API 1.43) needs.
+- **Migrating from one trio per pool:** merge your guard files into one `guard.yaml` with `pools:` (keep each old `prefix` as the pool's `prefix:` and its
+  scaler's `--labels` as the pool's `labels:`, so scale sets, containers and workflows' `runs-on` stay the same); run one `docker-policy`, one `guard` and
+  one `scaler` on it; remove the other trios. Runners that are running finish their jobs only if you restart nothing: plan the switch for a quiet time.
+- Image tag in the examples is `0.12`.
+
 ### Added
 - `runner-scaling firewall`: the fence is now part of the image. It speaks nftables over netlink (no `iptables` or `nft` binary), keeps
   its own table `inet gh_runners` (so `ufw`, `firewalld` and `iptables -F` do not touch it), covers IPv4 and, with `FENCE_SRC6`,
@@ -16,7 +32,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 - **Onboarding tools** in the `runner-scaling` binary (also attached to releases for linux/amd64 and arm64):
   - `doctor [--dir D] [--sysbox] [--github] [--json]`: checks Docker (version, rootful, Compose, Sysbox), kernel (cgroup v2, nf_tables), disk, memory, clock skew against GitHub, reachability, and in a stack directory the `.env`, `DOCKER_GID`, the key's owner and mode, the guard configs, subnet overlaps with the host and Docker, subnets inside the fence and, with `--github`, the App's permissions and the runner group. Every problem prints its fix.
-  - `init --org ORG [--create-app]`: writes `compose.yaml`, `guard-lite.yaml`, `.env` and the key for this host (free /16, slots and budget sized to the RAM). `--create-app` uses GitHub's App manifest flow: one button in the browser, with only the Self-hosted runners permission.
+  - `init --org ORG [--create-app] [--pools lite,sysbox]`: writes `compose.yaml`, `guard.yaml`, `.env` and the key for this host (free /16, slots and budget sized to the RAM). `--create-app` uses GitHub's App manifest flow: one button in the browser, with only the Self-hosted runners permission.
   - `pin-tenant`: reads the guard's refusal, asks for confirmation, writes `tenant_url` and restarts the policy and the guard.
 - `docs/SYSBOX.md`: install, verify and know the limits of the Sysbox pool.
 - CI runs an onboarding end-to-end check (`scripts/e2e-onboarding.sh`) on every change.

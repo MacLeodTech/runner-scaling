@@ -5,7 +5,7 @@
 # fall too far behind, and then jobs simply wait with no obvious error. Run this now and then (or from cron) and
 # bump the image when it warns.
 #
-#   scripts/check-runner-image.sh guard.yaml [guard-lite.yaml ...]
+#   scripts/check-runner-image.sh guard.yaml [other-stack.yaml ...]
 #
 # Needs docker and either gh or curl. Exits 0 when current, 1 when behind, 2 on error.
 set -euo pipefail

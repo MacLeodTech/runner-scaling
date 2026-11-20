@@ -41,7 +41,7 @@ type State struct {
 	PeerErr string `json:"peer_error,omitempty"`
 }
 
-// Peer is another scaler's dashboard, e.g. {"lite", "http://scaler-lite:8080"}.
+// Peer is another scaler's dashboard, e.g. {"homelab2", "http://other-host:8080"}.
 type Peer struct{ Name, URL string }
 
 // Server serves the page and its JSON. The dashboard itself is read-only. The only thing that can change is the account

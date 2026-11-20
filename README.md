@@ -201,8 +201,8 @@ names. The guard decodes it and requires that:
    sidecar, so jobs reach the internet but not your LAN or the host. Set `require_file` to its gate file, and the
    guard won't start a slot until the rules are in place.
 6. **Target it from workflows** with the scale set's labels, for example `runs-on: [self-hosted, ci]`.
-7. **Optional: a second pool without Docker.** See [Several pools](#operations) and
-   [examples/guard-lite.yaml](examples/guard-lite.yaml).
+7. **Optional: more pools.** Several kinds of runner (with and without Docker) run from one guard, one policy proxy and one
+   scaler: see [Several pools](#operations) and [examples/guard-pools.yaml](examples/guard-pools.yaml).
 
 ### Without an organization (repo-level scale set)
 
@@ -305,11 +305,18 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   update on an existing scale set and ignores it, so when the labels change the scaler deletes the scale set and
   creates it again (with a new id). Runners already started for the old one finish their jobs. Renaming `--name` creates a second scale set and leaves the first behind: remove it with
   `--delete-scale-set`.
-- **Several pools.** Run one guard + scaler pair per kind of runner, each with its own `prefix`, subnets, API
-  socket and labels: for example one with a `dind:` section for jobs that build images, and a lighter one without
-  for everything else ([examples/guard-lite.yaml](examples/guard-lite.yaml) and
-  [examples/compose.yaml](examples/compose.yaml) show both). Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
-  no network, no other mounts).
+- **Several pools.** One `guard.yaml` can describe several kinds of runner under `pools:` (for example `lite` with no Docker,
+  and `sysbox` with a private Docker per job): the settings above `pools:` are shared, and a pool's own keys replace
+  them (a pool's `runner:` is the whole runner section; `x-...` keys are free for YAML anchors, as in Compose). Each pool
+  gets the prefix `<prefix>-<name>` and the labels `self-hosted, linux, <arch>, <name>` unless you set `prefix` or `labels`.
+  One guard, one `docker-policy` and one scaler serve all of them, so the stack stays at four containers; the scaler asks the guard
+  which pools exist and keeps one scale set per pool (named by the pool's prefix). **A workflow picks a pool with `runs-on`**:
+  GitHub matches the labels, and the tool never inspects a job to decide, so the choice is the repo's (or the workflow's)
+  and an unprivileged pool can never hand a job to a more powerful one. The loader refuses pools that share a prefix, a
+  subnet, a host path or every label. [examples/guard-pools.yaml](examples/guard-pools.yaml) and
+  [examples/compose.yaml](examples/compose.yaml) show a `lite` and a `sysbox` pool. A `guard.yaml` without `pools:` is one pool, as
+  before (and `--name`/`--labels` on the scaler still apply to it). Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
+  no network, no other mounts). Upgrading from separate trios: [CHANGELOG 0.12.0](CHANGELOG.md).
 - **One memory budget for all runners.** Set `memory_budget` (e.g. `8G`) and `memory_reserve` (default `1G`, the
   assumed minimum size of one slot) in every pool's guard config, with the same values. The guard measures the working
   set of every runner-scaling container on the host (all pools, found by label) through the Docker API. It starts a
@@ -342,7 +349,7 @@ pinned runner image is the version you run. GitHub refuses runners that get too 
 wait. Check from time to time (or from cron):
 
 ```
-scripts/check-runner-image.sh guard.yaml guard-lite.yaml   # exits 1 when behind
+scripts/check-runner-image.sh guard.yaml   # exits 1 when behind (checks the first runner image in the file)
 ```
 
 To bump: pick a newer tag of your runner image, `docker pull` it, put its digest in every guard config's runner
@@ -358,15 +365,15 @@ versions file. Build with `images/build.sh`, check staleness with `images/check.
 ### Metrics
 
 With the [dashboard](#dashboard) on (`DASHBOARD_ADDR`), the scaler also serves `GET /metrics` in Prometheus text
-format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so scrape each
-pool's scaler. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
+format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so one
+scrape of the scaler covers every pool. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
 
 ```yaml
 scrape_configs:
   - job_name: runner-scaling
     authorization: {type: Bearer, credentials_file: /etc/prometheus/runner_scaling_token}   # the dashboard token
     static_configs:
-      - targets: ["scaler:8080", "scaler-lite:8080"]   # one per pool; Prometheus on the scalers' Docker network
+      - targets: ["scaler:8080"]   # one scaler serves every pool, each with its own pool="..." label
 ```
 
 | Metric | Type | Meaning |
@@ -451,8 +458,8 @@ Set `DASHBOARD_ADDR` and the scaler serves a read-only status page, a bit like t
 their state, running jobs with elapsed time, queued jobs with wait time, and the last 100 finished jobs (repo,
 workflow, event, branch, result, duration). It refreshes every few seconds from `/api/state` (JSON).
 
-- Running several pools? Give each scaler a dashboard and list the others in `DASHBOARD_PEERS` on the one you open:
-  its page then shows every pool, tagged by name. Peers need the same token and a network path between the scalers.
+- Running several pools? One scaler serves them all, and its page shows every pool, tagged by name. (`DASHBOARD_PEERS` still
+  folds in other scalers, for example on another host; they need the same token and a network path.)
 - The dashboard has no controls: it only shows. (With accounts on, the one thing that can change is the account list.) History lives in memory, so a scaler restart empties it.
 - Job names and repos can be sensitive for private repos. Bind it to loopback or a private network, and put a reverse
   proxy with TLS in front if it leaves the host. `DASHBOARD_TOKEN` adds a shared-secret check but sends it in clear
@@ -603,9 +610,9 @@ Omit `dind` for runners without a private Docker daemon.
 
 [Sysbox](https://github.com/nestybox/sysbox) is an OCI runtime that runs the dind sidecar without `privileged`. Root
 inside it maps to an unprivileged host uid, so a job that starts a `--privileged` container against that dind gets a
-container that cannot see the host's disks or devices. `examples/guard-sysbox.yaml` is `guard.yaml` with
-`runtime: sysbox-runc` in place of `privileged: true`; run it as a pool of its own (own `prefix`, own subnets) so you
-can move repos over one at a time.
+container that cannot see the host's disks or devices. The `sysbox` pool in `examples/guard-pools.yaml` is
+`examples/guard.yaml` with `runtime: sysbox-runc` in place of `privileged: true`; run it as a pool of its own (own `prefix`,
+own subnets) so you can move repos over one at a time.
 
 Install Sysbox on the host first and register it with Docker (`runtimes` in `daemon.json`). Things that bit us on
 Ubuntu 24.04 with Docker 29:
