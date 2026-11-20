@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
+	"github.com/MacLeodTech/runner-scaling/internal/scaler"
 )
 
 const multiConfig = `
@@ -203,5 +204,61 @@ func TestPolicyTwoPools(t *testing.T) {
 		if err := g.Stop(ctx, 1); err != nil {
 			t.Errorf("stop %s: %v", g.cfg.Prefix, err)
 		}
+	}
+}
+
+// The scaler's client against the real multi-pool handler over a unix socket: what the scaler does at start.
+func TestScalerClientAgainstPools(t *testing.T) {
+	cs, err := LoadConfigs(writeCfg(t, multiConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFake()
+	p := NewPools(cs, f, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	dir, _ := os.MkdirTemp("", "rs")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "g.sock")
+	ln, _ := net.Listen("unix", sock)
+	srv := &http.Server{Handler: p.Handler()}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	gc := scaler.NewGuardClient(sock)
+	ctx := context.Background()
+	infos, err := gc.Pools(ctx)
+	if err != nil || len(infos) != 2 {
+		t.Fatalf("pools: %v %v", infos, err)
+	}
+	for _, info := range infos {
+		c := gc.Pool(info.Name)
+		name := info.Prefix + "-1-abc123"
+		if err := c.Start(ctx, 1, api.StartRequest{RunnerName: name, JITConfig: jitFor(name, "https://github.com/example-org")}); err != nil {
+			t.Fatalf("start in %s: %v", info.Name, err)
+		}
+		slots, err := c.Slots(ctx)
+		if err != nil || len(slots) != 1 || slots[0].Slot != 1 {
+			t.Fatalf("slots of %s: %+v %v", info.Name, slots, err)
+		}
+		if _, err := c.SlotStats(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Counters(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := f.containers["ci-lite-runner-1"]; !ok {
+		t.Errorf("lite runner missing: %v", len(f.containers))
+	}
+	if _, ok := f.containers["ci-box-dind-1"]; !ok {
+		t.Errorf("box dind missing")
+	}
+	for _, info := range infos {
+		if err := gc.Pool(info.Name).Stop(ctx, 1); err != nil {
+			t.Fatalf("stop %s: %v", info.Name, err)
+		}
+	}
+	// Pools share one process but not slots: a slot beyond a pool's own max is refused (lite has 2, box has 3).
+	if err := gc.Pool("lite").Start(ctx, 3, api.StartRequest{RunnerName: "ci-lite-3-abc123", JITConfig: jitFor("ci-lite-3-abc123", "https://github.com/example-org")}); err == nil {
+		t.Error("slot 3 of a 2-slot pool was accepted")
 	}
 }

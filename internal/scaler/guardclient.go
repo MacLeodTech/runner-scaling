@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
@@ -26,12 +27,12 @@ type Guard interface {
 // GuardClient talks to the guard over its unix socket.
 type GuardClient struct {
 	c    *http.Client
-	base string // "" for the socket root, or /v1/pools/<name> for one pool
+	pool string // "" for the socket root (a single-pool guard), or the pool addressed as /v1/pools/<pool>/...
 }
 
 // Pool returns a client for one pool of a multi-pool guard; it shares the connection.
 func (g *GuardClient) Pool(name string) *GuardClient {
-	return &GuardClient{c: g.c, base: "/v1/pools/" + name}
+	return &GuardClient{c: g.c, pool: name}
 }
 
 // Pools lists the pools the guard runs, with their labels.
@@ -67,7 +68,10 @@ func (g *GuardClient) do(ctx context.Context, method, path string, body, out any
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, "http://guard"+g.base+path, rd)
+	if g.pool != "" { // the single-pool paths, under the pool: /v1/slots -> /v1/pools/<pool>/slots
+		path = "/v1/pools/" + g.pool + strings.TrimPrefix(path, "/v1")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://guard"+path, rd)
 	if err != nil {
 		return err
 	}

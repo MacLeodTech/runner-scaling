@@ -363,11 +363,11 @@ func TestDoctorStackFindings(t *testing.T) {
 	d := Doctor{Dir: dir, Offline: true, DockerHost: fakeDocker(t, "1.43", nil, "172.30.12.0/24"), WantSysbox: true}
 	cs := d.Run(context.Background())
 	for name, want := range map[string]Level{
-		"docker version":  Fail, // API too old
-		"sysbox runtime":  Fail, // required, absent
-		"app key owner":   Fail, // owned by the test user, not 65532
-		"subnet":          Fail, // overlaps the existing network
-		"tenant_url":      Warn,
+		"docker version":       Fail, // API too old
+		"sysbox runtime":       Fail, // required, absent
+		"app key owner":        Fail, // owned by the test user, not 65532
+		"subnet":               Fail, // overlaps the existing network
+		"tenant_url":           Warn,
 		"guard.yaml pool lite": Pass,
 	} {
 		c := find(cs, name)

@@ -132,9 +132,16 @@ func NewPlan(in PlanInput) (*Plan, error) {
 		return nil, err
 	}
 	slots, budget := Size(in.MemTotalGB)
+	var notes []string
+	if want["sysbox"] { // one slot there is a runner and a daemon: 3G + 3G, which the budget must be able to hold
+		if b, _ := strconv.Atoi(strings.TrimSuffix(budget, "G")); b < 6 {
+			budget = "6G"
+			notes = append(notes, fmt.Sprintf("a Sysbox pool needs 6 GB per job and this host has %d GB: raised memory_budget to 6G, so expect one Docker job at a time and little room for anything else", in.MemTotalGB))
+		}
+	}
 	rd := func(n string) string { b, _ := examples.FS.ReadFile(n); return string(b) }
 	prefix := strings.TrimSuffix(fence, ".0.0/16") // 172.30
-	p := &Plan{Files: map[string]File{}, Fence: fence, Slots: slots, Budget: budget}
+	p := &Plan{Files: map[string]File{}, Fence: fence, Slots: slots, Budget: budget, Notes: notes}
 
 	g := rd("guard-pools.yaml")
 	for _, r := range [][3]string{

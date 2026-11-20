@@ -71,14 +71,14 @@ pools:
       - /srv/runner-scaling/sbx-{slot}/docker
     runner:
       <<: *runner
-      memory: 4G
+      memory: 3G
       pids: 2048
       env: {RUNNER_TOOL_CACHE: /opt/hostedtoolcache}
       binds: ["/srv/runner-scaling/sbx-{slot}/toolcache:/opt/hostedtoolcache"]
     dind:                           # each runner's own Docker daemon; Jobs get DOCKER_HOST=tcp://<prefix>-dind-<slot>:2375
       image: docker:28-dind         # pin a digest
       runtime: sysbox-runc          # Sysbox must be installed and registered with Docker
-      memory: 4G
+      memory: 3G
       cpus: 2
       pids: 4096
       binds: ["/srv/runner-scaling/sbx-{slot}/docker:/var/lib/docker"]
