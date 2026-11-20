@@ -327,92 +327,52 @@ func (g *Guard) labels(slot int, role, runner string) map[string]string {
 	return l
 }
 
-func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error {
-	runnerName, dindName, netName, volName := g.names(slot)
-	subnet := ""
-	if g.cfg.Subnet != "" {
-		subnet = g.cfg.Expand(g.cfg.Subnet, slot)
+// slotSubnet is the slot's network range, "" when Docker picks one.
+func (g *Guard) slotSubnet(slot int) string {
+	if g.cfg.Subnet == "" {
+		return ""
 	}
-	if err := g.d.NetworkEnsure(ctx, netName, subnet, g.labels(slot, "network", "")); err != nil {
-		return fmt.Errorf("network: %w", err)
-	}
-	work := volName + ":" + g.cfg.WorkDir
-	if g.cfg.WorkBind != "" {
-		work = g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir
-	} else if err := g.d.VolumeCreate(ctx, volName, g.labels(slot, "work", "")); err != nil {
-		return fmt.Errorf("work volume: %w", err)
-	}
+	return g.cfg.Expand(g.cfg.Subnet, slot)
+}
 
-	extraEnv := map[string]string{}
-	high := map[string]*Template{} // container id -> template, for memory_high
+// slotWork is the work_dir bind of a slot: a per-slot volume, or work_bind.
+func (g *Guard) slotWork(slot int) string {
+	if g.cfg.WorkBind != "" {
+		return g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir
+	}
+	_, _, _, vol := g.names(slot)
+	return vol + ":" + g.cfg.WorkDir
+}
+
+// dindSpec is the one container spec the guard creates for a slot's Docker sidecar. Pure: no Docker calls.
+func (g *Guard) dindSpec(slot int) ContainerSpec {
+	_, dindName, netName, _ := g.names(slot)
+	spec := g.spec(g.cfg.Dind, slot, netName, g.slotWork(slot), map[string]string{"DOCKER_TLS_CERTDIR": ""})
+	spec.Hostname = dindName
+	spec.Labels = g.labels(slot, "dind", "")
+	return spec
+}
+
+// runnerSpec is the one container spec the guard creates for a slot's runner. Pure: no Docker calls.
+func (g *Guard) runnerSpec(slot int, runnerName, jit string) ContainerSpec {
+	_, dindName, netName, _ := g.names(slot)
+	extraEnv := map[string]string{jitEnv: jit, "RUNNER_SCALING_SLOT": strconv.Itoa(slot)}
 	if g.cfg.Dind != nil {
-		spec := g.spec(g.cfg.Dind, slot, netName, work, map[string]string{"DOCKER_TLS_CERTDIR": ""})
-		spec.Hostname = dindName
-		spec.Labels = g.labels(slot, "dind", "")
-		id, err := g.run(ctx, dindName, spec)
-		if err != nil {
-			return fmt.Errorf("dind: %w", err)
-		}
-		high[id] = g.cfg.Dind
-		if err := g.waitHealthy(ctx, dindName); err != nil {
-			return fmt.Errorf("dind: %w", err)
-		}
 		extraEnv["DOCKER_HOST"] = "tcp://" + dindName + ":2375"
 	}
-
-	if g.cfg.WorkBind != "" {
-		if err := g.wipeWork(ctx, slot); err != nil {
-			return err
-		}
-	}
-
-	extraEnv[jitEnv] = req.JITConfig
-	extraEnv["RUNNER_SCALING_SLOT"] = strconv.Itoa(slot)
-	spec := g.spec(&g.cfg.Runner, slot, netName, work, extraEnv)
-	spec.Hostname = req.RunnerName
-	spec.Labels = g.labels(slot, "runner", req.RunnerName)
+	spec := g.spec(&g.cfg.Runner, slot, netName, g.slotWork(slot), extraEnv)
+	spec.Hostname = runnerName
+	spec.Labels = g.labels(slot, "runner", runnerName)
 	spec.Entrypoint = []string{"/bin/sh", "-c", entrypointWrapper, "runner-scaling"}
 	spec.Cmd = g.cfg.Runner.Command
-	id, err := g.run(ctx, runnerName, spec)
-	if err != nil {
-		return fmt.Errorf("runner: %w", err)
-	}
-	high[id] = &g.cfg.Runner
-	g.applyMemoryHigh(ctx, slot, high)
-	return nil
+	return spec
 }
 
-// wipeCmd empties the directory given as $0, including dotfiles, without removing it.
-var wipeCmd = []string{"sh", "-c", `find "$0" -mindepth 1 -delete`}
-
-// wipeWork empties a slot's work_bind directory: inside its dind if there is one (it mounts the same directory),
-// otherwise in a one-shot container from the runner image with nothing but that directory and no network.
-func (g *Guard) wipeWork(ctx context.Context, slot int) error {
-	cmd := append(slices.Clone(wipeCmd), g.cfg.WorkDir)
-	var code int
-	var err error
-	if g.cfg.Dind != nil {
-		_, dindName, _, _ := g.names(slot)
-		code, err = g.d.Exec(ctx, dindName, cmd)
-	} else {
-		code, err = g.wipeOneShot(ctx, slot, cmd, []string{g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir})
-	}
-	if err == nil && code != 0 {
-		err = fmt.Errorf("exit %d", code)
-	}
-	if err != nil {
-		return fmt.Errorf("empty work dir: %w", err)
-	}
-	return nil
-}
-
-func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) (int, error) {
-	name := g.wiperName(slot)
-	if err := g.d.ContainerRemove(ctx, name); err != nil {
-		return -1, err
-	}
+// wipeSpec is the spec of every one-shot helper container (wipes, memory_high, module blocklist): the runner image as
+// root with no network, no capabilities beyond file deletion, and only the given command and binds. Pure.
+func (g *Guard) wipeSpec(slot int, cmd, binds []string) ContainerSpec {
 	pids := int64(64)
-	spec := ContainerSpec{
+	return ContainerSpec{
 		Image:      g.cfg.Runner.Image,
 		User:       "0",
 		Entrypoint: cmd,
@@ -429,6 +389,78 @@ func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) 
 			CgroupParent:  g.cfg.CgroupParent,
 		},
 	}
+}
+
+func (g *Guard) start(ctx context.Context, slot int, req api.StartRequest) error {
+	runnerName, dindName, netName, volName := g.names(slot)
+	if err := g.d.NetworkEnsure(ctx, netName, g.slotSubnet(slot), g.labels(slot, "network", "")); err != nil {
+		return fmt.Errorf("network: %w", err)
+	}
+	if g.cfg.WorkBind == "" {
+		if err := g.d.VolumeCreate(ctx, volName, g.labels(slot, "work", "")); err != nil {
+			return fmt.Errorf("work volume: %w", err)
+		}
+	}
+
+	high := map[string]*Template{} // container id -> template, for memory_high
+	if g.cfg.Dind != nil {
+		id, err := g.run(ctx, dindName, g.dindSpec(slot))
+		if err != nil {
+			return fmt.Errorf("dind: %w", err)
+		}
+		high[id] = g.cfg.Dind
+		if err := g.waitHealthy(ctx, dindName); err != nil {
+			return fmt.Errorf("dind: %w", err)
+		}
+	}
+
+	if g.cfg.WorkBind != "" {
+		if err := g.wipeWork(ctx, slot); err != nil {
+			return err
+		}
+	}
+
+	id, err := g.run(ctx, runnerName, g.runnerSpec(slot, req.RunnerName, req.JITConfig))
+	if err != nil {
+		return fmt.Errorf("runner: %w", err)
+	}
+	high[id] = &g.cfg.Runner
+	g.applyMemoryHigh(ctx, slot, high)
+	return nil
+}
+
+// wipeCmd empties the directory given as $0, including dotfiles, without removing it.
+var wipeCmd = []string{"sh", "-c", `find "$0" -mindepth 1 -delete`}
+
+// wipeWork empties a slot's work_bind directory: inside its dind if there is one (it mounts the same directory),
+// otherwise in a one-shot container from the runner image with nothing but that directory and no network.
+func (g *Guard) wipeWorkCmd() []string { return append(slices.Clone(wipeCmd), g.cfg.WorkDir) }
+
+func (g *Guard) wipeWork(ctx context.Context, slot int) error {
+	cmd := g.wipeWorkCmd()
+	var code int
+	var err error
+	if g.cfg.Dind != nil {
+		_, dindName, _, _ := g.names(slot)
+		code, err = g.d.Exec(ctx, dindName, cmd)
+	} else {
+		code, err = g.wipeOneShot(ctx, slot, cmd, []string{g.slotWork(slot)})
+	}
+	if err == nil && code != 0 {
+		err = fmt.Errorf("exit %d", code)
+	}
+	if err != nil {
+		return fmt.Errorf("empty work dir: %w", err)
+	}
+	return nil
+}
+
+func (g *Guard) wipeOneShot(ctx context.Context, slot int, cmd, binds []string) (int, error) {
+	name := g.wiperName(slot)
+	if err := g.d.ContainerRemove(ctx, name); err != nil {
+		return -1, err
+	}
+	spec := g.wipeSpec(slot, cmd, binds)
 	defer g.d.ContainerRemove(context.WithoutCancel(ctx), name)
 	if _, err := g.run(ctx, name, spec); err != nil {
 		return -1, err
@@ -497,7 +529,7 @@ func (g *Guard) applyMemoryHigh(ctx context.Context, slot int, targets map[strin
 	if len(args) == 4 {
 		return
 	}
-	code, err := g.wipeOneShot(ctx, slot, args, []string{"/sys/fs/cgroup:/cgroup"})
+	code, err := g.wipeOneShot(ctx, slot, args, []string{cgroupBind})
 	if err == nil && code != 0 {
 		err = fmt.Errorf("exit %d", code)
 	}
@@ -525,13 +557,24 @@ if [ -f "$f" ] && cmp -s "$tmp" "$f"; then rm -f "$tmp"; echo unchanged; else mv
 // startup, in a one-shot container with no network that has the host's /etc/modprobe.d mounted. A failure is logged
 // and counted, not fatal: the pool still works, it just doesn't have this protection. It does not unload modules that
 // are already loaded. With the option omitted it does nothing; with an explicit empty list it removes the guard's own file.
+func (g *Guard) modprobeFile() string { return "50-runner-scaling-" + g.cfg.Prefix + ".conf" }
+
+// modprobeBind and cgroupBind are the only host paths, besides the slots' own directories, a helper container may mount.
+const (
+	modprobeBind = "/etc/modprobe.d:/modprobe.d"
+	cgroupBind   = "/sys/fs/cgroup:/cgroup"
+)
+
+func (g *Guard) modprobeCmd() []string {
+	return append([]string{"sh", "-c", modprobeScript, "sh", g.modprobeFile()}, g.cfg.ModuleBlocklist...)
+}
+
 func (g *Guard) ApplyModuleBlocklist(ctx context.Context) error {
 	if g.cfg.ModuleBlocklist == nil {
 		return nil // not configured: the host is not touched at all
 	}
-	file := "50-runner-scaling-" + g.cfg.Prefix + ".conf"
-	args := append([]string{"sh", "-c", modprobeScript, "sh", file}, g.cfg.ModuleBlocklist...)
-	code, err := g.wipeOneShot(ctx, 0, args, []string{"/etc/modprobe.d:/modprobe.d"})
+	file := g.modprobeFile()
+	code, err := g.wipeOneShot(ctx, 0, g.modprobeCmd(), []string{modprobeBind})
 	if err == nil && code != 0 {
 		err = fmt.Errorf("exit %d", code)
 	}
@@ -681,19 +724,34 @@ func (g *Guard) takeKeep(slot int) bool {
 	return ok
 }
 
+// cacheMounts is the slot's cache_dirs as bind specs, with the in-container target of each.
+func (g *Guard) cacheMounts(slot int) (binds, targets []string) {
+	for i, d := range g.cfg.CacheDirs {
+		t := "/wipe/" + strconv.Itoa(i)
+		binds = append(binds, g.cfg.Expand(d, slot)+":"+t)
+		targets = append(targets, t)
+	}
+	return binds, targets
+}
+
+func (g *Guard) cacheWipeCmd(slot int) (binds, cmd []string) {
+	binds, targets := g.cacheMounts(slot)
+	return binds, append([]string{"sh", "-c", `for d in "$@"; do find "$d" -mindepth 1 -delete || exit 1; done`, "wipe"}, targets...)
+}
+
+func (g *Guard) cacheTrimCmd(slot int) (binds, cmd []string) {
+	binds, targets := g.cacheMounts(slot)
+	script := `max="$1"; shift; used=$(du -sk "$@" | awk '{t+=$1} END{print t+0}'); [ "$used" -le "$max" ] && exit 0; for d in "$@"; do find "$d" -mindepth 1 -delete || exit 1; done`
+	return binds, append([]string{"sh", "-c", script, "trim", strconv.FormatInt(g.cfg.cacheMax/1024, 10)}, targets...)
+}
+
 // wipeCaches empties every cache_dirs directory of the slot in a one-shot container with nothing else mounted and
 // no network. The slot's containers must be gone (dind's image store is among them).
 func (g *Guard) wipeCaches(ctx context.Context, slot int) error {
 	if len(g.cfg.CacheDirs) == 0 {
 		return nil
 	}
-	var binds, targets []string
-	for i, d := range g.cfg.CacheDirs {
-		t := "/wipe/" + strconv.Itoa(i)
-		binds = append(binds, g.cfg.Expand(d, slot)+":"+t)
-		targets = append(targets, t)
-	}
-	cmd := append([]string{"sh", "-c", `for d in "$@"; do find "$d" -mindepth 1 -delete || exit 1; done`, "wipe"}, targets...)
+	binds, cmd := g.cacheWipeCmd(slot)
 	wctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	code, err := g.wipeOneShot(wctx, slot, cmd, binds)
@@ -716,14 +774,7 @@ func (g *Guard) trimCaches(ctx context.Context, slot int) error {
 	if g.cfg.cacheMax <= 0 || len(g.cfg.CacheDirs) == 0 {
 		return nil
 	}
-	var binds, targets []string
-	for i, d := range g.cfg.CacheDirs {
-		t := "/wipe/" + strconv.Itoa(i)
-		binds = append(binds, g.cfg.Expand(d, slot)+":"+t)
-		targets = append(targets, t)
-	}
-	script := `max="$1"; shift; used=$(du -sk "$@" | awk '{t+=$1} END{print t+0}'); [ "$used" -le "$max" ] && exit 0; for d in "$@"; do find "$d" -mindepth 1 -delete || exit 1; done`
-	cmd := append([]string{"sh", "-c", script, "trim", strconv.FormatInt(g.cfg.cacheMax/1024, 10)}, targets...)
+	binds, cmd := g.cacheTrimCmd(slot)
 	wctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	code, err := g.wipeOneShot(wctx, slot, cmd, binds)
@@ -826,7 +877,7 @@ func (g *Guard) WipeStale(ctx context.Context) {
 			if g.cfg.WorkBind != "" {
 				wctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 				var code int
-				code, err = g.wipeOneShot(wctx, slot, append(slices.Clone(wipeCmd), g.cfg.WorkDir), []string{g.cfg.Expand(g.cfg.WorkBind, slot) + ":" + g.cfg.WorkDir})
+				code, err = g.wipeOneShot(wctx, slot, g.wipeWorkCmd(), []string{g.slotWork(slot)})
 				if err == nil && code != 0 {
 					err = fmt.Errorf("exit %d", code)
 				}

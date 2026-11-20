@@ -23,11 +23,27 @@ x-hardened: &hardened
     driver: journald
     options: {tag: "{{.Name}}"}
 
+# One docker-policy per guard holds the Docker socket and checks every call against that guard's config (see
+# compose.lite.yaml for the explanation). The guards themselves have no socket and are not root.
+x-policy: &policy
+  <<: *hardened
+  image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
+  user: "65533:65532"
+  group_add: ["${DOCKER_GID:?set it in .env: stat -c %g /var/run/docker.sock}"]
+  network_mode: none
+  mem_limit: 64m
+  pids_limit: 64
+  healthcheck:
+    test: [CMD, /usr/local/bin/runner-scaling, health, --docker-policy-socket, /run/docker-policy/docker.sock]
+    interval: 30s
+
 x-guard: &guard
   <<: *hardened
   image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
-  user: "0:65532"            # root for the Docker socket; group 65532 so the scaler (nonroot) can use the API socket
-  network_mode: none         # needs no network: it talks to Docker and the scaler over unix sockets
+  user: "65532:65532"
+  network_mode: none         # needs no network: it talks to Docker (via docker-policy) and the scaler over unix sockets
+  environment:
+    DOCKER_SOCKET: /run/docker-policy/docker.sock
   mem_limit: 64m
   pids_limit: 64
   healthcheck:
@@ -58,14 +74,24 @@ services:
     mem_limit: 32m
     pids_limit: 32
 
+  docker-policy:
+    <<: *policy
+    command: [docker-policy, --config, /etc/runner-scaling/guard.yaml]
+    volumes:
+      - ./guard.yaml:/etc/runner-scaling/guard.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-policy-api:/run/docker-policy
+
   guard:
     <<: *guard
     command: [guard, --config, /etc/runner-scaling/guard.yaml]
     volumes:
       - ./guard.yaml:/etc/runner-scaling/guard.yaml:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-policy-api:/run/docker-policy:ro
       - guard-api:/run/runner-scaling
       - gate:/gate:ro
+    depends_on:
+      docker-policy: {condition: service_healthy}
 
   scaler:
     <<: *scaler
@@ -75,14 +101,24 @@ services:
     depends_on:
       guard: {condition: service_healthy}
 
+  docker-policy-lite:
+    <<: *policy
+    command: [docker-policy, --config, /etc/runner-scaling/guard.yaml]
+    volumes:
+      - ./guard-lite.yaml:/etc/runner-scaling/guard.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-policy-lite-api:/run/docker-policy
+
   guard-lite:
     <<: *guard
     command: [guard, --config, /etc/runner-scaling/guard.yaml]
     volumes:
       - ./guard-lite.yaml:/etc/runner-scaling/guard.yaml:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-policy-lite-api:/run/docker-policy:ro
       - guard-lite-api:/run/runner-scaling
       - gate:/gate:ro
+    depends_on:
+      docker-policy-lite: {condition: service_healthy}
 
   scaler-lite:
     <<: *scaler
@@ -95,5 +131,7 @@ services:
 volumes:
   guard-api:
   guard-lite-api:
+  docker-policy-api:
+  docker-policy-lite-api:
   gate:     # a tmpfs: empty after every reboot, so no runner starts before the fence is back
     driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0755"}

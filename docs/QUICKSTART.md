@@ -24,25 +24,30 @@ Stuck? See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). Want the risks first? Read
 
 ## 0. What you are building, and what it costs you
 
-Two small containers and one helper run all the time. They hold **no runners while idle**:
+Three small containers and one helper run all the time. They hold **no runners while idle**, and each holds only what it
+needs:
 
 ```
-GitHub  <--- outbound HTTPS only --- scaler  --unix socket-->  guard  --docker.sock-->  Docker
-                                       |                         |
-                          holds the GitHub App key        builds a runner container for each
-                          has NO Docker access            queued job, from guard-lite.yaml only
-                                                          has NO network and NO GitHub key
+GitHub <-- outbound HTTPS only -- scaler --unix--> guard --unix--> docker-policy --docker.sock--> Docker
+                                    |                |                  |
+                      holds the GitHub App key  builds a runner   checks EVERY Docker call against
+                      has NO Docker access      from guard-lite   guard-lite.yaml; refuses anything
+                                                .yaml only. No    that differs by one field. The
+                                                network, key or   only container with the Docker
+                                                socket; not root  socket. No network; not root
 ```
 
 When a job is queued, the scaler gets a single-use runner registration from GitHub and hands it to the guard. The
-guard starts a fresh runner container, the runner takes that one job, and the container is deleted afterwards. A
-firewall sidecar stops those containers reaching your LAN or the host.
+guard asks `docker-policy` to start a fresh runner container, which allows exactly the container the config describes
+and nothing else. The runner takes that one job, and the container is deleted afterwards. A firewall sidecar stops those
+containers reaching your LAN or the host.
 
 What you must accept (details in [SECURITY-POSTURE.md](SECURITY-POSTURE.md)):
 
 - **Only run code you trust.** Anyone who can get a workflow onto a repo that uses these runners can run code on your
   hardware. Use **private repos only**, and never public ones.
-- **The `guard` holds the Docker socket**, which is root on the host. It is kept tiny on purpose.
+- **`docker-policy` holds the Docker socket**, which is root on the host. It is kept tiny on purpose, and it is the one
+  place that decides what Docker is asked to do, so keep `guard-lite.yaml` writable only by you.
 - Runners without Docker (this quickstart) are root inside their container, not on the host. Runners **with** Docker
   are a bigger risk and are covered [at the end](#add-a-pool-that-has-docker).
 
@@ -135,14 +140,15 @@ the Client ID and installation ID for the next step.
 
 | Copy | As | What it is |
 |---|---|---|
-| `compose.lite.yaml` | `compose.yaml` | the firewall, guard and scaler containers |
+| `compose.lite.yaml` | `compose.yaml` | the firewall, docker-policy, guard and scaler containers |
 | `guard-lite.yaml` | `guard-lite.yaml` | **the one config that decides what a runner is** |
 | `firewall.sh` | `firewall.sh` | the firewall sidecar's script |
-| `env.example` | `.env` | your two GitHub App identifiers |
+| `env.example` | `.env` | your GitHub App identifiers and the Docker socket's group id |
 
 Then edit:
 
-1. **`.env`**: put in your Client ID and installation ID.
+1. **`.env`**: put in your Client ID and installation ID, and the Docker socket's group id: `DOCKER_GID=$(stat -c %g /var/run/docker.sock)`
+   (a number such as `988` or `999`). `docker-policy` joins that group so it can use the socket without running as root.
 2. **`guard-lite.yaml`**: set `github_url: https://github.com/YOUR-ORG`. Leave `tenant_url` commented out for now
    (step 6 explains). The defaults (4 slots, 3 GB per runner, 8 GB total, 6 h job limit) suit a 16 GB machine; lower
    `max_slots` and `memory_budget` on a smaller one. `memory_budget` must be at least what one slot may use (here 3 GB).
@@ -177,7 +183,7 @@ pulls the images, and starts listening; the scaler waits for the guard, then reg
 your organization.
 
 **Check:**
-- `docker compose ps` shows `firewall`, `guard-lite` (healthy) and `scaler-lite` running.
+- `docker compose ps` shows `firewall`, `docker-policy` (healthy), `guard-lite` (healthy) and `scaler-lite` running.
 - The scaler log says `scale set ready` with the labels `self-hosted, linux, x64, ci-lite`.
 - On GitHub: Organization settings > Actions > Runners > **Runner scale sets** lists `ci-lite`.
 - Nothing else runs: `docker ps` shows only these three, because there is no job yet.
@@ -216,9 +222,10 @@ refused forever.
 3. **Confirm it is yours.** This is the only trust decision in setup: you are telling the guard which GitHub service to
    accept runners from. It is safe here because the refused registration came from *your* scaler, using *your* App, on a
    machine you just set up. (Do this on a fresh setup, before anything untrusted can reach the scaler.)
-4. Put that URL in `guard-lite.yaml` as `tenant_url:` (uncomment the line), then restart only the guard:
+4. Put that URL in `guard-lite.yaml` as `tenant_url:` (uncomment the line), then restart the policy and the guard (both read
+   the file, and the policy checks the registration too):
    ```
-   docker compose restart guard-lite
+   docker compose restart docker-policy guard-lite
    ```
 5. The scaler retries by itself within about 15 seconds. Watch the job start: `docker compose logs -f guard-lite`
    shows `slot started`, and `docker ps` shows a `ci-lite-runner-1` container.
@@ -226,7 +233,7 @@ refused forever.
 **Check:**
 - The workflow run succeeds. Its log shows the hostname (a `ci-lite-1-…` name), `internet: 200`, `LAN blocked (good)`.
 - A minute later the runner container is gone again (`docker ps`).
-- `docker compose logs guard-lite | grep DENY` shows no new lines.
+- `docker compose logs guard-lite docker-policy | grep DENY` shows no new lines.
 
 If the LAN line says `LAN REACHABLE`, **stop**: the fence is not working. Do not run real jobs. See
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-firewall-does-not-block-the-lan).
@@ -274,18 +281,21 @@ own private one (a "dind" sidecar). That is the main risk step, because the side
    [Sysbox install guide](https://github.com/nestybox/sysbox/blob/master/docs/user-guide/install-package.md) and read the
    README's [Running dind under Sysbox](../README.md#running-dind-under-sysbox) notes first: there is an AppArmor override, and
    Sysbox adds two host services (`sysbox-mgr`, `sysbox-fs`) that Docker then depends on. Check: `docker info --format '{{json .Runtimes}}'` lists `sysbox-runc`.
-2. Copy `guard-sysbox.yaml` next to the others and set `github_url`, then copy the `guard` and `scaler` blocks from
-   [`compose.yaml`](../examples/compose.yaml) as a new pair (own `prefix`, `subnet` inside your fence, API volume and
-   `--name`/`--labels`, for example `ci-sysbox`). Keep `memory_budget` identical in every guard: it is shared.
+2. Copy `guard-sysbox.yaml` next to the others and set `github_url`, then copy the `docker-policy`, `guard` and `scaler`
+   blocks from [`compose.yaml`](../examples/compose.yaml) as a new trio (own `prefix`, `subnet` inside your fence, API
+   volumes and `--name`/`--labels`, for example `ci-sysbox`). Every pool gets **its own** `docker-policy`, because each
+   one is bound to one guard config. Keep `memory_budget` identical in every guard: it is shared.
 3. Start it, run a job with `docker run hello-world` on `runs-on: [self-hosted, ci-sysbox]`, and pin the tenant the same
    way as in step 6 (it is the same URL; paste it in).
 4. Move repos over one at a time, and only the ones that need Docker.
 
 ## Day two: updating, watching, removing
 
-- **See what is happening.** `docker compose ps`; `docker compose logs --tail 50 guard-lite scaler-lite`; refusals:
-  `docker compose logs guard-lite | grep DENY` (or `journalctl CONTAINER_NAME=<container> | grep DENY`). An optional dashboard,
+- **See what is happening.** `docker compose ps`; `docker compose logs --tail 50 docker-policy guard-lite scaler-lite`; refusals:
+  `docker compose logs guard-lite docker-policy | grep DENY` (or `journalctl CONTAINER_NAME=<container> | grep DENY`). An optional dashboard,
   Prometheus metrics and a read-only `runners` command-line tool are in the [README](../README.md#dashboard).
+- **Changed a guard config?** Restart that pool's `docker-policy` **and** its guard (`docker compose restart docker-policy guard-lite`):
+  both read the file once at start, and the policy refuses what the old file did not describe.
 - **Update.** Read the [CHANGELOG](../CHANGELOG.md), change the image tag (or digest) in `compose.yaml`, then
   `docker compose pull && docker compose up -d`. Restarting does not kill running jobs. Config keys can change between
   `0.x` minor versions, so run `guard --check` against your config with the new image first (the command from step 4).

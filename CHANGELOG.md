@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Added
+- `runner-scaling docker-policy`: an optional **Docker policy proxy** between the guard and the Docker socket. It loads the guard's
+  config and refuses any Docker call that is not exactly one the guard's templates produce: container creates are compared
+  field by field with the spec the config builds for that slot (so a privileged flag, an extra mount, another image or any
+  unknown setting is a 403), exec only runs the config's own commands in the pool's own sidecars, networks and volumes
+  only match the pool's names and subnet, and everything else (`/info`, build, archive, attach, other containers) is refused.
+  The guard no longer needs the socket or root: the examples run it as `65532:65532` with no socket, and only `docker-policy`
+  (unprivileged user plus the socket's group, no network, read-only) mounts it. `health --docker-policy-socket` is its healthcheck.
+  Tested end to end against a fake daemon (every guard operation passes; about 50 tampered requests are refused) and against
+  a real Docker daemon, including a Sysbox sidecar and the module-blocklist helper. See docs/SECURITY-POSTURE.md.
+- The image has pre-owned `/run/runner-scaling` and `/run/docker-policy` so non-root processes can create sockets in fresh named volumes.
+
+### Changed (compose examples)
+- `examples/compose.lite.yaml` and `examples/compose.yaml` add `docker-policy` (one per pool) and run the guards without the socket
+  and without root. **Migrating an existing deployment:** add `DOCKER_GID` to `.env` (`stat -c %g /var/run/docker.sock`), add the
+  `docker-policy` service, remove `/var/run/docker.sock` from the guard, set its `DOCKER_SOCKET` to the policy socket and its `user` to
+  `65532:65532`. Pointing the guard straight at the socket keeps working.
+- After editing a guard config, restart that pool's `docker-policy` as well as the guard.
+
 ### Changed
 - The guard no longer runs `prune_on_stop` when the slot's dind data is a `cache_dirs` entry that is about to be wiped (an untrusted job). The prune held the slot for nothing.
 - `Reap` tears down several slots at once instead of one after another, so one slow teardown no longer delays the others, `max_runtime` or the memory backstop by the sum of their prune and wipe times.

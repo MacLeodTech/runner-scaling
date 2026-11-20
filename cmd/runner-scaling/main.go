@@ -2,6 +2,8 @@
 // internet-facing part of the system the Docker socket.
 //
 //	runner-scaling guard  --config guard.yaml   holds the Docker socket; builds containers only from its config
+//	runner-scaling docker-policy --config ...  optional: sits between the guard and the Docker socket and refuses any
+//	                                            Docker call that is not exactly one the guard's config produces
 //	runner-scaling scaler                       talks to GitHub; asks the guard for slots over a unix socket
 //	runner-scaling health --socket ...          exits 0 if the guard answers (for container healthchecks)
 package main
@@ -47,6 +49,8 @@ func main() {
 	switch os.Args[1] {
 	case "guard":
 		err = runGuard(ctx, log, os.Args[2:])
+	case "docker-policy":
+		err = runDockerPolicy(ctx, log, os.Args[2:])
 	case "scaler":
 		err = runScaler(ctx, log, os.Args[2:])
 	case "health":
@@ -123,24 +127,8 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	mcancel()
 	go g.ReapLoop(ctx)
 
-	_ = os.Remove(*socket)
-	// Create the socket closed to everyone but its owner; it is opened to its group below, after chown.
-	oldMask := syscall.Umask(0o177)
-	ln, err := net.Listen("unix", *socket)
-	syscall.Umask(oldMask)
+	ln, err := listenUnix(*socket, *mode, *gid)
 	if err != nil {
-		return err
-	}
-	m, err := strconv.ParseUint(*mode, 8, 32)
-	if err != nil {
-		return fmt.Errorf("socket-mode: %w", err)
-	}
-	if *gid >= 0 {
-		if err := os.Chown(*socket, -1, *gid); err != nil {
-			return fmt.Errorf("chown socket: %w", err)
-		}
-	}
-	if err := os.Chmod(*socket, os.FileMode(m)); err != nil {
 		return err
 	}
 	srv := &http.Server{Handler: g.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
@@ -152,12 +140,76 @@ func runGuard(ctx context.Context, log *slog.Logger, args []string) error {
 	return nil
 }
 
+// listenUnix creates a unix socket closed to everyone but its owner, then opens it to its group.
+func listenUnix(socket, mode string, gid int) (net.Listener, error) {
+	m, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
+		return nil, fmt.Errorf("socket-mode: %w", err)
+	}
+	_ = os.Remove(socket)
+	oldMask := syscall.Umask(0o177)
+	ln, err := net.Listen("unix", socket)
+	syscall.Umask(oldMask)
+	if err != nil {
+		return nil, err
+	}
+	if gid >= 0 {
+		if err := os.Chown(socket, -1, gid); err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("chown socket: %w", err)
+		}
+	}
+	if err := os.Chmod(socket, os.FileMode(m)); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+// runDockerPolicy serves the Docker policy proxy: the guard's Docker socket, minus everything the guard never asks for.
+func runDockerPolicy(ctx context.Context, log *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("docker-policy", flag.ExitOnError)
+	cfgPath := fs.String("config", env("GUARD_CONFIG", "/etc/runner-scaling/guard.yaml"), "the guard's config file (read-only)")
+	listen := fs.String("listen", env("POLICY_SOCKET", "/run/docker-policy/docker.sock"), "unix socket the guard connects to")
+	mode := fs.String("socket-mode", env("POLICY_SOCKET_MODE", "0660"), "permissions of that socket")
+	gid := fs.Int("socket-gid", -1, "group to give that socket")
+	dockerSock := fs.String("docker", env("DOCKER_SOCKET", "/var/run/docker.sock"), "the real Docker daemon socket")
+	check := fs.Bool("check", false, "validate the config and exit")
+	fs.Parse(args)
+
+	cfg, err := guard.LoadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if *check {
+		fmt.Printf("%s: ok (policy for prefix %s, %d slots)\n", *cfgPath, cfg.Prefix, cfg.MaxSlots)
+		return nil
+	}
+	ln, err := listenUnix(*listen, *mode, *gid)
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler: guard.NewProxy(cfg, *dockerSock, log), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second,
+	}
+	go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
+	log.Info("docker policy listening", "socket", *listen, "docker", *dockerSock, "prefix", cfg.Prefix, "version", version)
+	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
 func runHealth(args []string) error {
 	fs := flag.NewFlagSet("health", flag.ExitOnError)
 	socket := fs.String("socket", env("GUARD_SOCKET", defaultSocket), "guard API socket")
+	policy := fs.String("docker-policy-socket", "", "check the Docker policy proxy on this socket instead of the guard")
 	fs.Parse(args)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if *policy != "" {
+		return guard.PingDocker(ctx, *policy)
+	}
 	_, err := scaler.NewGuardClient(*socket).Info(ctx)
 	return err
 }

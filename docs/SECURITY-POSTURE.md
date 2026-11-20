@@ -8,8 +8,10 @@ reports go through [SECURITY.md](../SECURITY.md).
 
 Self-hosted runners execute whatever a workflow says, on your machine. This tool makes that safer in three ways: each job
 gets a **fresh, single-use container** that is deleted afterwards; the part that talks to GitHub (the **scaler**) has **no
-Docker access**, and the part that has Docker access (the **guard**) has **no network and no GitHub credential**, so
-taking over the scaler does not hand over your host; and a **firewall** keeps jobs off your LAN. It does **not** make it safe
+Docker access**, and the part that decides what to start (the **guard**) has **no network, no GitHub credential, no Docker
+socket and does not run as root**. Only a tiny **Docker policy proxy** holds the socket, and it refuses every Docker call that
+is not exactly a container the guard's config describes. So taking over the scaler, or even the guard, does not hand over
+your host; and a **firewall** keeps jobs off your LAN. It does **not** make it safe
 to run code you do not trust. Use **private repos you control** and treat anyone who can push to them as someone who can run
 commands on this machine.
 
@@ -20,7 +22,8 @@ commands on this machine.
 | **a workflow in an allowed repo** (push access, a bot such as Dependabot, a stolen token) | run code as root *in a runner container*; read that runner's credentials; use the internet; read other jobs' leftovers only through caches (see below). With a Docker pool, run containers in the job's own Docker daemon | reach your LAN or the host's own services (the firewall); keep anything after the job except warm caches from trusted runs. **With a privileged Docker pool they become root on the host**; with Sysbox that route is closed, but the host kernel is still shared |
 | **control of the scaler** (a bug in its GitHub handling, or its credential) | start up to `max_slots` runners built exactly from your config; stop them; register runners in your scale set | create containers of their own design, mount host paths, change images or privileges, point a runner at another server or org (the guard validates every registration against your pinned tenant URL) |
 | **the scaler's GitHub App key** | register runners and so run workflows of their own in your org | anything outside "Self-hosted runners" (the App has no other permission); tokens last an hour |
-| **control of the guard** | everything: it holds the Docker socket, which is root on the host | n/a. This is why the guard is small, has no network, no credentials, a read-only filesystem and a six-call API |
+| **control of the guard** | what the config allows and no more: start and stop containers built exactly from `guard.yaml` (a runner, its Docker sidecar, the config's one-shot helpers), on this pool's own names and networks | create any other container, mount any other host path, run any other image or flag, run commands in containers other than the pool's own sidecars, touch other containers on the host. The [Docker policy proxy](#the-docker-policy-proxy) refuses these even though the guard asks |
+| **control of the Docker policy proxy** | everything: it holds the Docker socket, which is root on the host | n/a. This is why it is small, has no network, a read-only filesystem and runs as an unprivileged user that only has the socket's group |
 | **someone on your LAN** | reach the dashboard (if you turned it on) | reach runners from outside; there is no inbound port. Runners are only reachable by what is on their own network |
 | **a fork or a public repo** | nothing: the runner group blocks public repos, and fork PR workflows are off or need approval | n/a, provided you did QUICKSTART step 2 |
 
@@ -52,7 +55,7 @@ group on the Free plan, and a workflow's `runs-on` chooses the pool.
 ## What it does not do (know these)
 
 1. **It cannot protect you from code you chose to run.** Root in a runner container can read the runner's own credentials, use your internet connection, and attack anything the firewall allows.
-2. **The guard is root-equivalent.** It holds the Docker socket. It is small and isolated, but a flaw in it, or a malicious image tag you pull for it, is a host compromise. Pin its image by digest and verify the attestation.
+2. **The Docker policy proxy is root-equivalent.** It holds the Docker socket. It is small and isolated, but a flaw in it, or a malicious image tag you pull for it, is a host compromise. Pin the image by digest and verify the attestation. The proxy also **trusts `guard.yaml`**: a config that asks for a privileged sidecar (the privileged pool does) gets one. Keep the file writable only by you, and mount it read-only, as the examples do.
 3. **Jobs share the host kernel.** A kernel escape is a host compromise on every pool. Sysbox narrows common routes, it is not a VM.
 4. **Branch pushes can change workflows** on plans without branch protection. Your trust boundary is "who can push to these repos".
 5. **Caches are shared across repos on `main`.** A trusted job in one repo can leave code for a trusted job in another.
@@ -69,49 +72,53 @@ group on the Free plan, and a workflow's `runs-on` chooses the pool.
 - [ ] Image tags are replaced by digests, and `gh attestation verify` passes for the runner-scaling image.
 - [ ] You can see logs after a restart (journald), and you alert on `DENY` bursts, `GATE WITHDRAWN` and `module_blocklist_failures_total`.
 - [ ] The firewall test (`curl` to a LAN address from a job) fails as it should, and you re-run it after Docker or kernel upgrades.
+- [ ] Only `docker-policy` mounts `/var/run/docker.sock`: `docker ps -q | xargs docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' | grep docker.sock` lists nothing else from this stack.
+- [ ] You alert on `DENY` lines from `docker-policy`: the guard never makes a refused call in normal operation, so any is news.
 - [ ] Host patched; Docker and, if used, Sysbox kept current.
 - [ ] A dashboard, if any, is LAN/VPN-only with a changed password.
 
-## Should the guard talk to Docker through a socket proxy?
+## The Docker policy proxy
 
-A socket proxy (for example [`wollomatic/socket-proxy`](https://github.com/wollomatic/socket-proxy) or
-[`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy)) sits between a client and
-`docker.sock` and allows only chosen API paths and methods. It is a good idea for many tools. For the guard it helps
-less than it seems, because **the guard's job is to create containers**, and creating containers is the capability that
-equals root.
+**The problem.** Whatever holds the Docker socket is root on the host: one `POST /containers/create` with `"Privileged": true` and a
+bind mount of `/` is enough. The guard's whole job is to create containers, so a bug in the guard, or something that
+takes it over, would otherwise be the end of the host. A usual Docker socket proxy (for example
+[`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy) or
+[`wollomatic/socket-proxy`](https://github.com/wollomatic/socket-proxy)) filters by method and path only. It cannot tell the guard's
+normal create from a malicious one, because the difference is in the request **body**.
 
-What the guard needs from Docker (every call it makes):
+**What we do instead.** `runner-scaling docker-policy` is a proxy that reads the body. It loads the same `guard.yaml` as the
+guard and, with the guard's own code, rebuilds the one container each request is allowed to be. A request that differs in any field
+(a privileged flag, an extra mount, another image, a capability, a different network, an unknown extra setting) is refused with 403
+and logged as `DENY`. The guard has no Docker socket and does not run as root; it reaches Docker only through the proxy's unix socket.
 
-| Method and path | Used for |
+| Call | What the proxy allows |
 |---|---|
-| `GET /images/{ref}/json`, `POST /images/create` | check and pull the runner and dind images |
-| `GET /networks/{name}`, `POST /networks/create` | per-slot networks (and check their subnet) |
-| `POST /volumes/create`, `DELETE /volumes/{name}` | per-slot work volume |
-| `POST /containers/create`, `POST /containers/{id}/start`, `DELETE /containers/{id}` | create, start, remove runners, dind and one-shot wipers |
-| `GET /containers/json`, `GET /containers/{id}/json`, `GET /containers/{id}/stats` | list, inspect, memory and CPU figures |
-| `POST /containers/{id}/exec`, `POST /exec/{id}/start`, `GET /exec/{id}/json` | wipe the work directory and prune inside dind |
+| `POST /containers/create` | only a container named `<prefix>-runner-N`, `-dind-N` or `-wipe-N` whose whole body equals what the config builds for that slot. A runner's JIT registration is validated against the pinned tenant too. One-shot helpers may only run the guard's own commands (wipe a work directory, wipe or trim the caches, set `memory_high`, write the module blocklist) with exactly the mounts that command uses |
+| start, inspect, stats, remove | only containers that carry the runner-scaling label; removing or starting needs this pool's label |
+| `POST /containers/{id}/exec` | only in this pool's own dind sidecars, only the config's wipe and `prune_on_stop` commands, no extra options; `exec/start` and `exec/json` only for exec ids it saw created |
+| images | only a pull or inspect of exactly the configured images |
+| networks, volumes | only this pool's names, with the config's subnet and labels |
+| everything else | refused: `/info`, `/build`, `/swarm`, `/plugins`, copy-in/out (`archive`), attach, other containers, other API versions, encoded or odd paths, connection upgrades, bodies over 256 KiB |
 
-What a proxy **can** add: it removes everything else from the guard's reach. A taken-over guard could not, through the
-proxy, use `/build`, `/swarm`, `/plugins`, `/system`, `/commit`, copying files in or out of containers
-(`/containers/{id}/archive`), attaching to containers, or changing the daemon's configuration. That is real
-defence in depth against a bug in the guard.
+The guard can still list its own containers, and read the runner-scaling containers of other pools for the shared memory budget.
+It cannot see or touch anything else on the host.
 
-What it **cannot** do: path-and-method filters do not read the request body. `POST /containers/create` with
-`"Privileged": true` or a bind mount of `/` looks identical to the guard's normal request, and an attacker who controls the guard can
-send exactly that. So a proxy does **not** change the statement "the guard is root-equivalent". It narrows it.
+**What it does not do.**
 
-The costs: one more privileged container to trust, update and keep healthy, and the guard container needs a way to reach it without losing its
-`network_mode: none` (a proxy that listens on a unix socket, shared through a volume, keeps that).
+- It trusts the config. If `guard.yaml` says `privileged: true` for the sidecar, a privileged sidecar is allowed. The proxy removes
+  the guard (and the scaler) from your trust base; it does not remove the config.
+- It does not look inside images, and it cannot restrain what a job does inside the container it was given. It is not a VM.
+- It is itself root-equivalent: it holds the socket. It is one file you can read in
+  [`internal/guard/dockerpolicy.go`](../internal/guard/dockerpolicy.go). It reads its config once at start, so restart it with the guard when you change the config.
+- It checks requests, not what the daemon does with a request that is allowed; a Docker or kernel bug is out of its reach.
 
-Our recommendation:
+**How it was tested.** Unit tests drive the real guard through the real proxy against a fake daemon, for the privileged, `work_bind`,
+caches, `memory_high`, module-blocklist and no-dind variants, and fail if the proxy refuses anything the guard does in normal operation. Negative tests
+change one field of a valid request at a time and require a refusal; removing the body comparison makes 21 of them fail.
+It was also run against a real Docker daemon: start and stop of a slot with sidecar, runner, health check, `memory_high` helper, exec, cache
+wipe and removal, with no refusal; then the proxy's socket was attacked with a privileged create, `/info`, a listing of all containers, and
+removing, starting and exec'ing in an unrelated container: all refused. The Sysbox pool was tested the same way on a real daemon (`docker:28-dind` under `sysbox-runc`, `memory_high` on both containers, the module-blocklist helper writing and then removing its host file, a real `docker run` and `docker build` inside the sidecar, teardown with prune and cache wipe). Changing the runtime, privilege, a bind, the network, a capability, a PID mode, the memory limit or the image of that sidecar, one at a time, was refused at exactly that field. A real GitHub job through the whole chain has not been run yet.
 
-- **Optional, not default.** If you want it, use a proxy that supports an allow-list per method and path (regular expressions),
-  allow only the table above, and mount the real socket only into the proxy. **We have not tested this combination.** Treat the
-  table as the starting point, point the guard at the proxy with `--docker <socket path>` (or `DOCKER_SOCKET`), and run your own test
-  of start, job, stop and the memory-stats calls before relying on it. Contributions that add a tested example are welcome.
-- **What would really constrain the guard** is an enforcement point that reads the request body: a Docker authorization plugin
-  (for example one backed by Open Policy Agent) that rejects container creation unless it matches the shape the guard is configured to
-  produce (no `Privileged` unless the config says so, binds only from an allow-list, images only from the config). It protects against a
-  compromised guard, but it is daemon-wide, needs a daemon restart to install, and has not been tried with this project.
-- **The biggest lever you control** is the same as before: keep the guard image pinned by digest and verified, keep its config
-  read-only, and keep its surface small. Rootless Docker or Podman would change the model more fundamentally; they are not supported or tested here.
+**One more layer is possible** if you want it: a Docker authorization plugin (for example one backed by Open Policy Agent) is enforced
+inside the daemon itself, so it would also constrain the proxy. It is daemon-wide, needs a daemon restart to install, and has
+not been tried with this project.
