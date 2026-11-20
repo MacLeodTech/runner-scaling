@@ -36,7 +36,11 @@ commands on this machine.
 | **privileged** | the same, plus a *privileged* dind | **root on the host**, by starting a privileged container | only if you accept that for every repo on that pool |
 
 Move a repo to the least powerful pool that works. The pools are a convention, not a boundary: they share one GitHub runner
-group on the Free plan, and a workflow's `runs-on` chooses the pool.
+group on the Free plan, and a workflow's `runs-on` chooses the pool. Several pools can share one guard, one policy proxy and
+one scaler (one `guard.yaml` with `pools:`); that does not weaken the split: each pool keeps its own names, networks and
+directories, the policy proxy allows a request only when one pool's policy allows all of it, and a request never gets rights from
+another pool's config. The shared parts are the processes, so a bug in the guard or scaler reaches every pool at once, which is
+the case for keeping a pool with **privileged** dind in a stack of its own.
 
 ## What the tool does about it
 
