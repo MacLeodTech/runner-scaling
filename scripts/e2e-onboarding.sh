@@ -20,11 +20,12 @@ fence=$(sed -n 's/^ *FENCE_SRC: *\([0-9./]*\).*/\1/p' compose.yaml)
 test -n "$fence"
 out=$("$RS" firewall --src "$fence" --check 2>&1 || true)   # without NET_ADMIN or the table it fails, but not on the flags
 case "$out" in *"want an IPv4 network"*|*invalid*|*"no source range"*) echo "fence range rejected: $out"; exit 1;; esac
-# 4. doctor: the only finding allowed is the key's owner (a non-root init cannot chown to 65532)
+# 4. doctor: the only findings allowed are the key's owner (a non-root init cannot chown to 65532) and Sysbox (the sysbox pool
+#    is in the stack on purpose, and a CI host has none)
 "$RS" doctor --offline --dir . --json > "$D/doctor.json" || true
 python3 - "$D/doctor.json" <<'PY'
 import json, sys
-bad = [c for c in json.load(open(sys.argv[1])) if c["status"] == "FAIL" and c["name"] != "app key owner"]
+bad = [c for c in json.load(open(sys.argv[1])) if c["status"] == "FAIL" and c["name"] not in ("app key owner", "sysbox runtime")]
 if bad:
     print("unexpected doctor failures:", json.dumps(bad, indent=1)); sys.exit(1)
 PY
