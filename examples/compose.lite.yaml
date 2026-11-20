@@ -1,0 +1,85 @@
+# START HERE. The smallest safe deployment: one pool of runners WITHOUT Docker, plus the firewall sidecar.
+# Follow docs/QUICKSTART.md; this file is step 5 of it. Run it from a directory that holds, side by side:
+#
+#   compose.lite.yaml   (this file, copied as compose.yaml if you like)
+#   guard-lite.yaml     edit github_url (and later tenant_url)
+#   firewall.sh
+#   .env                GITHUB_APP_CLIENT_ID and GITHUB_APP_INSTALLATION_ID (see env.example)
+#   secrets/github_app.pem   the App's private key, owned by uid 65532, mode 0400 (see QUICKSTART, step 3)
+#
+# Runners from this pool are root inside their own container only, not on the host. When you need `docker build` in
+# jobs, add the Sysbox pool: see compose.yaml (two pools) and docs/QUICKSTART.md, "Add a pool that has Docker".
+name: runner-scaling
+
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  # journald keeps logs after the container is removed (journalctl CONTAINER_NAME=<container>). No systemd on the
+  # host? Delete this block: Docker's default json-file driver works, but its logs go when the container does.
+  logging:
+    driver: journald
+    options: {tag: "{{.Name}}"}
+
+services:
+  # Fences the runner networks (jobs reach the internet, not your LAN or the host), then creates /gate/firewall-ok.
+  # The guard starts no slot until that file exists.
+  firewall:
+    <<: *hardened
+    image: docker:28-dind       # only used for its iptables; pin a digest once it works
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    entrypoint: [/bin/sh, /fw/firewall.sh]
+    tmpfs: [/run]
+    environment:
+      FENCE_SRC: 172.30.0.0/16  # must contain every guard's `subnet` range
+    volumes:
+      - ./firewall.sh:/fw/firewall.sh:ro
+      - gate:/gate
+    mem_limit: 32m
+    pids_limit: 32
+
+  # Holds the Docker socket. No network, no credentials: it builds containers only from guard-lite.yaml.
+  guard-lite:
+    <<: *hardened
+    image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest (`docker buildx imagetools inspect <image>`) once it works
+    user: "0:65532"            # root for the Docker socket; group 65532 so the scaler can use the API socket
+    network_mode: none
+    mem_limit: 64m
+    pids_limit: 64
+    command: [guard, --config, /etc/runner-scaling/guard.yaml]
+    healthcheck:
+      test: [CMD, /usr/local/bin/runner-scaling, health]
+      interval: 30s
+    volumes:
+      - ./guard-lite.yaml:/etc/runner-scaling/guard.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - guard-lite-api:/run/runner-scaling
+      - gate:/gate:ro
+
+  # Talks to GitHub (outbound only) and asks the guard for slots. Holds the GitHub App key; has no Docker access.
+  scaler-lite:
+    <<: *hardened
+    image: ghcr.io/macleodtech/runner-scaling:0.10
+    mem_limit: 128m
+    pids_limit: 64
+    command: [scaler, --name, ci-lite, --labels, "self-hosted,linux,x64,ci-lite"]
+    environment:
+      GITHUB_APP_CLIENT_ID: ${GITHUB_APP_CLIENT_ID:?set it in .env}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:?set it in .env}
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github_app_key   # a file, so `docker inspect` never shows the key
+    secrets: [github_app_key]
+    volumes:
+      - guard-lite-api:/run/runner-scaling
+    depends_on:
+      guard-lite: {condition: service_healthy}
+
+secrets:
+  github_app_key:
+    file: ./secrets/github_app.pem
+
+volumes:
+  guard-lite-api:
+  gate:     # a tmpfs: empty after every reboot, so no runner starts before the fence is back
+    driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0755"}

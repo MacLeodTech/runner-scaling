@@ -1,3 +1,7 @@
+# NOT your first file: start with compose.lite.yaml and docs/QUICKSTART.md. This one adds a second pool that has Docker.
+# The `main` pool below uses guard.yaml, whose dind is PRIVILEGED (any job is root on the host). To use Sysbox instead,
+# point it at guard-sysbox.yaml. Secrets here are read from .env; compose.lite.yaml shows the safer secret-as-file way.
+#
 # Example deployment: two pools on one host, each a guard + scaler pair, plus the firewall sidecar.
 #
 #   pool  runs-on labels              runner gets            guard config     slots
@@ -21,7 +25,7 @@ x-hardened: &hardened
 
 x-guard: &guard
   <<: *hardened
-  image: ghcr.io/macleodtech/runner-scaling:0.1   # pin a digest
+  image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
   user: "0:65532"            # root for the Docker socket; group 65532 so the scaler (nonroot) can use the API socket
   network_mode: none         # needs no network: it talks to Docker and the scaler over unix sockets
   mem_limit: 64m
@@ -32,7 +36,7 @@ x-guard: &guard
 
 x-scaler: &scaler
   <<: *hardened
-  image: ghcr.io/macleodtech/runner-scaling:0.1   # pin a digest
+  image: ghcr.io/macleodtech/runner-scaling:0.10   # pin a digest
   mem_limit: 128m
   pids_limit: 64
   env_file: [.env]
