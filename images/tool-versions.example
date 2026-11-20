@@ -1,0 +1,41 @@
+# Tool versions for the CI runner images. KEY=value, one per line, no quotes, no shell. Comments start with #.
+# The consuming repo (e.g. Assay's ci/tool-versions) owns the real file; images/build.sh takes it with --versions.
+# Every download is verified against the checksum below it. A tool missing from the file is simply not installed,
+# except the BASE_* entries, which are required.
+#
+# Example values (amd64), checked against upstream on 2026-11-19.
+
+# Base: the runner image the pools run today. Keep in step with the digest in guard-*.yaml.
+BASE_IMAGE=myoung34/github-runner:ubuntu-noble@sha256:46c0ed292169f619594248cbfa6752d2c5760e170165bb401a2d132f71a2faf7
+
+# Go (also builds govulncheck). sha256 from https://go.dev/dl/?mode=json
+GO_VERSION=1.26.11
+GO_SHA256=9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec
+
+# Node: a primary and an older line (Assay's matrix tests 22 and 24). sha256 from SHASUMS256.txt of the release.
+NODE_VERSION=24.22.3
+NODE_SHA256=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb
+NODE_OLD_VERSION=22.23.5
+NODE_OLD_SHA256=cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8
+
+# JDKs from Ubuntu's signed apt archive (majors, not patch versions). Default java is the first.
+JDK_MAJORS=21 17
+MAVEN_VERSION=3.9.11
+MAVEN_SHA512=bcfe4fe305c962ace56ac7b5fc7a08b87d5abd8b7e89027ab251069faebee516b0ded8961445d6d91ec1985dfe30f8153268843c89aa392733d1a3ec956c9978
+
+# Rust: rustup-init is checked against this sha256; rustup then verifies every toolchain component itself.
+RUSTUP_VERSION=1.29.3
+RUSTUP_INIT_SHA256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+RUST_VERSION=1.100.0
+
+# Security tools. sha256 of the release tarball (gosec_<v>_checksums.txt, gitleaks_<v>_checksums.txt).
+GOSEC_VERSION=2.30.0
+GOSEC_SHA256=3fcce2c4e802ff4169217874602a7df355e9a37bcb6ffaa34b08f3d5f336cdfb
+GITLEAKS_VERSION=8.30.1
+GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+# govulncheck has no release binaries: it is compiled once at build time, verified by Go's checksum database.
+GOVULNCHECK_VERSION=1.9.0
+
+# Playwright (in lite, hence sysbox too). Must equal the version the project resolves, or it asks for another browser build.
+# Playwright publishes no checksums for its browser downloads: the one download here that is not hash-checked.
+PLAYWRIGHT_VERSION=1.64.1
