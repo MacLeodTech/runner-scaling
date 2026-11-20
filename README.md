@@ -10,6 +10,14 @@ Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's
 
 > Status: early (0.x); see the [changelog](CHANGELOG.md). The scale set API and the `actions/scaleset` module are in public preview.
 
+**New here? Start with these, in order:**
+
+1. [docs/SECURITY-POSTURE.md](docs/SECURITY-POSTURE.md): what this protects, what it does not, and what you must do yourself. Five minutes.
+2. [docs/QUICKSTART.md](docs/QUICKSTART.md): host checks, GitHub App, files, first job, step by step, from nothing to a working runner.
+3. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): symptoms, causes and fixes, and a table of every message you will see.
+
+The rest of this README is the reference: how it works, every setting, operations, metrics and the dashboard.
+
 ## How it works
 
 ```mermaid
@@ -45,12 +53,13 @@ The software has two parts, both in one small image (`runner-scaling guard` / `r
 - **The scaler** registers a runner scale set, receives job messages, and asks GitHub for a single-use
   just-in-time (JIT) runner config whenever it needs a runner. It hands that config to the guard. It never
   touches Docker.
-- **The guard** owns the Docker socket and exposes five calls to the scaler, on a unix socket:
+- **The guard** owns the Docker socket and exposes six calls to the scaler, on a unix socket:
 
   | Call | What it does |
   |---|---|
   | `GET /v1/info` | prefix, slot count, work dir, GitHub URL |
   | `GET /v1/slots` | which slots exist and their state |
+  | `GET /v1/counters` | refusal and lifecycle counters (for metrics) |
   | `PUT /v1/slots/{n}` | `{runner_name, jit_config}`: start slot *n* |
   | `DELETE /v1/slots/{n}` | stop slot *n* |
   | `POST /v1/slots/{n}/keep-cache` | `{runner_name}`: the job on slot *n* is trusted, so keep its caches (see [Caches](#caches)) |
@@ -111,7 +120,7 @@ They can't:
   has no way to express any of that;
 - point a runner at a server of their own, or at a GitHub org of their own. The guard checks every JIT config
   (see below);
-- reach the Docker API in any other way. Every request outside the five calls above is refused and logged as `DENY`.
+- reach the Docker API in any other way. Every request outside the six calls above is refused and logged as `DENY`.
 
 **What the guard checks in a JIT config.** A JIT config isn't signed, and a runner trusts whatever servers it
 names. The guard decodes it and requires that:
@@ -124,8 +133,8 @@ names. The guard decodes it and requires that:
 
 **Not solved by this tool. Know these before you use it:**
 - **The guard itself is root-equivalent**, because it holds the Docker socket. It is kept small: no network, no
-  credentials, a fixed five-call API, read-only filesystem, all capabilities dropped.
-- **With the dind sidecar, any job is root on the host.** The sidecar is privileged, so a job can start a
+  credentials, a fixed six-call API, read-only filesystem, all capabilities dropped.
+- **With a privileged dind sidecar, any job is root on the host.** (Sysbox narrows this route; see below.) The sidecar is privileged, so a job can start a
   `--privileged` container against it and mount the host's disk. The guard's API limits what a taken-over *scaler*
   can ask for; it does not limit what a *job* can do. Anyone who can get a workflow onto a repo that uses these
   runners (a push to any branch, a bot such as Dependabot, a stolen token) can run code as root on the host, and so
@@ -158,10 +167,8 @@ names. The guard decodes it and requires that:
 
 ## Setup
 
-> **Image availability: private preview.** CI builds and attests `ghcr.io/macleodtech/runner-scaling` on every `v*`
-> tag, but the package is not public yet, so `docker pull` fails for anyone outside the org. Build it yourself for now:
-> `docker build -t runner-scaling:local .`, and use that tag wherever the examples name the ghcr image. The package will
-> be made public once the project settles; digests and tags won't change when it is.
+> **Image:** `ghcr.io/macleodtech/runner-scaling` is public. CI builds and attests it on every `v*` tag. Pin a tag or digest
+> in your compose file rather than `:latest`, and check the attestation with `gh attestation verify`.
 
 1. **Credentials for the scaler.** A GitHub App (recommended: `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_INSTALLATION_ID`,
    `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_FILE`) with organization *Self-hosted runners: read and

@@ -1649,3 +1649,48 @@ func TestHostPressureBackstop(t *testing.T) {
 		}
 	})
 }
+
+func TestPruneSkippedWhenDockerStoreIsWiped(t *testing.T) {
+	g, f := newGuard(t)
+	g.cfg.CacheDirs = []string{"/srv/runners/{slot}/docker"} // dind's /var/lib/docker bind is a cache dir
+	ctx := context.Background()
+	req := api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}
+
+	// Untrusted job: the store is wiped after teardown, so pruning it first is wasted time.
+	if err := g.Start(ctx, 1, req); err != nil {
+		t.Fatal(err)
+	}
+	f.execs = nil
+	g.Stop(ctx, 1)
+	if len(f.execs) != 0 {
+		t.Errorf("pruned a store that is about to be wiped: %v", f.execs)
+	}
+
+	// Trusted job (cache kept): the store survives, so it is pruned.
+	if err := g.Start(ctx, 1, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.KeepCache(ctx, 1, "ci-1-abcd12"); err != nil {
+		t.Fatal(err)
+	}
+	f.execs = nil
+	g.Stop(ctx, 1)
+	if len(f.execs) != 1 {
+		t.Errorf("expected one prune for a kept store, got %v", f.execs)
+	}
+}
+
+func TestDindStoreWiped(t *testing.T) {
+	g, _ := newGuard(t)
+	if g.dindStoreWiped(1, true) {
+		t.Error("no cache_dirs: nothing is wiped")
+	}
+	g.cfg.CacheDirs = []string{"/srv/runners/{slot}/docker"}
+	if !g.dindStoreWiped(2, true) || g.dindStoreWiped(2, false) {
+		t.Error("wipe flag not respected")
+	}
+	g.cfg.CacheDirs = []string{"/srv/runners/{slot}/other"}
+	if g.dindStoreWiped(1, true) {
+		t.Error("unrelated cache dir matched")
+	}
+}

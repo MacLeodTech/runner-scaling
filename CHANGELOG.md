@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Changed
+- The guard no longer runs `prune_on_stop` when the slot's dind data is a `cache_dirs` entry that is about to be wiped (an untrusted job). The prune held the slot for nothing.
+- `Reap` tears down several slots at once instead of one after another, so one slow teardown no longer delays the others, `max_runtime` or the memory backstop by the sum of their prune and wipe times.
+
+### Documentation
+- New [docs/QUICKSTART.md](docs/QUICKSTART.md) (host checks, GitHub App, files, first job, tenant pin, hardening, adding a Docker pool, day two), [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and [docs/SECURITY-POSTURE.md](docs/SECURITY-POSTURE.md) (who can do what, pool choice, checklist, and whether the guard should use a Docker socket proxy).
+- `examples/compose.lite.yaml` (firewall + a no-Docker pool, key as a file) and `examples/env.example`: the smallest safe first deployment.
+- The example compose files pinned `:0.1`, a version whose guard rejects the example configs; they now pin `:0.10`.
+- README: start-here links, the guard API is six calls (not five).
+
+### Repository
+- The ghcr package is public; README and the example compose file no longer say "private preview".
+- Dependabot for GitHub Actions, Go modules and the Dockerfile base images.
+
 ## [0.10.0] - 2026-11-20
 
 ### Added
