@@ -10,6 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 - `Reap` tears down several slots at once instead of one after another, so one slow teardown no longer delays the others, `max_runtime` or the memory backstop by the sum of their prune and wipe times.
 
 ### Repository
+- The ghcr package is public; README and the example compose file no longer say "private preview".
 - Dependabot for GitHub Actions, Go modules and the Dockerfile base images.
 
 ## [0.10.0] - 2026-11-20

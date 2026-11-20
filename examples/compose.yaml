@@ -4,9 +4,6 @@
 #   main  [self-hosted, ci]           its own Docker daemon  guard.yaml       2
 #   lite  [self-hosted, ci-lite]      no Docker              guard-lite.yaml  4
 #
-# The image below is in private preview (the ghcr package isn't public yet): build it with
-# `docker build -t runner-scaling:local .` and use that tag instead.
-#
 # Put GITHUB_APP_* (or GITHUB_TOKEN) in .env next to this file. Both pools share one memory budget
 # (memory_budget in both guard configs). Start with `docker compose up -d`.
 name: runner-scaling
