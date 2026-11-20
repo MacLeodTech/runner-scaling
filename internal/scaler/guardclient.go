@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/MacLeodTech/runner-scaling/internal/api"
@@ -24,7 +25,21 @@ type Guard interface {
 }
 
 // GuardClient talks to the guard over its unix socket.
-type GuardClient struct{ c *http.Client }
+type GuardClient struct {
+	c    *http.Client
+	pool string // "" for the socket root (a single-pool guard), or the pool addressed as /v1/pools/<pool>/...
+}
+
+// Pool returns a client for one pool of a multi-pool guard; it shares the connection.
+func (g *GuardClient) Pool(name string) *GuardClient {
+	return &GuardClient{c: g.c, pool: name}
+}
+
+// Pools lists the pools the guard runs, with their labels.
+func (g *GuardClient) Pools(ctx context.Context) ([]api.Info, error) {
+	var out []api.Info
+	return out, g.do(ctx, http.MethodGet, "/v1/pools", nil, &out, http.StatusOK)
+}
 
 func NewGuardClient(socket string) *GuardClient {
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -53,6 +68,9 @@ func (g *GuardClient) do(ctx context.Context, method, path string, body, out any
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if g.pool != "" { // the single-pool paths, under the pool: /v1/slots -> /v1/pools/<pool>/slots
+		path = "/v1/pools/" + g.pool + strings.TrimPrefix(path, "/v1")
+	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://guard"+path, rd)
 	if err != nil {
 		return err

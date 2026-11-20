@@ -103,6 +103,60 @@ type Counters interface {
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	out := s.metricsText(ctx)
+	if len(s.Locals) > 0 {
+		parts := []string{out}
+		for _, l := range s.Locals {
+			parts = append(parts, l.metricsText(ctx))
+		}
+		out = mergeExpositions(parts)
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	io.WriteString(w, out)
+}
+
+// mergeExpositions joins several pools' metric text into one: each family's HELP/TYPE once, all its samples together.
+func mergeExpositions(parts []string) string {
+	var order []string
+	head := map[string][]string{}
+	body := map[string][]string{}
+	for _, part := range parts {
+		cur := ""
+		for _, ln := range strings.Split(part, "\n") {
+			if ln == "" {
+				continue
+			}
+			if f, ok := strings.CutPrefix(ln, "# HELP "); ok {
+				cur, _, _ = strings.Cut(f, " ")
+				if _, seen := head[cur]; !seen {
+					order = append(order, cur)
+					head[cur] = []string{ln}
+				}
+				continue
+			}
+			if strings.HasPrefix(ln, "# TYPE ") {
+				if len(head[cur]) == 1 {
+					head[cur] = append(head[cur], ln)
+				}
+				continue
+			}
+			body[cur] = append(body[cur], ln)
+		}
+	}
+	var b strings.Builder
+	for _, f := range order {
+		for _, l := range head[f] {
+			b.WriteString(l + "\n")
+		}
+		for _, l := range body[f] {
+			b.WriteString(l + "\n")
+		}
+	}
+	return b.String()
+}
+
+func (s *Server) metricsText(ctx context.Context) string {
 	snap := s.Tracker.Snapshot()
 	pool := fmt.Sprintf("pool=%q,", s.Name)
 	p := wrap(pool)
@@ -208,9 +262,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	io.WriteString(w, b.String())
+	return b.String()
 }
 
 func mapsKeys[V any](m map[string]V) func(yield func(string) bool) {

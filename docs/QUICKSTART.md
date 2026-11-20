@@ -6,6 +6,7 @@ starts with the **safest and smallest** setup (runners without Docker) and shows
 How to read it: every step says **You do** (something only you can do) and what the tool does for you. Each step ends
 with a **Check** so you know it worked before you move on.
 
+- [The fast path (recommended)](#the-fast-path-recommended)
 - [0. What you are building, and what it costs you](#0-what-you-are-building-and-what-it-costs-you)
 - [1. Check the host](#1-check-the-host)
 - [2. Prepare GitHub](#2-prepare-github)
@@ -22,19 +23,62 @@ Stuck? See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). Want the risks first? Read
 
 ---
 
+## The fast path (recommended)
+
+`runner-scaling` also ships as a setup tool. It checks your host, creates the GitHub App through your browser, and writes
+every file in steps 3 and 4 for you. Steps 0 to 7 below explain what each piece is and are the manual route; read step 0 and
+[SECURITY-POSTURE.md](SECURITY-POSTURE.md) either way, and do step 2 (limiting who can use the runners) yourself.
+
+```
+# 1. Get the tool (Linux; use the arm64 file on a Raspberry Pi-class machine) and verify it
+V=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/MacLeodTech/runner-scaling/releases/latest | sed 's#.*/##')
+curl -fsSLO https://github.com/MacLeodTech/runner-scaling/releases/download/$V/runner-scaling-linux-amd64
+curl -fsSL https://github.com/MacLeodTech/runner-scaling/releases/download/$V/SHA256SUMS | grep runner-scaling-linux-amd64 | sha256sum -c
+chmod +x runner-scaling-linux-amd64 && mv runner-scaling-linux-amd64 runner-scaling
+
+# 2. Is this host ready? Every FAIL line says how to fix it.
+./runner-scaling doctor
+
+# 3. Do QUICKSTART step 2 (runner group and workflow settings) on github.com, then:
+./runner-scaling init --org YOUR-ORG --create-app --dir ~/runner-scaling
+```
+
+`init --create-app` prints an address. Open it in a browser signed in to GitHub as an owner of the organization, press the
+button, press **Create GitHub App**, then **Install** it on the organization. The terminal picks up the Client ID and
+installation id by itself, writes `compose.yaml`, `guard.yaml`, `.env` and `secrets/github_app.pem`
+(a free subnet, slots and memory sized for this host), and runs `doctor` on the result. It then prints the one `sudo chown`
+command that hands the key to the scaler's user. (On a headless host: `--listen 127.0.0.1:8765` and
+`ssh -L 8765:127.0.0.1:8765 <host>` from your laptop.) Already made an App by hand? Use `--client-id`, `--installation-id`
+and `--key-file` instead of `--create-app`. Want runners with their own Docker as well (after
+[installing Sysbox](SYSBOX.md))? Add `--pools lite,sysbox`; it is still one stack of four containers.
+
+```
+# 4. Start it
+cd ~/runner-scaling && docker compose up -d
+
+# 5. Run any workflow on  runs-on: [self-hosted, lite]  (step 6 has a ready-made one). The guard refuses its first
+#    registration on purpose; this shows what it saw, asks you to confirm it is your organization's, pins it and restarts:
+./runner-scaling pin-tenant --dir ~/runner-scaling
+```
+
+Then continue at [step 6's check](#6-run-a-first-job-and-pin-the-tenant) (the job should now run and the LAN should be
+blocked) and [step 7](#7-make-it-permanent-and-safe). Something off? `runner-scaling doctor --dir ~/runner-scaling` again.
+
+---
+
 ## 0. What you are building, and what it costs you
 
-Three small containers and one helper run all the time. They hold **no runners while idle**, and each holds only what it
+Four small containers run all the time, however many kinds of runner (pools) you add. They hold **no runners while idle**, and each holds only what it
 needs:
 
 ```
 GitHub <-- outbound HTTPS only -- scaler --unix--> guard --unix--> docker-policy --docker.sock--> Docker
                                     |                |                  |
                       holds the GitHub App key  builds a runner   checks EVERY Docker call against
-                      has NO Docker access      from guard-lite   guard-lite.yaml; refuses anything
-                                                .yaml only. No    that differs by one field. The
-                                                network, key or   only container with the Docker
-                                                socket; not root  socket. No network; not root
+                      has NO Docker access      from guard.yaml   guard.yaml; refuses anything
+                      one scale set per pool    only. No network, that differs by one field. The
+                                                key or socket;    only container with the Docker
+                                                not root          socket. No network; not root
 ```
 
 When a job is queued, the scaler gets a single-use runner registration from GitHub and hands it to the guard. The
@@ -47,7 +91,7 @@ What you must accept (details in [SECURITY-POSTURE.md](SECURITY-POSTURE.md)):
 - **Only run code you trust.** Anyone who can get a workflow onto a repo that uses these runners can run code on your
   hardware. Use **private repos only**, and never public ones.
 - **`docker-policy` holds the Docker socket**, which is root on the host. It is kept tiny on purpose, and it is the one
-  place that decides what Docker is asked to do, so keep `guard-lite.yaml` writable only by you.
+  place that decides what Docker is asked to do, so keep `guard.yaml` writable only by you.
 - Runners without Docker (this quickstart) are root inside their container, not on the host. Runners **with** Docker
   are a bigger risk and are covered [at the end](#add-a-pool-that-has-docker).
 
@@ -63,7 +107,7 @@ org see the [README](../README.md#without-an-organization-repo-level-scale-set))
 | Docker Engine 25 or newer | the guard speaks Engine API v1.44 | `docker version --format '{{.Server.Version}} (api {{.Server.APIVersion}})'` | API `1.44` or higher |
 | Docker Compose v2 | runs the stack | `docker compose version` | `v2.x` or newer |
 | A normal (rootful) Docker | the guard needs the real socket; rootless Docker is untested | `docker info --format '{{.SecurityOptions}}'` | does **not** list `rootless` |
-| `iptables` working in the kernel | the firewall sidecar fences the runners | `sudo iptables -L -n \| head -3` | prints chains, no error |
+| `nf_tables` in the kernel | the firewall sidecar fences the runners | `sudo nft list tables` (or `sudo iptables -L -n \| head -3`) | no error |
 | cgroup v2 (recommended) | only `memory_high` needs it; the memory budget works on v1 | `stat -fc %T /sys/fs/cgroup` | `cgroup2fs` |
 | Correct clock | the GitHub App signs short-lived tokens; a skewed clock is rejected | `timedatectl \| grep synchronized` | `System clock synchronized: yes` |
 | Outbound HTTPS (443) | the scaler and runners reach GitHub and GHCR | `curl -sI https://api.github.com \| head -1` and `curl -sI https://ghcr.io \| head -1` | an `HTTP` status line |
@@ -140,29 +184,30 @@ the Client ID and installation ID for the next step.
 
 | Copy | As | What it is |
 |---|---|---|
-| `compose.lite.yaml` | `compose.yaml` | the firewall, docker-policy, guard and scaler containers |
-| `guard-lite.yaml` | `guard-lite.yaml` | **the one config that decides what a runner is** |
-| `firewall.sh` | `firewall.sh` | the firewall sidecar's script |
+| `compose.yaml` | `compose.yaml` | the firewall, docker-policy, guard and scaler containers |
+| `guard-pools.yaml` | `guard.yaml` | **the one config that decides what a runner is**: one block per kind of runner (pool) |
 | `env.example` | `.env` | your GitHub App identifiers and the Docker socket's group id |
 
 Then edit:
 
 1. **`.env`**: put in your Client ID and installation ID, and the Docker socket's group id: `DOCKER_GID=$(stat -c %g /var/run/docker.sock)`
    (a number such as `988` or `999`). `docker-policy` joins that group so it can use the socket without running as root.
-2. **`guard-lite.yaml`**: set `github_url: https://github.com/YOUR-ORG`. Leave `tenant_url` commented out for now
-   (step 6 explains). The defaults (4 slots, 3 GB per runner, 8 GB total, 6 h job limit) suit a 16 GB machine; lower
-   `max_slots` and `memory_budget` on a smaller one. `memory_budget` must be at least what one slot may use (here 3 GB).
+2. **`guard.yaml`**: set `github_url: https://github.com/YOUR-ORG`. Leave `tenant_url` commented out for now
+   (step 6 explains). The file has two pools, `lite` and `sysbox`; **delete the whole `sysbox` block** (from `# >>> pool sysbox`
+   to `# <<< pool sysbox`) unless you have [installed Sysbox](SYSBOX.md): this quickstart needs only `lite`. The defaults
+   (4 slots, 3 GB per runner, 8 GB total, 6 h job limit) suit a 16 GB machine; lower `max_slots` and `memory_budget` on a
+   smaller one. `memory_budget` is one cap for all pools and must be at least what one slot may use (3 GB for `lite`).
 3. **No systemd on the host?** In `compose.yaml` delete the `logging:` block under `x-hardened`.
 4. **Your LAN already uses `172.30.0.0/16`?** Pick another unused private range and change it in three places: `subnet`
-   in `guard-lite.yaml`, and `FENCE_SRC` in `compose.yaml`. Check with `ip route` and `docker network ls`.
+   in each pool of `guard.yaml`, and `FENCE_SRC` in `compose.yaml`. Check with `ip route` and `docker network ls`.
 
 Validate the config before starting anything (this runs the guard's own checker, nothing is started):
 
 ```
-docker run --rm -v "$PWD/guard-lite.yaml:/c.yaml:ro" ghcr.io/macleodtech/runner-scaling:0.11 guard --check --config /c.yaml
+docker run --rm -v "$PWD/guard.yaml:/c.yaml:ro" ghcr.io/macleodtech/runner-scaling:0.12 guard --check --config /c.yaml
 ```
 
-**Check:** it prints `…: ok (prefix ci-lite, 4 slots, tenant pinned: false)`. A bad key or value is named in the
+**Check:** it prints `…: ok (pool lite, prefix ci-lite, 4 slots, tenant pinned: false)`, one line per pool. A bad key or value is named in the
 error. Warnings that images are "not pinned by digest" are expected for now (see step 7).
 
 ## 5. Start it
@@ -180,13 +225,13 @@ following the logs; the stack keeps running.
 
 What the tool does: the firewall container applies its rules and creates the gate file; the guard waits for that file,
 pulls the images, and starts listening; the scaler waits for the guard, then registers a *scale set* named `ci-lite` in
-your organization.
+your organization (one per pool, so a stack with two pools registers two).
 
 **Check:**
-- `docker compose ps` shows `firewall`, `docker-policy` (healthy), `guard-lite` (healthy) and `scaler-lite` running.
-- The scaler log says `scale set ready` with the labels `self-hosted, linux, x64, ci-lite`.
+- `docker compose ps` shows `firewall`, `docker-policy` (healthy), `guard` (healthy) and `scaler` running.
+- The scaler log says `scale set ready` with the labels `self-hosted, linux, x64, lite` (and `sysbox` for that pool).
 - On GitHub: Organization settings > Actions > Runners > **Runner scale sets** lists `ci-lite`.
-- Nothing else runs: `docker ps` shows only these three, because there is no job yet.
+- Nothing else runs: `docker ps` shows only these four, because there is no job yet.
 
 ## 6. Run a first job (and pin the tenant)
 
@@ -205,7 +250,7 @@ refused forever.
    on: workflow_dispatch
    jobs:
      hello:
-       runs-on: [self-hosted, ci-lite]
+       runs-on: [self-hosted, lite]
        steps:
          - run: |
              echo "hello from $(hostname)"
@@ -216,24 +261,24 @@ refused forever.
    Use an address of a real device on your LAN in the last line. Then run it: `gh workflow run hello.yml -R YOUR-ORG/YOUR-REPO`.
 2. Within a minute the guard logs a refusal:
    ```
-   docker compose logs guard-lite | grep DENY
+   docker compose logs guard | grep DENY
    ```
    It contains `no tenant_url pinned: this config's ServerUrl is "https://pipelines….actions.githubusercontent.com/<tenant>/"`.
 3. **Confirm it is yours.** This is the only trust decision in setup: you are telling the guard which GitHub service to
    accept runners from. It is safe here because the refused registration came from *your* scaler, using *your* App, on a
    machine you just set up. (Do this on a fresh setup, before anything untrusted can reach the scaler.)
-4. Put that URL in `guard-lite.yaml` as `tenant_url:` (uncomment the line), then restart the policy and the guard (both read
+4. Put that URL in `guard.yaml` as `tenant_url:` (or let `runner-scaling pin-tenant --dir .` show it, ask, edit and restart for you) (uncomment the line), then restart the policy and the guard (both read
    the file, and the policy checks the registration too):
    ```
-   docker compose restart docker-policy guard-lite
+   docker compose restart docker-policy guard
    ```
-5. The scaler retries by itself within about 15 seconds. Watch the job start: `docker compose logs -f guard-lite`
+5. The scaler retries by itself within about 15 seconds. Watch the job start: `docker compose logs -f guard`
    shows `slot started`, and `docker ps` shows a `ci-lite-runner-1` container.
 
 **Check:**
 - The workflow run succeeds. Its log shows the hostname (a `ci-lite-1-…` name), `internet: 200`, `LAN blocked (good)`.
 - A minute later the runner container is gone again (`docker ps`).
-- `docker compose logs guard-lite docker-policy | grep DENY` shows no new lines.
+- `docker compose logs guard docker-policy | grep DENY` shows no new lines.
 
 If the LAN line says `LAN REACHABLE`, **stop**: the fence is not working. Do not run real jobs. See
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-firewall-does-not-block-the-lan).
@@ -245,22 +290,22 @@ If the LAN line says `LAN REACHABLE`, **stop**: the fence is not working. Do not
 1. **Start on boot.** The containers have `restart: unless-stopped`, so they come back when Docker does. Reboot once
    and confirm a job still starts. The gate file lives on a tmpfs, so after a reboot no runner starts until the
    firewall has re-applied its rules; that is intended.
-2. **Point repos at it.** Use `runs-on: [self-hosted, ci-lite]` in the workflows that should run here. To switch a
+2. **Point repos at it.** Use `runs-on: [self-hosted, lite]` in the workflows that should run here. To switch a
    repo without editing workflows, write them as `runs-on: ${{ fromJSON(vars.RUNNER || '"ubuntu-latest"') }}` and set
-   the repo variable: `gh variable set RUNNER --body '["self-hosted","ci-lite"]' -R YOUR-ORG/REPO` (delete it to go back to GitHub's runners).
+   the repo variable: `gh variable set RUNNER --body '["self-hosted","lite"]' -R YOUR-ORG/REPO` (delete it to go back to GitHub's runners).
 3. **Pin the images.** The example uses tags so it works first time. A tag can change under you, and the guard image holds
    the Docker socket, so pin by digest (the docker:28-dind image too):
    ```
-   docker pull ghcr.io/macleodtech/runner-scaling:0.11
-   docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/macleodtech/runner-scaling:0.11   # prints name@sha256:…
+   docker pull ghcr.io/macleodtech/runner-scaling:0.12
+   docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/macleodtech/runner-scaling:0.12   # prints name@sha256:…
    ```
    Put that `…@sha256:…` value in `compose.yaml` (both services), the same for the
-   `docker:28-dind` image, and for `runner.image` in `guard-lite.yaml`
+   `docker:28-dind` image, and for `runner.image` in `guard.yaml`
    (`docker pull ghcr.io/actions/actions-runner:<tag>`, then use the digest `docker inspect` reports under `RepoDigests`).
-   Verify where the runner-scaling image came from (needs `gh` 2.49 or newer): `gh attestation verify oci://ghcr.io/macleodtech/runner-scaling:0.11 -R MacLeodTech/runner-scaling`.
+   Verify where the runner-scaling image came from (needs `gh` 2.49 or newer): `gh attestation verify oci://ghcr.io/macleodtech/runner-scaling:0.12 -R MacLeodTech/runner-scaling`.
    A passing check means the image was built by this repo's CI from a tagged commit.
 4. **Keep the runner image current.** GitHub stops accepting runners that are too old, and then jobs just wait. Run
-   `scripts/check-runner-image.sh guard-lite.yaml` now and then (it exits 1 when you are behind); the bump routine is
+   `scripts/check-runner-image.sh guard.yaml` now and then (it exits 1 when you are behind); the bump routine is
    in the [README](../README.md#keeping-the-runner-image-current).
 5. **Back up nothing.** There is no state to lose: no database, no volumes you care about. The config files and the
    `.pem` are the whole install; keep a copy of those somewhere safe.
@@ -272,29 +317,28 @@ own private one (a "dind" sidecar). That is the main risk step, because the side
 
 | Variant | Config | Risk |
 |---|---|---|
-| Sysbox (recommended) | [`guard-sysbox.yaml`](../examples/guard-sysbox.yaml) | Root in the sidecar maps to an unprivileged host user. Jobs cannot see host disks or devices. Needs Sysbox installed on the host. Jobs still share the host kernel. |
-| Privileged | [`guard.yaml`](../examples/guard.yaml) | **Any job is root on the host.** Use only if you accept that for every repo on the pool. |
+| Sysbox (recommended) | the `sysbox` pool of [`guard-pools.yaml`](../examples/guard-pools.yaml) | Root in the sidecar maps to an unprivileged host user. Jobs cannot see host disks or devices. Needs Sysbox installed on the host. Jobs still share the host kernel. |
+| Privileged | [`guard.yaml`](../examples/guard.yaml) (a stack of its own) | **Any job is root on the host.** Use only if you accept that for every repo on the pool. |
 
 **You do** (Sysbox):
 
-1. Install Sysbox on the host and register it with Docker. Follow the
-   [Sysbox install guide](https://github.com/nestybox/sysbox/blob/master/docs/user-guide/install-package.md) and read the
-   README's [Running dind under Sysbox](../README.md#running-dind-under-sysbox) notes first: there is an AppArmor override, and
-   Sysbox adds two host services (`sysbox-mgr`, `sysbox-fs`) that Docker then depends on. Check: `docker info --format '{{json .Runtimes}}'` lists `sysbox-runc`.
-2. Copy `guard-sysbox.yaml` next to the others and set `github_url`, then copy the `docker-policy`, `guard` and `scaler`
-   blocks from [`compose.yaml`](../examples/compose.yaml) as a new trio (own `prefix`, `subnet` inside your fence, API
-   volumes and `--name`/`--labels`, for example `ci-sysbox`). Every pool gets **its own** `docker-policy`, because each
-   one is bound to one guard config. Keep `memory_budget` identical in every guard: it is shared.
-3. Start it, run a job with `docker run hello-world` on `runs-on: [self-hosted, ci-sysbox]`, and pin the tenant the same
+1. Install Sysbox on the host and register it with Docker: follow [SYSBOX.md](SYSBOX.md) (install, the AppArmor override some
+   Ubuntu hosts need, and a job that proves a nested privileged container cannot see your disks).
+   Check: `runner-scaling doctor --sysbox` is green.
+2. Add the pool to `guard.yaml`: copy the `sysbox` block from [`guard-pools.yaml`](../examples/guard-pools.yaml) under `pools:`
+   (and the `x-runner` anchor above it if you removed it). Its `prefix`, labels and `subnet` (inside your fence) are already
+   its own. **No new containers**: restart `docker compose restart docker-policy guard scaler`; the scaler finds the
+   new pool and registers a second scale set, `ci-sysbox`. `memory_budget` is one value for every pool.
+3. Start it, run a job with `docker run hello-world` on `runs-on: [self-hosted, sysbox]`, and pin the tenant the same
    way as in step 6 (it is the same URL; paste it in).
 4. Move repos over one at a time, and only the ones that need Docker.
 
 ## Day two: updating, watching, removing
 
-- **See what is happening.** `docker compose ps`; `docker compose logs --tail 50 docker-policy guard-lite scaler-lite`; refusals:
-  `docker compose logs guard-lite docker-policy | grep DENY` (or `journalctl CONTAINER_NAME=<container> | grep DENY`). An optional dashboard,
+- **See what is happening.** `docker compose ps`; `docker compose logs --tail 50 docker-policy guard scaler`; refusals:
+  `docker compose logs guard docker-policy | grep DENY` (or `journalctl CONTAINER_NAME=<container> | grep DENY`). An optional dashboard,
   Prometheus metrics and a read-only `runners` command-line tool are in the [README](../README.md#dashboard).
-- **Changed a guard config?** Restart that pool's `docker-policy` **and** its guard (`docker compose restart docker-policy guard-lite`):
+- **Changed a guard config?** Restart `docker-policy` **and** the guard (`docker compose restart docker-policy guard`):
   both read the file once at start, and the policy refuses what the old file did not describe.
 - **Update.** Read the [CHANGELOG](../CHANGELOG.md), change the image tag (or digest) in `compose.yaml`, then
   `docker compose pull && docker compose up -d`. Restarting does not kill running jobs. Config keys can change between
@@ -302,9 +346,9 @@ own private one (a "dind" sidecar). That is the main risk step, because the side
 - **Add repos / remove repos.** Change the runner group's repository access on GitHub (step 2). Nothing to restart.
 - **Remove everything.**
   ```
-  docker compose stop scaler-lite                                   # the scale set can't be deleted while the scaler holds it open
-  docker compose run --rm scaler-lite scaler --delete-scale-set    # remove the scale set from GitHub
+  docker compose stop scaler                                   # the scale set can't be deleted while the scaler holds it open
+  docker compose run --rm scaler scaler --delete-scale-set          # remove the scale sets (all pools) from GitHub
   docker compose down                                               # stops the rest (running jobs are killed)
-  docker rm -f $(docker ps -aq -f label=io.github.runner-scaling.instance=ci-lite)   # any leftover runner containers
+  docker rm -f $(docker ps -aq -f label=io.github.runner-scaling.instance)   # any leftover runner containers
   ```
   Then delete the GitHub App, `/opt/runner-scaling`, and the per-slot directories under `/srv/runner-scaling`.

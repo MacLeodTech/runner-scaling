@@ -104,7 +104,15 @@ func (d *fakeDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out(200, map[string]any{"Running": false, "ExitCode": 0})
 	case r.Method == "GET" && path == "/containers/json":
 		var all []map[string]any
+		var f map[string][]string
+		_ = json.Unmarshal([]byte(r.URL.Query().Get("filters")), &f)
 		for _, c := range d.ctrs {
+			if l := f["label"]; len(l) == 1 { // the daemon's label filter: "key" or "key=value"
+				k, v, hasV := strings.Cut(l[0], "=")
+				if got, ok := c.labels[k]; !ok || hasV && got != v {
+					continue
+				}
+			}
 			all = append(all, map[string]any{"Id": c.id, "Names": []string{"/" + c.name}, "Labels": c.labels, "State": c.status, "Created": 1})
 		}
 		out(200, all)
@@ -185,7 +193,7 @@ func newPolicyRig(t *testing.T, mutate func(*Config)) *policyRig {
 	t.Cleanup(func() { dsrv.Close() })
 
 	logs := &bytes.Buffer{}
-	px := NewProxy(cfg, dsock, slog.New(slog.NewTextHandler(logs, nil)))
+	px := NewProxy([]*Config{cfg}, dsock, slog.New(slog.NewTextHandler(logs, nil)))
 	psock := filepath.Join(dir, "p.sock")
 	pln, err := net.Listen("unix", psock)
 	if err != nil {

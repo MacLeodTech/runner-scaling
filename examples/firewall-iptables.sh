@@ -1,4 +1,7 @@
 #!/bin/sh
+# LEGACY iptables version. The default is now `runner-scaling firewall` (nftables over netlink, own table, IPv6, 3s
+# repair, no extra binary); use this only on a host whose kernel has iptables but not nf_tables.
+#
 # Firewall sidecar: fences the runner networks so a job can reach the internet but not your LAN, other Docker
 # networks or the host itself, then tells the guards it is safe to start runners.
 #

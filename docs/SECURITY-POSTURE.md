@@ -36,7 +36,11 @@ commands on this machine.
 | **privileged** | the same, plus a *privileged* dind | **root on the host**, by starting a privileged container | only if you accept that for every repo on that pool |
 
 Move a repo to the least powerful pool that works. The pools are a convention, not a boundary: they share one GitHub runner
-group on the Free plan, and a workflow's `runs-on` chooses the pool.
+group on the Free plan, and a workflow's `runs-on` chooses the pool. Several pools can share one guard, one policy proxy and
+one scaler (one `guard.yaml` with `pools:`); that does not weaken the split: each pool keeps its own names, networks and
+directories, the policy proxy allows a request only when one pool's policy allows all of it, and a request never gets rights from
+another pool's config. The shared parts are the processes, so a bug in the guard or scaler reaches every pool at once, which is
+the case for keeping a pool with **privileged** dind in a stack of its own.
 
 ## What the tool does about it
 
@@ -46,7 +50,7 @@ group on the Free plan, and a workflow's `runs-on` chooses the pool.
   refuses configs that point at another tenant, another runner name or another work folder. Every refusal is logged as `DENY`.
 - **Hardened containers.** Read-only filesystems, all capabilities dropped, `no-new-privileges`, memory, CPU and process limits, and a
   `max_runtime`.
-- **Firewall fence.** Runner networks reach the internet and nothing private. New runners wait for the fence (the gate file).
+- **Firewall fence.** Runner networks reach the internet and nothing private. New runners wait for the fence (the gate file), and the fence is checked against the kernel every few seconds.
 - **Cache isolation.** Warm caches survive only after a *trusted* run (a push, schedule, dispatch or release on `refs/heads/main`). Anything else wipes them,
   so a pull request cannot plant code for a later main build.
 - **Resource budget.** One memory budget across pools, with optional headroom for other services on the host.
@@ -59,7 +63,7 @@ group on the Free plan, and a workflow's `runs-on` chooses the pool.
 3. **Jobs share the host kernel.** A kernel escape is a host compromise on every pool. Sysbox narrows common routes, it is not a VM.
 4. **Branch pushes can change workflows** on plans without branch protection. Your trust boundary is "who can push to these repos".
 5. **Caches are shared across repos on `main`.** A trusted job in one repo can leave code for a trusted job in another.
-6. **The firewall is IPv4 only,** and has a gap of up to 30 seconds if its rules are flushed (the guard logs it). A job can still send data out to the internet, including your secrets: secrets given to a job are visible to that job.
+6. **The fence is a blocklist of private ranges.** It lives in its own nftables table and is read back every 3 seconds, so if something deletes it there is a gap of at most a few seconds (the guard logs it, and with `gate_loss: stop` removes running slots after `gate_grace`). IPv6 is fenced only if you list the networks in `FENCE_SRC6`; the guard creates IPv4-only networks. A job can still send data out to the internet, including your secrets: secrets given to a job are visible to that job.
 7. **The dashboard is optional and runs inside the scaler.** If you turn it on, keep it on your LAN or VPN behind a reverse proxy, change the default `admin` password immediately, and do not expose it to the internet.
 8. **The scale-set API is a public preview** from GitHub, and so is the library this tool uses. Pin versions and read the changelog before upgrading.
 

@@ -13,7 +13,7 @@ Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's
 **New here? Start with these, in order:**
 
 1. [docs/SECURITY-POSTURE.md](docs/SECURITY-POSTURE.md): what this protects, what it does not, and what you must do yourself. Five minutes.
-2. [docs/QUICKSTART.md](docs/QUICKSTART.md): host checks, GitHub App, files, first job, step by step, from nothing to a working runner.
+2. [docs/QUICKSTART.md](docs/QUICKSTART.md): from nothing to a working runner. The fast path is three commands: `runner-scaling doctor` (is this host ready?), `runner-scaling init --org YOUR-ORG --create-app` (creates the GitHub App in your browser and writes every file), then `docker compose up -d`. The manual steps explain each piece.
 3. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): symptoms, causes and fixes, and a table of every message you will see.
 
 The rest of this README is the reference: how it works, every setting, operations, metrics and the dashboard.
@@ -201,8 +201,8 @@ names. The guard decodes it and requires that:
    sidecar, so jobs reach the internet but not your LAN or the host. Set `require_file` to its gate file, and the
    guard won't start a slot until the rules are in place.
 6. **Target it from workflows** with the scale set's labels, for example `runs-on: [self-hosted, ci]`.
-7. **Optional: a second pool without Docker.** See [Several pools](#operations) and
-   [examples/guard-lite.yaml](examples/guard-lite.yaml).
+7. **Optional: more pools.** Several kinds of runner (with and without Docker) run from one guard, one policy proxy and one
+   scaler: see [Several pools](#operations) and [examples/guard-pools.yaml](examples/guard-pools.yaml).
 
 ### Without an organization (repo-level scale set)
 
@@ -226,27 +226,37 @@ GitHub API requires, and report what differs.
 A job can talk to anything its network can reach. With the default Docker bridge setup that includes your LAN, the
 host's own services and the other slots. The fence closes that: runner networks reach the internet and nothing else.
 
-[examples/firewall.sh](examples/firewall.sh) is a small sidecar that does it with `iptables` and is wired into
+`runner-scaling firewall` is a small sidecar (the same image, no extra binary) that does it with **nftables** and is wired into
 [examples/compose.yaml](examples/compose.yaml):
 
-- **Rules.** A chain `GH_RUNNERS` is hooked into `DOCKER-USER` (traffic the runners send through the host) and
-  `INPUT` (traffic aimed at the host itself). Traffic from the fenced range to private and link-local addresses
-  (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`) is dropped, and the rest goes through to Docker's
-  normal handling. Replies to connections the host opened still work.
+- **Rules.** Its own table, `inet gh_runners`, with a `forward` chain (traffic the runners send through the host) and an
+  `input` chain (traffic aimed at the host itself), both at priority -5, ahead of Docker's, `ufw`'s and `firewalld`'s default
+  chains. Traffic from the fenced range to private, link-local, shared (CGNAT), loopback, multicast, reserved and benchmarking
+  addresses is dropped (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `127/8`, `0/8`, `192.0.0.0/24`,
+  `198.18/15`, `224/4`, `240/4`), and the rest goes through to Docker's normal handling. Replies to connections the host
+  opened still work. The table is separate from everyone else's, so a firewall reload, `ufw`, `firewalld` or `iptables -F`
+  does not touch it.
+- **IPv4 and IPv6.** One `inet` table covers both. IPv6 is fenced when you give the runner networks IPv6 and list them in
+  `FENCE_SRC6` (then `fc00::/7`, `fe80::/10`, `ff00::/8`, `::1`, IPv4-mapped and the NAT64 prefix are dropped). The guard creates
+  IPv4-only networks, so by default there is nothing to fence; the sidecar logs a warning if the host forwards IPv6 and no
+  IPv6 range is listed.
 - **Range.** `FENCE_SRC` (default `172.30.0.0/16`) must contain every guard's `subnet`. This is why `subnet` has a
   fixed value: with `subnet` empty Docker picks ranges the fence can't know about.
-- **Gate.** After the rules are in place the script creates a file (`/gate/firewall-ok`, on a tmpfs volume).
+- **Gate.** Once the rules are verified the sidecar creates a file (`/gate/firewall-ok`, on a tmpfs volume).
   Set `require_file` to it in every guard: no slot starts without it, so a reboot can't start an unfenced runner
   before the rules are back.
-- **Upkeep.** Every 30 seconds it re-checks the rules and re-applies any that are missing. If it can't, it removes the
-  gate, so no new slot starts. Runners that are already running stay unfenced until the rules return (up to 30
-  seconds after something flushes them). The guard watches the gate file too: when it vanishes while the guard is
-  running it logs one `GATE WITHDRAWN` error and counts `gate_withdrawn_total` (see Metrics), so you hear about the
-  gap. It doesn't kill running jobs over it.
-- **Limits.** It needs host networking, `NET_ADMIN` and an `iptables` binary. It hooks the `DOCKER-USER` chain. Under
-  Docker's nftables backend that chain doesn't exist, so it hooks `FORWARD` instead (Docker's rules are in a separate
-  table, so a drop there still applies). The fallback is tested on the iptables-nft variant only; check it on your
-  Docker version with the `curl` test below.
+- **Upkeep.** Every 3 seconds it reads the kernel's ruleset back (the table, both chains' hook, priority and policy, and every
+  rule in order) and compares it with what it expects. Anything different is replaced in one atomic transaction (there is no
+  moment without rules), and the gate is withdrawn while it is in doubt. So the unfenced window after something deletes the
+  rules is at most the interval, not 30 seconds. The guard watches the gate too: it logs one `GATE WITHDRAWN` error and
+  counts `gate_withdrawn_total`. With `gate_loss: stop` in the guard config it also **removes running slots** after
+  `gate_grace` (default 10s) of no gate, so nothing keeps running unfenced; the default `warn` leaves jobs alone.
+- **Metrics.** `FENCE_METRICS=127.0.0.1:9102` serves `runner_fence_ok`, `runner_fence_reapplied_total`,
+  `runner_fence_apply_failures_total` and `runner_fence_dropped_packets{chain}` for Prometheus. A rising `reapplied` means
+  something keeps changing your rules: find it.
+- **Limits.** It needs host networking and `NET_ADMIN` (root in the container, with every other capability dropped) and a
+  kernel with nf_tables. Hosts that only have legacy iptables can use [examples/firewall-iptables.sh](examples/firewall-iptables.sh).
+  It cannot stop a job sending data to the internet.
 
 Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` should time out, and
 `curl https://github.com` should work.
@@ -295,11 +305,18 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   update on an existing scale set and ignores it, so when the labels change the scaler deletes the scale set and
   creates it again (with a new id). Runners already started for the old one finish their jobs. Renaming `--name` creates a second scale set and leaves the first behind: remove it with
   `--delete-scale-set`.
-- **Several pools.** Run one guard + scaler pair per kind of runner, each with its own `prefix`, subnets, API
-  socket and labels: for example one with a `dind:` section for jobs that build images, and a lighter one without
-  for everything else ([examples/guard-lite.yaml](examples/guard-lite.yaml) and
-  [examples/compose.yaml](examples/compose.yaml) show both). Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
-  no network, no other mounts).
+- **Several pools.** One `guard.yaml` can describe several kinds of runner under `pools:` (for example `lite` with no Docker,
+  and `sysbox` with a private Docker per job): the settings above `pools:` are shared, and a pool's own keys replace
+  them (a pool's `runner:` is the whole runner section; `x-...` keys are free for YAML anchors, as in Compose). Each pool
+  gets the prefix `<prefix>-<name>` and the labels `self-hosted, linux, <arch>, <name>` unless you set `prefix` or `labels`.
+  One guard, one `docker-policy` and one scaler serve all of them, so the stack stays at four containers; the scaler asks the guard
+  which pools exist and keeps one scale set per pool (named by the pool's prefix). **A workflow picks a pool with `runs-on`**:
+  GitHub matches the labels, and the tool never inspects a job to decide, so the choice is the repo's (or the workflow's)
+  and an unprivileged pool can never hand a job to a more powerful one. The loader refuses pools that share a prefix, a
+  subnet, a host path or every label. [examples/guard-pools.yaml](examples/guard-pools.yaml) and
+  [examples/compose.yaml](examples/compose.yaml) show a `lite` and a `sysbox` pool. A `guard.yaml` without `pools:` is one pool, as
+  before (and `--name`/`--labels` on the scaler still apply to it). Without dind, `work_bind` directories are emptied by a one-shot container (runner image,
+  no network, no other mounts). Upgrading from separate trios: [CHANGELOG 0.12.0](CHANGELOG.md).
 - **One memory budget for all runners.** Set `memory_budget` (e.g. `8G`) and `memory_reserve` (default `1G`, the
   assumed minimum size of one slot) in every pool's guard config, with the same values. The guard measures the working
   set of every runner-scaling container on the host (all pools, found by label) through the Docker API. It starts a
@@ -332,7 +349,7 @@ pinned runner image is the version you run. GitHub refuses runners that get too 
 wait. Check from time to time (or from cron):
 
 ```
-scripts/check-runner-image.sh guard.yaml guard-lite.yaml   # exits 1 when behind
+scripts/check-runner-image.sh guard.yaml   # exits 1 when behind (checks the first runner image in the file)
 ```
 
 To bump: pick a newer tag of your runner image, `docker pull` it, put its digest in every guard config's runner
@@ -348,15 +365,15 @@ versions file. Build with `images/build.sh`, check staleness with `images/check.
 ### Metrics
 
 With the [dashboard](#dashboard) on (`DASHBOARD_ADDR`), the scaler also serves `GET /metrics` in Prometheus text
-format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so scrape each
-pool's scaler. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
+format. It sits behind the same token (use `Authorization: Bearer <token>`) and carries a `pool` label, so one
+scrape of the scaler covers every pool. History isn't kept by the scaler: Prometheus (or anything that reads the format) does that.
 
 ```yaml
 scrape_configs:
   - job_name: runner-scaling
     authorization: {type: Bearer, credentials_file: /etc/prometheus/runner_scaling_token}   # the dashboard token
     static_configs:
-      - targets: ["scaler:8080", "scaler-lite:8080"]   # one per pool; Prometheus on the scalers' Docker network
+      - targets: ["scaler:8080"]   # one scaler serves every pool, each with its own pool="..." label
 ```
 
 | Metric | Type | Meaning |
@@ -441,8 +458,8 @@ Set `DASHBOARD_ADDR` and the scaler serves a read-only status page, a bit like t
 their state, running jobs with elapsed time, queued jobs with wait time, and the last 100 finished jobs (repo,
 workflow, event, branch, result, duration). It refreshes every few seconds from `/api/state` (JSON).
 
-- Running several pools? Give each scaler a dashboard and list the others in `DASHBOARD_PEERS` on the one you open:
-  its page then shows every pool, tagged by name. Peers need the same token and a network path between the scalers.
+- Running several pools? One scaler serves them all, and its page shows every pool, tagged by name. (`DASHBOARD_PEERS` still
+  folds in other scalers, for example on another host; they need the same token and a network path.)
 - The dashboard has no controls: it only shows. (With accounts on, the one thing that can change is the account list.) History lives in memory, so a scaler restart empties it.
 - Job names and repos can be sensitive for private repos. Bind it to loopback or a private network, and put a reverse
   proxy with TLS in front if it leaves the host. `DASHBOARD_TOKEN` adds a shared-secret check but sends it in clear
@@ -593,9 +610,9 @@ Omit `dind` for runners without a private Docker daemon.
 
 [Sysbox](https://github.com/nestybox/sysbox) is an OCI runtime that runs the dind sidecar without `privileged`. Root
 inside it maps to an unprivileged host uid, so a job that starts a `--privileged` container against that dind gets a
-container that cannot see the host's disks or devices. `examples/guard-sysbox.yaml` is `guard.yaml` with
-`runtime: sysbox-runc` in place of `privileged: true`; run it as a pool of its own (own `prefix`, own subnets) so you
-can move repos over one at a time.
+container that cannot see the host's disks or devices. The `sysbox` pool in `examples/guard-pools.yaml` is
+`examples/guard.yaml` with `runtime: sysbox-runc` in place of `privileged: true`; run it as a pool of its own (own `prefix`,
+own subnets) so you can move repos over one at a time.
 
 Install Sysbox on the host first and register it with Docker (`runtimes` in `daemon.json`). Things that bit us on
 Ubuntu 24.04 with Docker 29:

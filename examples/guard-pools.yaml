@@ -1,0 +1,90 @@
+# One guard, several pools. Each pool is a kind of runner that workflows pick with `runs-on`:
+#
+#   lite     runners WITHOUT Docker: tests, lint, builds that don't make images. Cheapest, safest.
+#   sysbox   runners that each get their own Docker daemon (Sysbox, unprivileged), for `docker build` and service
+#            containers. Needs Sysbox on the host: docs/SYSBOX.md.
+#
+#   runs-on: [self-hosted, ci-lite]        # or [self-hosted, ci-sysbox]
+#
+# Settings above `pools:` are shared by every pool; a key inside a pool replaces the shared key of the same name (a
+# pool's `runner:` is the WHOLE runner section, which is why the examples below start from an anchor). A pool's prefix is
+# <prefix>-<pool name> and its labels are self-hosted, linux, <arch> and the pool's name, unless you set them.
+#
+# One guard, one Docker policy and one scaler serve all pools, so the whole stack is four containers however many
+# pools you add. Pools never touch each other's containers, networks or directories: the loader refuses a config
+# where two pools share a prefix, a label, a subnet or a host path.
+#
+# `runner-scaling init --pools lite,sysbox` writes this file for you. Lines between ">>> pool" and "<<< pool" are the
+# pools; delete a block (and its lines) to drop a pool. Check the result with `runner-scaling guard --check`.
+
+github_url: https://github.com/YOUR-ORG
+# Leave tenant_url out on first start. The guard refuses the first JIT config and logs its ServerUrl
+# (`docker logs <guard> | grep DENY`). Check it came from your own scaler talking to your own org, then pin it here
+# (or let `runner-scaling pin-tenant` do it). All pools register in the same org, so one value serves all.
+# tenant_url: https://pipelines….actions.githubusercontent.com/<tenant>/
+
+prefix: ci                    # pool prefixes: ci-lite, ci-sysbox. Containers ci-lite-runner-N, networks ci-lite-slot-N
+require_file: /gate/firewall-ok   # no slot starts until the firewall has put the fence up (see the firewall service)
+# gate_loss: stop             # also remove RUNNING slots if the gate is gone for gate_grace (default 10s); default "warn" only logs
+max_runtime: 6h               # the reaper removes a runner that has run longer than this
+
+# One cap for the whole host, across every pool: new slots wait when it is full. Give it the same value everywhere.
+memory_budget: 8G
+memory_reserve: 1G
+# memory_host_headroom: 3G    # keep this much host memory for other services
+# cgroup_parent: ci.slice     # group all runners so `systemd-cgtop ci.slice` shows them together
+
+x-runner: &runner             # x-... keys are ignored: this is only a place to hang the anchor
+  image: ghcr.io/actions/actions-runner:latest  # pin a digest: ghcr.io/actions/actions-runner@sha256:…
+  command: [/home/runner/run.sh]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  dns: [1.1.1.1, 9.9.9.9]     # public DNS: the fence blocks private ranges, so a LAN resolver would be unreachable
+  cpus: 2
+  cpu_shares: 512             # half the default weight: other host workloads win when the CPU is contended
+  log_opts: {max-size: 10m, max-file: "3"}
+
+pools:
+  # >>> pool lite
+  lite:
+    max_slots: 4
+    subnet: 172.30.1{slot}.0/24     # every pool's subnets sit inside the firewall's FENCE_SRC range
+    work_dir: /home/runner/_work
+    work_bind: /srv/runner-scaling/lite-{slot}/work   # emptied before and after every job
+    cache_dirs:                     # emptied after every job the scaler doesn't vouch for
+      - /srv/runner-scaling/lite-{slot}/toolcache
+    runner:
+      <<: *runner
+      memory: 3G
+      pids: 1024
+      env: {RUNNER_TOOL_CACHE: /opt/hostedtoolcache}
+      binds: ["/srv/runner-scaling/lite-{slot}/toolcache:/opt/hostedtoolcache"]
+  # <<< pool lite
+  # >>> pool sysbox
+  sysbox:
+    max_slots: 2
+    subnet: 172.30.2{slot}.0/24
+    module_blocklist: [dummy, ifb, nlmon, bonding, team, geneve, bareudp, gtp, amt, netdevsim, macsec, ipvlan, vxlan]  # stop jobs making the host kernel load these; list only modules your host never uses
+    work_dir: /home/runner/_work    # a fresh Docker volume per runner, mounted in the runner and in dind
+    cache_dirs:
+      - /srv/runner-scaling/sbx-{slot}/toolcache
+      - /srv/runner-scaling/sbx-{slot}/docker
+    runner:
+      <<: *runner
+      memory: 3G
+      pids: 2048
+      env: {RUNNER_TOOL_CACHE: /opt/hostedtoolcache}
+      binds: ["/srv/runner-scaling/sbx-{slot}/toolcache:/opt/hostedtoolcache"]
+    dind:                           # each runner's own Docker daemon; Jobs get DOCKER_HOST=tcp://<prefix>-dind-<slot>:2375
+      image: docker:28-dind         # pin a digest
+      runtime: sysbox-runc          # Sysbox must be installed and registered with Docker
+      memory: 3G
+      cpus: 2
+      pids: 4096
+      binds: ["/srv/runner-scaling/sbx-{slot}/docker:/var/lib/docker"]
+      healthcheck: {test: [CMD, docker, info], interval: 3s, timeout: 5s, retries: 40, start_period: 3s}
+      prune_on_stop:
+        - [docker, builder, prune, -f, --filter, until=168h]
+        - [docker, image, prune, -af, --filter, until=336h]
+      log_opts: {max-size: 10m, max-file: "3"}
+  # <<< pool sysbox

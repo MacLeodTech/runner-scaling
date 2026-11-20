@@ -103,6 +103,7 @@ type Decision struct {
 	Body         []byte // nil for none
 	TrackExec    bool   // remember the exec id in the response
 	execOf       string
+	pol          *Policy // the pool's policy that allowed it (set by the Proxy)
 }
 
 // Check decides one request. path is the URL path without the API version prefix.
@@ -645,14 +646,15 @@ func mapKeys[V any](m map[string]V) func(yield func(string) bool) {
 
 // Proxy is an http.Handler that checks each request with a Policy and forwards the allowed ones to the daemon.
 type Proxy struct {
-	pol    *Policy
+	pols   []*Policy // one per pool; a request must satisfy exactly one of them
 	log    *slog.Logger
 	daemon *http.Transport
 	rp     *httputil.ReverseProxy
 }
 
-// NewProxy serves pol in front of the Docker socket at dockerSock.
-func NewProxy(cfg *Config, dockerSock string, log *slog.Logger) *Proxy {
+// NewProxy serves the pools' policies in front of the Docker socket at dockerSock. A request is allowed if one pool's
+// policy allows it whole; the policies never combine, so a pool cannot gain anything from another pool's rules.
+func NewProxy(cfgs []*Config, dockerSock string, log *slog.Logger) *Proxy {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", dockerSock)
@@ -660,7 +662,9 @@ func NewProxy(cfg *Config, dockerSock string, log *slog.Logger) *Proxy {
 		ResponseHeaderTimeout: 15 * time.Minute, // image pulls and removals can be slow
 	}
 	px := &Proxy{log: log, daemon: tr}
-	px.pol = NewPolicy(cfg, px.lookupOwner)
+	for _, cfg := range cfgs {
+		px.pols = append(px.pols, NewPolicy(cfg, px.lookupOwner))
+	}
 	px.rp = &httputil.ReverseProxy{
 		Transport: tr,
 		Rewrite:   func(*httputil.ProxyRequest) {}, // the request is already built by serve
@@ -676,7 +680,7 @@ func NewProxy(cfg *Config, dockerSock string, log *slog.Logger) *Proxy {
 				ID string `json:"Id"`
 			}
 			if err == nil && json.Unmarshal(b, &out) == nil && hexIDRE.MatchString(out.ID) {
-				px.pol.rememberExec(out.ID, dec.execOf)
+				dec.pol.rememberExec(out.ID, dec.execOf)
 			}
 			return nil
 		},
@@ -742,17 +746,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		px.refuse(w, r, "encoded path")
 		return
 	}
-	var dec *Decision
-	// DELETE /containers/{ref} has two segments; every other container call goes through Check.
-	if r.Method == "DELETE" {
-		if ref, ok := strings.CutPrefix(path, "/"+apiVersion+"/containers/"); ok && ref != "" && !strings.Contains(ref, "/") {
-			dec, err = px.pol.checkContainerDelete(r.Context(), &Decision{Method: r.Method, Path: "/containers/" + ref, Query: r.URL.Query()}, ref, r.URL.Query(), body)
-		} else {
-			dec, err = px.pol.Check(r.Context(), r.Method, path, r.URL.Query(), body)
-		}
-	} else {
-		dec, err = px.pol.Check(r.Context(), r.Method, path, r.URL.Query(), body)
-	}
+	dec, err := px.check(r.Context(), r.Method, path, r.URL.Query(), body)
 	if err != nil {
 		px.refuse(w, r, err.Error())
 		return
@@ -768,6 +762,30 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out.Body, out.ContentLength = io.NopCloser(bytes.NewReader(dec.Body)), int64(len(dec.Body))
 	}
 	px.rp.ServeHTTP(w, out)
+}
+
+// check asks each pool's policy in turn and returns the first decision that allows the request. When none does, the
+// refusal reported is the most informative one (a pool-name mismatch says least).
+func (px *Proxy) check(ctx context.Context, method, path string, q url.Values, body []byte) (*Decision, error) {
+	var best error
+	for _, pol := range px.pols {
+		var dec *Decision
+		var err error
+		// DELETE /containers/{ref} has two segments; every other container call goes through Check.
+		if ref, ok := strings.CutPrefix(path, "/"+apiVersion+"/containers/"); ok && method == "DELETE" && ref != "" && !strings.Contains(ref, "/") {
+			dec, err = pol.checkContainerDelete(ctx, &Decision{Method: method, Path: "/containers/" + ref, Query: q}, ref, q, body)
+		} else {
+			dec, err = pol.Check(ctx, method, path, q, body)
+		}
+		if err == nil {
+			dec.pol = pol
+			return dec, nil
+		}
+		if best == nil || strings.Contains(best.Error(), "pool's") || strings.Contains(best.Error(), "not one of") {
+			best = err
+		}
+	}
+	return nil, best
 }
 
 func (px *Proxy) refuse(w http.ResponseWriter, r *http.Request, why string) {

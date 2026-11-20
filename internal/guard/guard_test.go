@@ -404,19 +404,25 @@ func TestExampleConfigsLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lite, err := LoadConfig("../../examples/guard-lite.yaml")
+	pools, err := LoadConfigs("../../examples/guard-pools.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if main.Dind == nil || lite.Dind != nil {
-		t.Errorf("main pool should have dind and lite should not: %v, %v", main.Dind != nil, lite.Dind != nil)
+	if len(pools) != 2 {
+		t.Fatalf("guard-pools.yaml has %d pools", len(pools))
 	}
-	// Two pools on one host: they must not share names or overlap, and must share the memory budget.
-	if main.Prefix == lite.Prefix || main.Subnet == lite.Subnet {
-		t.Errorf("pools collide: %q/%q, %q/%q", main.Prefix, lite.Prefix, main.Subnet, lite.Subnet)
+	lite, sbx := pools[0], pools[1] // sorted by name
+	if sbx.Dind == nil || sbx.Dind.Runtime != "sysbox-runc" || lite.Dind != nil || main.Dind == nil {
+		t.Errorf("sysbox pool should have a Sysbox dind and lite none: %v %v", sbx.Dind != nil, lite.Dind != nil)
 	}
-	if main.MemoryBudget != lite.MemoryBudget || main.RequireFile != lite.RequireFile {
-		t.Errorf("pools disagree on the shared budget or gate")
+	if sbx.MemoryBudget != lite.MemoryBudget || sbx.RequireFile != lite.RequireFile || sbx.TenantURL != lite.TenantURL {
+		t.Errorf("pools disagree on the shared budget, gate or tenant")
+	}
+	// The standalone privileged example can still run beside the pools file as another guard: no shared names or ranges.
+	for _, p := range pools {
+		if p.Prefix == main.Prefix || p.Subnet == main.Subnet {
+			t.Errorf("pool %s collides with guard.yaml: %q %q", p.Name, p.Prefix, p.Subnet)
+		}
 	}
 }
 
@@ -503,6 +509,42 @@ func TestGateWithdrawnIsCountedOnceAndRunnersSurvive(t *testing.T) {
 	g.Reap(ctx)
 	if n := g.Counters()[CounterGateWithdrawn]; n != 2 {
 		t.Fatalf("second outage should count: %d", n)
+	}
+}
+
+func TestGateLossStopRemovesRunningSlotsAfterGrace(t *testing.T) {
+	g, f := newGuard(t)
+	ctx := context.Background()
+	g.cfg.RequireFile = filepath.Join(t.TempDir(), "firewall-ok")
+	g.cfg.GateLoss = "stop"
+	grace := Duration{Duration: time.Hour}
+	g.cfg.GateGrace = &grace
+	os.WriteFile(g.cfg.RequireFile, nil, 0o600)
+	if err := g.Start(ctx, 1, api.StartRequest{RunnerName: "ci-1-abcd12", JITConfig: jitFor("ci-1-abcd12", "https://github.com/example-org")}); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(g.cfg.RequireFile)
+	g.Reap(ctx)
+	if f.containers["ci-runner-1"] == nil {
+		t.Fatal("slot removed inside the grace period")
+	}
+	grace.Duration = 0 // grace over
+	g.Reap(ctx)
+	if f.containers["ci-runner-1"] != nil || f.containers["ci-dind-1"] != nil {
+		t.Fatal("running slot survived a lost gate with gate_loss: stop")
+	}
+	if n := g.Counters()[CounterReapedPrefix+"gate_lost_total"]; n != 1 {
+		t.Fatalf("gate_lost reaps = %d", n)
+	}
+}
+
+func TestGateLossConfigValidation(t *testing.T) {
+	for _, bad := range []string{"gate_loss: kill\n", "gate_loss: stop\n"} { // unknown mode; stop without require_file
+		p := filepath.Join(t.TempDir(), "guard.yaml")
+		os.WriteFile(p, []byte(bad+testConfig), 0o600)
+		if _, err := LoadConfig(p); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
 	}
 }
 

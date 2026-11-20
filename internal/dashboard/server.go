@@ -41,7 +41,7 @@ type State struct {
 	PeerErr string `json:"peer_error,omitempty"`
 }
 
-// Peer is another scaler's dashboard, e.g. {"lite", "http://scaler-lite:8080"}.
+// Peer is another scaler's dashboard, e.g. {"homelab2", "http://other-host:8080"}.
 type Peer struct{ Name, URL string }
 
 // Server serves the page and its JSON. The dashboard itself is read-only. The only thing that can change is the account
@@ -54,7 +54,8 @@ type Server struct {
 	Tracker       *Tracker
 	GitHub        *Enricher     // optional: steps and run details from GitHub
 	StallAfter    time.Duration // see MarkStalled; default DefaultStallAfter
-	Peers         []Peer        // other pools to fold into this page; they must share Token
+	Peers         []Peer        // other scalers to fold into this page; they must share Token
+	Locals        []*Server     // other pools of this same process, folded in without an HTTP hop
 	Token         string        // if set, required as a bearer token, ?token= or the password of basic auth
 	Auth          *Auth         // if set, a login session is accepted instead of the token, and the account API is served
 }
@@ -77,6 +78,20 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	st := s.local(ctx)
+	if r.URL.Query().Get("local") == "" { // peers answer with local=1, so peers never chain
+		for _, l := range s.Locals {
+			st.Peers = append(st.Peers, l.local(ctx))
+		}
+		st.Peers = append(st.Peers, s.peerStates(ctx)...)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(st)
+}
+
+// local is this pool's own state, without peers.
+func (s *Server) local(ctx context.Context) State {
 	st := State{Name: s.Name, Version: s.Version, Now: time.Now(), MaxSlots: s.Info.MaxSlots, Snapshot: s.Tracker.Snapshot(), Slots: []api.Slot{}}
 	if slots, err := s.Guard.SlotStats(ctx); err != nil {
 		st.GuardErr = "guard unreachable"
@@ -88,12 +103,7 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		st.GitHub = &gs
 	}
 	MarkStalled(st.Running, st.Slots, st.Now, s.StallAfter)
-	if r.URL.Query().Get("local") == "" { // peers answer with local=1, so peers never chain
-		st.Peers = s.peerStates(ctx)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	json.NewEncoder(w).Encode(st)
+	return st
 }
 
 func (s *Server) peerStates(ctx context.Context) []State {

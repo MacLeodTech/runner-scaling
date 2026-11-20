@@ -126,3 +126,13 @@ func (a *AppAuth) Token(ctx context.Context) (string, error) {
 	a.token, a.expires = out.Token, out.ExpiresAt
 	return a.token, nil
 }
+
+// JWT returns a short-lived token that authenticates as the App itself (not an installation), for the few calls
+// that need it, such as listing the App's installations.
+func (a *AppAuth) JWT() (string, error) {
+	now := time.Now
+	if a.Now != nil {
+		now = a.Now
+	}
+	return a.jwt(now())
+}
