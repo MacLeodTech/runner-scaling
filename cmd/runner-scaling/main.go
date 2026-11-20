@@ -1,6 +1,9 @@
 // Command runner-scaling runs ephemeral, autoscaled GitHub Actions runners on one Docker host without giving the
 // internet-facing part of the system the Docker socket.
 //
+//	runner-scaling init --org ACME              first run: create the GitHub App, write the files for this host
+//	runner-scaling doctor [--dir D]             check this host and a stack directory; prints the fix for each problem
+//	runner-scaling pin-tenant [--dir D]         after the first refused job: pin the tenant URL the guard saw
 //	runner-scaling guard  --config guard.yaml   holds the Docker socket; builds containers only from its config
 //	runner-scaling docker-policy --config ...  optional: sits between the guard and the Docker socket and refuses any
 //	                                            Docker call that is not exactly one the guard's config produces
@@ -54,6 +57,12 @@ func main() {
 		err = runGuard(ctx, log, os.Args[2:])
 	case "docker-policy":
 		err = runDockerPolicy(ctx, log, os.Args[2:])
+	case "doctor":
+		err = runDoctor(ctx, os.Args[2:])
+	case "init":
+		err = runInit(ctx, os.Args[2:])
+	case "pin-tenant":
+		err = runPinTenant(ctx, os.Args[2:])
 	case "firewall":
 		err = runFirewall(ctx, log, os.Args[2:])
 	case "scaler":
@@ -72,7 +81,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: runner-scaling guard|docker-policy|scaler|firewall|health|version [flags]")
+	fmt.Fprintln(os.Stderr, "usage: runner-scaling init|doctor|pin-tenant|guard|docker-policy|scaler|firewall|health|version [flags]")
 	os.Exit(2)
 }
 
