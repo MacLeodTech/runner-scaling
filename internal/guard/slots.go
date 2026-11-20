@@ -59,13 +59,15 @@ type Guard struct {
 	gateDown   bool                 // require_file was missing at the last reap tick; only touched by Reap
 	nameRE     *regexp.Regexp
 	count      counters
+	hostAvail  func() (int64, error) // the host's available memory; a test seam, /proc/meminfo in production
 }
 
 func New(cfg *Config, d Docker, log *slog.Logger) *Guard {
 	return &Guard{
 		cfg: cfg, d: d, log: log,
 		starting: map[int]bool{}, keepCache: map[int]string{}, cacheDirty: map[int]bool{},
-		nameRE: regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.Prefix) + `-([0-9]+)-[a-z0-9]{4,16}$`),
+		nameRE:    regexp.MustCompile(`^` + regexp.QuoteMeta(cfg.Prefix) + `-([0-9]+)-[a-z0-9]{4,16}$`),
+		hostAvail: func() (int64, error) { return readMemAvailable("/proc/meminfo") },
 	}
 }
 
@@ -1008,16 +1010,75 @@ func (g *Guard) admit(ctx context.Context, slot int) error {
 	g.mu.Unlock()
 	// A slot counts as its measured use, but at least the reserve, and while its containers are young at least a
 	// share of their limits: they look light now and will grow.
-	var total int64
+	var total, measured int64
 	for _, l := range by {
 		total += max(l.used, g.cfg.memReserve, int64(float64(l.young)*g.cfg.memRampShare))
+		measured += l.used
 	}
-	if total+g.cfg.memReserve > g.cfg.memBudget {
+	budget, avail, limited := g.effectiveBudget(measured)
+	if total+g.cfg.memReserve > budget {
 		g.count.add(CounterAdmissionRefused)
+		if limited {
+			return fmt.Errorf("%w: memory budget: %s in use of %s (the host has %s free and keeps %s for other services), need %s reserve", ErrNotReady,
+				fmtBytes(total), fmtBytes(budget), fmtBytes(avail), fmtBytes(g.cfg.memHeadroom), fmtBytes(g.cfg.memReserve))
+		}
 		return fmt.Errorf("%w: memory budget: %s in use of %s, need %s reserve", ErrNotReady,
 			fmtBytes(total), fmtBytes(g.cfg.memBudget), fmtBytes(g.cfg.memReserve))
 	}
 	return nil
+}
+
+// effectiveBudget is memory_budget, lowered when memory_host_headroom is set and the host cannot spare that much: the
+// host's available memory plus what the runners already use (they are part of what is no longer available), minus the
+// headroom. limited reports that the host, not the configured budget, set the figure; avail is the host's available
+// memory. An unreadable /proc/meminfo fails open to the configured budget.
+func (g *Guard) effectiveBudget(runnersUsed int64) (budget, avail int64, limited bool) {
+	budget = g.cfg.memBudget
+	if g.cfg.memHeadroom <= 0 || g.hostAvail == nil {
+		return budget, 0, false
+	}
+	avail, err := g.hostAvail()
+	if err != nil {
+		g.log.Warn("memory budget: cannot read host memory, using memory_budget alone", "err", err)
+		return budget, 0, false
+	}
+	spare := max(avail+runnersUsed-g.cfg.memHeadroom, 0)
+	if spare < budget {
+		return spare, avail, true
+	}
+	return budget, avail, false
+}
+
+// hostShort reports that the host's available memory is below half the headroom: real pressure from outside the
+// runners, not just a smaller budget.
+func (g *Guard) hostShort() bool {
+	if g.cfg.memHeadroom <= 0 || g.hostAvail == nil {
+		return false
+	}
+	avail, err := g.hostAvail()
+	return err == nil && avail < g.cfg.memHeadroom/2
+}
+
+// readMemAvailable returns MemAvailable from a /proc/meminfo-style file, in bytes. A container sees the host's figure.
+func readMemAvailable(path string) (int64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return parseMemAvailable(string(b))
+}
+
+func parseMemAvailable(s string) (int64, error) {
+	for _, line := range strings.Split(s, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "MemAvailable:" {
+			kb, err := strconv.ParseInt(f[1], 10, 64)
+			if err != nil || kb < 0 {
+				return 0, fmt.Errorf("MemAvailable %q is not a size", f[1])
+			}
+			return kb * 1024, nil
+		}
+	}
+	return 0, errors.New("no MemAvailable in meminfo")
 }
 
 // memoryBackstop reaps this guard's newest running slot once measured use has been over memory_budget on 3
@@ -1045,7 +1106,8 @@ func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map
 	for _, m := range by {
 		total += m
 	}
-	if total <= g.cfg.memBudget {
+	short := g.hostShort()
+	if total <= g.cfg.memBudget && !short {
 		g.overMem = 0
 		return
 	}
@@ -1062,7 +1124,7 @@ func (g *Guard) memoryBackstop(ctx context.Context, slots []api.Slot, starts map
 	if g.claim(victim.Slot) {
 		g.count.add(CounterReapedPrefix + "memory_budget_total")
 		g.log.Info("reaping slot", "slot", victim.Slot, "runner", victim.RunnerName, "runner_state", victim.RunnerState,
-			"reason", "memory_budget", "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
+			"reason", "memory_budget", "host_short", short, "in_use", fmtBytes(total), "budget", fmtBytes(g.cfg.memBudget))
 		if err := g.teardown(ctx, victim.Slot, true, true); err != nil {
 			g.log.Error("reap: teardown", "slot", victim.Slot, "err", err)
 		}

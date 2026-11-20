@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Added
+- **`memory_host_headroom`**: keep a share of the host's memory for other services (a game server, say). Admission uses the smaller of `memory_budget` and the host's available memory plus current runner use minus the headroom, so new runners wait while something else holds the memory. A running job is reaped only if the host's available memory stays below half the headroom for three checks. Needs `memory_budget`; fails open if `/proc/meminfo` cannot be read.
+
 ## [0.9.0] - 2026-11-19
 
 ### Changed

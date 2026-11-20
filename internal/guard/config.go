@@ -65,6 +65,13 @@ type Config struct {
 	// across every pool: give every guard on the host the same value. The guard refuses new slots that would not fit
 	// and reaps its newest slot if measured use stays over budget. Needs no host or systemd setup.
 	MemoryBudget string `yaml:"memory_budget"`
+	// MemoryHostHeadroom, if set (e.g. 3G), keeps that much of the host's memory for everything that is not a runner (a
+	// game server, say). Admission then uses the smaller of memory_budget and what the host can spare: its available
+	// memory plus what the runners already use, minus the headroom. So when something else on the host grows, new
+	// slots wait instead of pushing the host into swap or the OOM killer. A running job is only reaped when the host's
+	// available memory falls below half the headroom for 3 reap ticks in a row. Needs memory_budget; unreadable host
+	// memory fails open (the plain budget applies).
+	MemoryHostHeadroom string `yaml:"memory_host_headroom"`
 	// MemoryReserve is the assumed minimum footprint of one slot (runner and dind together) for admission, so slots
 	// that have just started and not ramped up are not counted as nearly empty. Default 1G with memory_budget.
 	MemoryReserve string `yaml:"memory_reserve"`
@@ -95,6 +102,7 @@ type Config struct {
 	ReapInterval Duration `yaml:"reap_interval"`
 
 	memBudget, memReserve int64 // parsed MemoryBudget and MemoryReserve
+	memHeadroom           int64 // parsed MemoryHostHeadroom; 0 = host memory is not consulted
 	cacheMax              int64 // parsed CacheMax
 	memRamp               time.Duration
 	memRampShare          float64
@@ -261,7 +269,7 @@ func (c *Config) Validate() error {
 	if c.MaxRuntime.Duration < 0 || (c.MaxRuntime.Duration > 0 && c.MaxRuntime.Duration < time.Minute) {
 		errs = append(errs, errors.New("max_runtime must be 0 (disabled) or at least 1m"))
 	}
-	c.memBudget, c.memReserve, c.memRamp, c.memRampShare = 0, 0, 0, 0
+	c.memBudget, c.memReserve, c.memRamp, c.memRampShare, c.memHeadroom = 0, 0, 0, 0, 0
 	c.cacheMax = 0
 	if c.CacheMax != "" {
 		n, err := ParseBytes(c.CacheMax)
@@ -291,6 +299,17 @@ func (c *Config) Validate() error {
 			errs = append(errs, errors.New("memory_reserve must not exceed memory_budget"))
 		}
 		c.memBudget, c.memReserve = b, r
+		if c.MemoryHostHeadroom != "" {
+			h, err := ParseBytes(c.MemoryHostHeadroom)
+			switch {
+			case err != nil:
+				errs = append(errs, fmt.Errorf("memory_host_headroom: %w", err))
+			case h <= 0:
+				errs = append(errs, errors.New("memory_host_headroom must be above 0 (leave it out to ignore host memory)"))
+			default:
+				c.memHeadroom = h
+			}
+		}
 		c.memRamp, c.memRampShare = 2*time.Minute, 0.5
 		if c.MemoryRamp != nil {
 			c.memRamp = c.MemoryRamp.Duration
@@ -307,8 +326,8 @@ func (c *Config) Validate() error {
 		if b > 0 {
 			errs = append(errs, c.budgetFit(b)...)
 		}
-	} else if c.MemoryReserve != "" || c.MemoryRamp != nil || c.MemoryRampShare != 0 {
-		errs = append(errs, errors.New("memory_reserve, memory_ramp and memory_ramp_share need memory_budget"))
+	} else if c.MemoryReserve != "" || c.MemoryRamp != nil || c.MemoryRampShare != 0 || c.MemoryHostHeadroom != "" {
+		errs = append(errs, errors.New("memory_reserve, memory_ramp, memory_ramp_share and memory_host_headroom need memory_budget"))
 	}
 	seenMod := map[string]bool{}
 	for _, m := range c.ModuleBlocklist {

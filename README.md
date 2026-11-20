@@ -295,6 +295,13 @@ Check it from a runner: a job that runs `curl -m 5 http://<a LAN address>` shoul
   is a polling limit: a sudden spike can briefly overshoot, so keep the per-container `memory` limits as the hard
   stop. The guard rejects a config where one slot's `memory` limits add up to more than the budget (that slot could never
   finish) and prints a notice at startup when all slots together may exceed it, which is normal for a shared budget.
+  **Sharing the host with something else** (a game server, a database): set `memory_host_headroom` (e.g. `3G`) next to
+  `memory_budget`. Admission then uses the smaller of `memory_budget` and what the host can spare, that is its
+  available memory plus what the runners already use, minus the headroom, so new slots wait while the other service
+  is using the memory and resume when it frees. It only ever lowers the budget. The backstop reaps a running job for
+  host pressure only when the host's available memory is below half the headroom for three checks in a row (the
+  refusal and log lines say so). The guard reads the host's `MemAvailable` from `/proc/meminfo`, which a container
+  sees as the host's figure; if it cannot, the plain budget applies.
   Concurrent starts on one guard are serialised, and a slot whose containers exist but are not running yet counts as
   the reserve, so two guards starting slots at the same moment can only both be admitted in the few milliseconds before
   the first container exists; the backstop covers that. Set `cpu_shares` (Docker's default weight is 1024) to make runners yield CPU to other workloads when the host
@@ -546,6 +553,7 @@ vouch always means a wipe, so a failure costs speed, not safety. The cost is col
 | `cache_dirs` | host directories (`{slot}` required) emptied after untrusted jobs |
 | `cache_max` | optional size cap (e.g. `20G`) for one slot's kept caches together; over it, they are emptied after the job |
 | `memory_budget`, `memory_reserve` | host-wide memory cap and per-slot admission estimate |
+| `memory_host_headroom` | optional (e.g. `3G`): memory kept for the rest of the host; admission waits when the host cannot spare more than the budget, see above |
 | `memory_ramp`, `memory_ramp_share` | how long a new slot counts at a share of its memory limits (default `2m`, `0.5`; `0s` turns the ramp off) |
 | `cgroup_parent` | put all runner containers under one cgroup you can cap with systemd |
 | `require_file` | the guard starts no slot until this file exists (a gate for a host firewall) |

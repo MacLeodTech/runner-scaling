@@ -17,6 +17,7 @@ memory_budget: 8G           # optional: cap on the memory working set of ALL run
 #                             # Shared by every pool: give every guard the same value. New slots wait (503) when full.
 # memory_ramp: 2m             # optional: a new slot counts at memory_ramp_share (default 0.5) of its limits this long
 #                             # (default 2m; 0s = off), so a burst of fresh jobs isn't admitted against memory they haven't used yet
+memory_host_headroom: 3G  # optional: keep this much host memory for other services; new slots wait when the host can't spare it
 memory_reserve: 1G          # assumed minimum per slot (runner+dind) for admission; default 1G with memory_budget
 # cache_dirs:                 # optional: warm caches that are emptied when a slot is torn down, unless the scaler vouches
 #   - /srv/runner-scaling/{slot}/toolcache   # for the job (a push/schedule/dispatch/release on CACHE_TRUSTED_REFS,
