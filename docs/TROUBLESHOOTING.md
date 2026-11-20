@@ -20,6 +20,9 @@ If you log to journald (the example does), logs also survive a `docker compose d
 - [Message reference](#message-reference)
 - [Still stuck](#still-stuck)
 
+First, run `runner-scaling doctor --dir <your stack directory>` (add `--github` to also check the App). It checks the host, the files and the
+runner group, and prints the fix beside every problem; most entries below are what it finds.
+
 ## Nothing starts
 
 **`docker compose up` fails to pull the image (`denied` or `unauthorized`).** The image is public at

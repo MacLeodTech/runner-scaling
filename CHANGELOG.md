@@ -14,6 +14,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 - Guard `gate_loss: stop` and `gate_grace`: remove running slots when the firewall's gate file has been gone longer than the grace
   period (default stays `warn`: log only).
 
+- **Onboarding tools** in the `runner-scaling` binary (also attached to releases for linux/amd64 and arm64):
+  - `doctor [--dir D] [--sysbox] [--github] [--json]`: checks Docker (version, rootful, Compose, Sysbox), kernel (cgroup v2, nf_tables), disk, memory, clock skew against GitHub, reachability, and in a stack directory the `.env`, `DOCKER_GID`, the key's owner and mode, the guard configs, subnet overlaps with the host and Docker, subnets inside the fence and, with `--github`, the App's permissions and the runner group. Every problem prints its fix.
+  - `init --org ORG [--create-app]`: writes `compose.yaml`, `guard-lite.yaml`, `.env` and the key for this host (free /16, slots and budget sized to the RAM). `--create-app` uses GitHub's App manifest flow: one button in the browser, with only the Self-hosted runners permission.
+  - `pin-tenant`: reads the guard's refusal, asks for confirmation, writes `tenant_url` and restarts the policy and the guard.
+- `docs/SYSBOX.md`: install, verify and know the limits of the Sysbox pool.
+- CI runs an onboarding end-to-end check (`scripts/e2e-onboarding.sh`) on every change.
+
 ### Changed
 - The example compose files run the firewall from the runner-scaling image (`command: [firewall]`, `user: 0:0`, only `NET_ADMIN`)
   instead of `docker:dind` with `firewall.sh`. **Migrating:** replace the `firewall` service as in `examples/compose.yaml`; the old

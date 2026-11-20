@@ -13,7 +13,7 @@ Actions Runner Controller uses. It long-polls GitHub (outbound only), so there's
 **New here? Start with these, in order:**
 
 1. [docs/SECURITY-POSTURE.md](docs/SECURITY-POSTURE.md): what this protects, what it does not, and what you must do yourself. Five minutes.
-2. [docs/QUICKSTART.md](docs/QUICKSTART.md): host checks, GitHub App, files, first job, step by step, from nothing to a working runner.
+2. [docs/QUICKSTART.md](docs/QUICKSTART.md): from nothing to a working runner. The fast path is three commands: `runner-scaling doctor` (is this host ready?), `runner-scaling init --org YOUR-ORG --create-app` (creates the GitHub App in your browser and writes every file), then `docker compose up -d`. The manual steps explain each piece.
 3. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): symptoms, causes and fixes, and a table of every message you will see.
 
 The rest of this README is the reference: how it works, every setting, operations, metrics and the dashboard.

@@ -6,6 +6,7 @@ starts with the **safest and smallest** setup (runners without Docker) and shows
 How to read it: every step says **You do** (something only you can do) and what the tool does for you. Each step ends
 with a **Check** so you know it worked before you move on.
 
+- [The fast path (recommended)](#the-fast-path-recommended)
 - [0. What you are building, and what it costs you](#0-what-you-are-building-and-what-it-costs-you)
 - [1. Check the host](#1-check-the-host)
 - [2. Prepare GitHub](#2-prepare-github)
@@ -19,6 +20,48 @@ with a **Check** so you know it worked before you move on.
 
 Stuck? See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). Want the risks first? Read
 [SECURITY-POSTURE.md](SECURITY-POSTURE.md) before step 2; it is short.
+
+---
+
+## The fast path (recommended)
+
+`runner-scaling` also ships as a setup tool. It checks your host, creates the GitHub App through your browser, and writes
+every file in steps 3 and 4 for you. Steps 0 to 7 below explain what each piece is and are the manual route; read step 0 and
+[SECURITY-POSTURE.md](SECURITY-POSTURE.md) either way, and do step 2 (limiting who can use the runners) yourself.
+
+```
+# 1. Get the tool (Linux; use the arm64 file on a Raspberry Pi-class machine) and verify it
+V=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/MacLeodTech/runner-scaling/releases/latest | sed 's#.*/##')
+curl -fsSLO https://github.com/MacLeodTech/runner-scaling/releases/download/$V/runner-scaling-linux-amd64
+curl -fsSL https://github.com/MacLeodTech/runner-scaling/releases/download/$V/SHA256SUMS | grep runner-scaling-linux-amd64 | sha256sum -c
+chmod +x runner-scaling-linux-amd64 && mv runner-scaling-linux-amd64 runner-scaling
+
+# 2. Is this host ready? Every FAIL line says how to fix it.
+./runner-scaling doctor
+
+# 3. Do QUICKSTART step 2 (runner group and workflow settings) on github.com, then:
+./runner-scaling init --org YOUR-ORG --create-app --dir ~/runner-scaling
+```
+
+`init --create-app` prints an address. Open it in a browser signed in to GitHub as an owner of the organization, press the
+button, press **Create GitHub App**, then **Install** it on the organization. The terminal picks up the Client ID and
+installation id by itself, writes `compose.yaml`, `guard-lite.yaml`, `.env` and `secrets/github_app.pem`
+(a free subnet, slots and memory sized for this host), and runs `doctor` on the result. It then prints the one `sudo chown`
+command that hands the key to the scaler's user. (On a headless host: `--listen 127.0.0.1:8765` and
+`ssh -L 8765:127.0.0.1:8765 <host>` from your laptop.) Already made an App by hand? Use `--client-id`, `--installation-id`
+and `--key-file` instead of `--create-app`.
+
+```
+# 4. Start it
+cd ~/runner-scaling && docker compose up -d
+
+# 5. Run any workflow on  runs-on: [self-hosted, ci-lite]  (step 6 has a ready-made one). The guard refuses its first
+#    registration on purpose; this shows what it saw, asks you to confirm it is your organization's, pins it and restarts:
+./runner-scaling pin-tenant --dir ~/runner-scaling
+```
+
+Then continue at [step 6's check](#6-run-a-first-job-and-pin-the-tenant) (the job should now run and the LAN should be
+blocked) and [step 7](#7-make-it-permanent-and-safe). Something off? `runner-scaling doctor --dir ~/runner-scaling` again.
 
 ---
 
@@ -221,7 +264,7 @@ refused forever.
 3. **Confirm it is yours.** This is the only trust decision in setup: you are telling the guard which GitHub service to
    accept runners from. It is safe here because the refused registration came from *your* scaler, using *your* App, on a
    machine you just set up. (Do this on a fresh setup, before anything untrusted can reach the scaler.)
-4. Put that URL in `guard-lite.yaml` as `tenant_url:` (uncomment the line), then restart the policy and the guard (both read
+4. Put that URL in `guard-lite.yaml` as `tenant_url:` (or let `runner-scaling pin-tenant --dir .` show it, ask, edit and restart for you) (uncomment the line), then restart the policy and the guard (both read
    the file, and the policy checks the registration too):
    ```
    docker compose restart docker-policy guard-lite
@@ -276,10 +319,9 @@ own private one (a "dind" sidecar). That is the main risk step, because the side
 
 **You do** (Sysbox):
 
-1. Install Sysbox on the host and register it with Docker. Follow the
-   [Sysbox install guide](https://github.com/nestybox/sysbox/blob/master/docs/user-guide/install-package.md) and read the
-   README's [Running dind under Sysbox](../README.md#running-dind-under-sysbox) notes first: there is an AppArmor override, and
-   Sysbox adds two host services (`sysbox-mgr`, `sysbox-fs`) that Docker then depends on. Check: `docker info --format '{{json .Runtimes}}'` lists `sysbox-runc`.
+1. Install Sysbox on the host and register it with Docker: follow [SYSBOX.md](SYSBOX.md) (install, the AppArmor override some
+   Ubuntu hosts need, and a job that proves a nested privileged container cannot see your disks).
+   Check: `runner-scaling doctor --sysbox` is green.
 2. Copy `guard-sysbox.yaml` next to the others and set `github_url`, then copy the `docker-policy`, `guard` and `scaler`
    blocks from [`compose.yaml`](../examples/compose.yaml) as a new trio (own `prefix`, `subnet` inside your fence, API
    volumes and `--name`/`--labels`, for example `ci-sysbox`). Every pool gets **its own** `docker-policy`, because each

@@ -30,6 +30,10 @@ jobs:
         run: |
           CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/fence.test" ./internal/fence
           docker run --rm --cap-add NET_ADMIN -v "$RUNNER_TEMP/fence.test:/t:ro" -e FENCE_TEST=1 alpine:3 /t -test.v
+      - name: Onboarding end to end (init writes a stack; compose, guard, policy and doctor accept it)
+        run: |
+          go build -o "$RUNNER_TEMP/runner-scaling" ./cmd/runner-scaling
+          scripts/e2e-onboarding.sh "$RUNNER_TEMP/runner-scaling"
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 && govulncheck ./...
 
   image:
@@ -76,7 +80,7 @@ jobs:
           push-to-registry: true
 
   release-binaries:
-    # Attach the read-only `runners` CLI to the GitHub release for a v* tag.
+    # Attach the read-only `runners` CLI and the `runner-scaling` setup tool to the GitHub release for a v* tag.
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -97,7 +101,11 @@ jobs:
             CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/runners-$os-$arch" ./cmd/runners
           done
-          (cd dist && sha256sum runners-* > SHA256SUMS)
+          for arch in amd64 arm64; do   # the setup tool (init, doctor, pin-tenant): run it on the host that will run the stack
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/runner-scaling-linux-$arch" ./cmd/runner-scaling
+          done
+          (cd dist && sha256sum runners-* runner-scaling-* > SHA256SUMS)
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
