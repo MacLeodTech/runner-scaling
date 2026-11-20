@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -142,7 +143,7 @@ func TestApiLess(t *testing.T) {
 // A fake GitHub: converts the manifest code, lists installations after "install".
 func TestAppFlow(t *testing.T) {
 	key := testKey(t)
-	installed := false
+	var installed atomic.Bool
 	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/app-manifests/") && strings.HasSuffix(r.URL.Path, "/conversions"):
@@ -156,7 +157,7 @@ func TestAppFlow(t *testing.T) {
 				http.Error(w, "no jwt", 401)
 				return
 			}
-			if !installed {
+			if !installed.Load() {
 				w.Write([]byte("[]"))
 				return
 			}
@@ -203,7 +204,7 @@ func TestAppFlow(t *testing.T) {
 	if r, _ := http.Get(local + "callback?code=abc&state=" + url.QueryEscape(state)); r.StatusCode != 200 {
 		t.Fatalf("callback: %d", r.StatusCode)
 	}
-	installed = true
+	installed.Store(true)
 	select {
 	case o := <-done:
 		if o.err != nil {
