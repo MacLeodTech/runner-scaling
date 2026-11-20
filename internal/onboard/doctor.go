@@ -81,6 +81,9 @@ func (d Doctor) Run(ctx context.Context) []Check {
 	if d.ExpectOwner == 0 {
 		d.ExpectOwner = scalerUID
 	}
+	if d.Dir != "" && !d.WantSysbox {
+		d.WantSysbox = d.stackWantsSysbox()
+	}
 	var out []Check
 	out = append(out, d.docker(ctx)...)
 	out = append(out, d.kernel()...)
@@ -139,7 +142,7 @@ func (d Doctor) docker(ctx context.Context) []Check {
 		return []Check{mk(Fail, "docker", err.Error(), hint)}
 	}
 	if apiLess(ver.ApiVersion, minAPI) {
-		out = append(out, mk(Fail, "docker version", fmt.Sprintf("Docker %s speaks API %s; need %s or newer", ver.Version, ver.ApiVersion, minAPI), "Upgrade Docker Engine to 25 or newer"))
+		out = append(out, mk(Fail, "docker version", fmt.Sprintf("Docker %s speaks API %s; need %s or newer", ver.Version, ver.ApiVersion, minAPI), "Upgrade Docker Engine to 25 or newer. Ubuntu 22.04's docker.io package is 24.x: install docker-ce from Docker's own apt repository (https://docs.docker.com/engine/install/ubuntu/)"))
 	} else {
 		out = append(out, mk(Pass, "docker version", fmt.Sprintf("Docker %s (API %s)", ver.Version, ver.ApiVersion), ""))
 	}
@@ -355,22 +358,65 @@ func (d Doctor) stack(ctx context.Context) []Check {
 	return out
 }
 
-func (d Doctor) guardConfig(path string, env map[string]string, fence string, taken []netip.Prefix) []Check {
-	name := filepath.Base(path)
-	for k, v := range env { // the compose file passes .env through; the config may reference these
+// withEnv sets what the compose file would pass through from .env (and a default USERDIR) while a config is loaded;
+// the returned func undoes it.
+func withEnv(env map[string]string) func() {
+	var undo []string
+	set := func(k, v string) {
 		if _, ok := os.LookupEnv(k); !ok {
 			os.Setenv(k, v)
-			defer os.Unsetenv(k)
+			undo = append(undo, k)
 		}
 	}
-	if _, ok := os.LookupEnv("USERDIR"); !ok {
-		os.Setenv("USERDIR", "/srv")
-		defer os.Unsetenv("USERDIR")
+	for k, v := range env {
+		set(k, v)
 	}
-	cfg, err := guard.LoadConfig(path)
+	set("USERDIR", "/srv")
+	return func() {
+		for _, k := range undo {
+			os.Unsetenv(k)
+		}
+	}
+}
+
+// stackWantsSysbox reports whether any pool in the stack directory runs its Docker sidecar under Sysbox.
+func (d Doctor) stackWantsSysbox() bool {
+	env, _ := ReadEnv(filepath.Join(d.Dir, ".env"))
+	defer withEnv(env)()
+	files, _ := filepath.Glob(filepath.Join(d.Dir, "guard*.yaml"))
+	for _, f := range files {
+		cfgs, err := guard.LoadConfigs(f)
+		if err != nil {
+			continue
+		}
+		for _, c := range cfgs {
+			if c.Dind != nil && c.Dind.Runtime == "sysbox-runc" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (d Doctor) guardConfig(path string, env map[string]string, fence string, taken []netip.Prefix) []Check {
+	name := filepath.Base(path)
+	defer withEnv(env)()
+	cfgs, err := guard.LoadConfigs(path)
 	if err != nil {
 		return []Check{mk(Fail, name, err.Error(), "Fix the key it names; `runner-scaling guard --check --config "+path+"` repeats this check")}
 	}
+	var out []Check
+	for _, cfg := range cfgs {
+		pool := name
+		if cfg.Name != "" {
+			pool = name + " pool " + cfg.Name
+		}
+		out = append(out, d.poolChecks(pool, cfg, fence, taken)...)
+	}
+	return out
+}
+
+func (d Doctor) poolChecks(name string, cfg *guard.Config, fence string, taken []netip.Prefix) []Check {
 	out := []Check{mk(Pass, name, fmt.Sprintf("valid: prefix %s, %d slots", cfg.Prefix, cfg.MaxSlots), "")}
 	if strings.Contains(cfg.GitHubURL, "YOUR-ORG") {
 		out = append(out, mk(Fail, name+" github_url", "still the example value", "Set github_url: https://github.com/<your-org>"))

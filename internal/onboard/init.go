@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ type PlanInput struct {
 	DockerGID      int
 	MemTotalGB     int
 	Taken          []netip.Prefix // ranges already in use on the host
+	Pools          []string       // "lite", "sysbox"; empty means lite only
 	Version        string         // this binary's version (v0.12.0), to pin the image tag; "dev" keeps the example's
 	Root           bool
 }
@@ -90,7 +92,21 @@ func replaceOnce(s, old, new, what string) (string, error) {
 	return strings.Replace(s, old, new, 1), nil
 }
 
-// NewPlan builds the files for one pool without Docker (the QUICKSTART's deployment).
+// KnownPools are the pools init can write, in the order they appear in guard-pools.yaml.
+var KnownPools = []string{"lite", "sysbox"}
+
+// poolBlock cuts the lines between "# >>> pool NAME" and "# <<< pool NAME" (markers included) out of s, or returns
+// just that block when keep is true.
+func poolBlock(s, name string) (before, block, after string, err error) {
+	start, end := "  # >>> pool "+name+"\n", "  # <<< pool "+name+"\n"
+	i, j := strings.Index(s, start), strings.Index(s, end)
+	if i < 0 || j < i {
+		return "", "", "", fmt.Errorf("init: guard-pools.yaml has no %q pool block; this is a bug in init", name)
+	}
+	return s[:i], s[i : j+len(end)], s[j+len(end):], nil
+}
+
+// NewPlan builds the files for the stack: the compose file, guard.yaml with the chosen pools, .env and the key.
 func NewPlan(in PlanInput) (*Plan, error) {
 	if !orgRE.MatchString(in.Org) {
 		return nil, fmt.Errorf("%q does not look like a GitHub organization name", in.Org)
@@ -101,6 +117,16 @@ func NewPlan(in PlanInput) (*Plan, error) {
 	if in.DockerGID <= 0 {
 		return nil, fmt.Errorf("the Docker socket's group id is unknown")
 	}
+	want := map[string]bool{}
+	for _, n := range in.Pools {
+		if !slices.Contains(KnownPools, n) {
+			return nil, fmt.Errorf("unknown pool %q (init can write: %s)", n, strings.Join(KnownPools, ", "))
+		}
+		want[n] = true
+	}
+	if len(want) == 0 {
+		want["lite"] = true
+	}
 	fence, err := ChooseFence(in.Taken)
 	if err != nil {
 		return nil, err
@@ -110,25 +136,44 @@ func NewPlan(in PlanInput) (*Plan, error) {
 	prefix := strings.TrimSuffix(fence, ".0.0/16") // 172.30
 	p := &Plan{Files: map[string]File{}, Fence: fence, Slots: slots, Budget: budget}
 
-	g := rd("guard-lite.yaml")
+	g := rd("guard-pools.yaml")
 	for _, r := range [][3]string{
 		{"github_url: https://github.com/YOUR-ORG", "github_url: https://github.com/" + in.Org, "github_url"},
-		{"max_slots: 4", "max_slots: " + strconv.Itoa(slots), "max_slots"},
 		{"memory_budget: 8G", "memory_budget: " + budget, "memory_budget"},
 	} {
-		if g, err = replaceOnce(g, r[0], r[1], "guard-lite.yaml"); err != nil {
+		if g, err = replaceOnce(g, r[0], r[1], "guard-pools.yaml"); err != nil {
 			return nil, err
 		}
 	}
+	for _, n := range KnownPools {
+		before, block, after, err := poolBlock(g, n)
+		if err != nil {
+			return nil, err
+		}
+		if !want[n] {
+			g = before + after
+			continue
+		}
+		// lite gets the sized slot count; a Docker pool is heavier (two containers a slot), so half as many.
+		n2 := slots
+		if n == "sysbox" {
+			n2 = max(1, slots/2)
+		}
+		re := regexp.MustCompile(`(?m)^    max_slots: \d+`)
+		if !re.MatchString(block) {
+			return nil, fmt.Errorf("init: the %s block of guard-pools.yaml has no max_slots; this is a bug in init", n)
+		}
+		g = before + re.ReplaceAllLiteralString(block, "    max_slots: "+strconv.Itoa(n2)) + after
+	}
 	g = strings.ReplaceAll(g, "172.30.", prefix+".")
-	p.Files["guard-lite.yaml"] = File{[]byte(g), 0o644}
+	p.Files["guard.yaml"] = File{[]byte(g), 0o644}
 
-	c := rd("compose.lite.yaml")
-	if c, err = replaceOnce(c, "FENCE_SRC: 172.30.0.0/16", "FENCE_SRC: "+fence, "compose.lite.yaml"); err != nil {
+	c := rd("compose.yaml")
+	if c, err = replaceOnce(c, "FENCE_SRC: 172.30.0.0/16", "FENCE_SRC: "+fence, "compose.yaml"); err != nil {
 		return nil, err
 	}
 	if m := versionRE.FindStringSubmatch(in.Version); m != nil {
-		c = strings.ReplaceAll(c, "runner-scaling:0.11", "runner-scaling:"+m[1]+"."+m[2])
+		c = strings.ReplaceAll(c, "runner-scaling:0.12", "runner-scaling:"+m[1]+"."+m[2])
 	}
 	p.Files["compose.yaml"] = File{[]byte(c), 0o644}
 
@@ -150,6 +195,7 @@ func NewPlan(in PlanInput) (*Plan, error) {
 		p.ChownTo = scalerUID
 	}
 	p.Notes = append(p.Notes,
+		fmt.Sprintf("pools: %s", strings.Join(slices.DeleteFunc(slices.Clone(KnownPools), func(n string) bool { return !want[n] }), ", ")),
 		fmt.Sprintf("fenced range %s (nothing on this host uses it); every pool's subnet sits inside it", fence),
 		fmt.Sprintf("%d slot(s), %s memory budget for %d GB of RAM", slots, budget, in.MemTotalGB))
 	return p, nil

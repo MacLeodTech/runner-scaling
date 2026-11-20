@@ -67,7 +67,7 @@ func TestLoadConfigsMultiPool(t *testing.T) {
 	if box.MaxSlots != 3 || lite.MaxSlots != 2 {
 		t.Errorf("max_slots %d %d: the pool's own value wins, else the shared one", box.MaxSlots, lite.MaxSlots)
 	}
-	if strings.Join(box.Labels, ",") != "homelab-box,box" || strings.Join(lite.Labels, ",") != "lite" {
+	if strings.Join(box.Labels, ",") != "homelab-box,box" || lite.Labels[len(lite.Labels)-1] != "lite" || lite.Labels[0] != "self-hosted" {
 		t.Errorf("labels %v %v", box.Labels, lite.Labels)
 	}
 	if box.Dind == nil || lite.Dind != nil {

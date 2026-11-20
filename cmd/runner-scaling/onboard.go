@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/MacLeodTech/runner-scaling/internal/onboard"
@@ -60,13 +61,14 @@ func runDoctor(ctx context.Context, args []string) error {
 func runInit(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	org := fs.String("org", "", "your GitHub organization (required)")
-	dir := fs.String("dir", ".", "where the stack lives (compose.yaml, .env, guard-lite.yaml, secrets/)")
+	dir := fs.String("dir", ".", "where the stack lives (compose.yaml, .env, guard.yaml, secrets/)")
 	create := fs.Bool("create-app", false, "create the GitHub App through your browser (GitHub's manifest flow)")
 	appName := fs.String("app-name", "runner-scaler", "name for the new App")
 	listen := fs.String("listen", "127.0.0.1:0", "address for the local page (use a fixed port plus `ssh -L` on a headless host)")
 	clientID := fs.String("client-id", "", "existing App: Client ID")
 	instID := fs.Int64("installation-id", 0, "existing App: installation id")
 	keyFile := fs.String("key-file", "", "existing App: private key (.pem); copied into secrets/")
+	poolList := fs.String("pools", "lite", "pools to set up, comma-separated: lite (no Docker in jobs), sysbox (own Docker per job; needs Sysbox, docs/SYSBOX.md)")
 	force := fs.Bool("force", false, "overwrite files that exist")
 	dry := fs.Bool("dry-run", false, "show what would be written; write nothing")
 	sock := fs.String("docker", env("DOCKER_SOCKET", "/var/run/docker.sock"), "Docker socket")
@@ -74,7 +76,7 @@ func runInit(ctx context.Context, args []string) error {
 	if *org == "" {
 		return errors.New("--org is required, e.g. runner-scaling init --org my-org --create-app")
 	}
-	d := onboard.Doctor{DockerHost: *sock}
+	d := onboard.Doctor{DockerHost: *sock, WantSysbox: slices.Contains(splitList(*poolList), "sysbox")}
 	host, err := d.Detect(ctx)
 	if err != nil {
 		return fmt.Errorf("%w\n(run `runner-scaling doctor` to see what is missing)", err)
@@ -109,7 +111,7 @@ func runInit(ctx context.Context, args []string) error {
 		return errors.New("give either --create-app, or --client-id, --installation-id and --key-file of an App you made (QUICKSTART step 3)")
 	}
 	plan, err := onboard.NewPlan(onboard.PlanInput{Org: *org, ClientID: *clientID, InstallationID: *instID, Key: key,
-		DockerGID: host.DockerGID, MemTotalGB: host.MemTotalGB, Taken: host.Taken, Version: version, Root: os.Geteuid() == 0})
+		Pools: splitList(*poolList), DockerGID: host.DockerGID, MemTotalGB: host.MemTotalGB, Taken: host.Taken, Version: version, Root: os.Geteuid() == 0})
 	if err != nil {
 		return err
 	}
@@ -143,8 +145,8 @@ func runInit(ctx context.Context, args []string) error {
 func runPinTenant(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("pin-tenant", flag.ExitOnError)
 	dir := fs.String("dir", ".", "the stack directory")
-	cfgName := fs.String("config", "guard-lite.yaml", "the guard config to edit")
-	guardSvc := fs.String("guard", "guard-lite", "the guard's compose service")
+	cfgName := fs.String("config", "guard.yaml", "the guard config to edit")
+	guardSvc := fs.String("guard", "guard", "the guard's compose service")
 	policySvc := fs.String("policy", "docker-policy", "the docker-policy's compose service")
 	yes := fs.Bool("yes", false, "do not ask for confirmation")
 	fs.Parse(args)
@@ -188,4 +190,14 @@ func runPinTenant(ctx context.Context, args []string) error {
 	}
 	fmt.Println("Done. The scaler retries by itself within about 15 seconds.")
 	return nil
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

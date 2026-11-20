@@ -6,15 +6,15 @@ set -eu
 RS=${1:?usage: e2e-onboarding.sh /path/to/runner-scaling}
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 openssl genrsa -out "$D/key.pem" 2048 2>/dev/null
-"$RS" init --org example-org --client-id Iv1.e2etest --installation-id 4242 --key-file "$D/key.pem" --dir "$D/stack"
+"$RS" init --org example-org --client-id Iv1.e2etest --installation-id 4242 --key-file "$D/key.pem" --pools lite,sysbox --dir "$D/stack"
 
 cd "$D/stack"
-# 1. compose accepts the files as written (RUNNER_BASE etc. are not used by the lite example)
+# 1. compose accepts the files as written 
 docker compose config -q
 # 2. the guard and the policy proxy accept the config, under the example's own environment
 export USERDIR=/srv
-"$RS" guard --check --config guard-lite.yaml
-"$RS" docker-policy --check --config guard-lite.yaml
+"$RS" guard --check --config guard.yaml
+"$RS" docker-policy --check --config guard.yaml
 # 3. the fence flags the example uses parse, and the range is what compose says
 fence=$(sed -n 's/^ *FENCE_SRC: *\([0-9./]*\).*/\1/p' compose.yaml)
 test -n "$fence"

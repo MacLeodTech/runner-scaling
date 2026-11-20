@@ -43,7 +43,7 @@ func TestChooseFenceAvoidsUsedRanges(t *testing.T) {
 	if got, _ := ChooseFence(nil); got != "172.30.0.0/16" {
 		t.Fatalf("free host: %s", got)
 	}
-	if got, _ := ChooseFence(pfx("172.30.22.0/24")); got != "172.31.0.0/16" {
+	if got, _ := ChooseFence(pfx("172.30.12.0/24")); got != "172.31.0.0/16" {
 		t.Fatalf("172.30 in use: %s", got)
 	}
 	if got, _ := ChooseFence(pfx("172.16.0.0/12")); got != "" {
@@ -79,9 +79,13 @@ func TestPlanProducesValidFiles(t *testing.T) {
 		t.Errorf("a non-root init must say how to hand over the key: %v", notes)
 	}
 	t.Setenv("USERDIR", "/srv")
-	cfg, err := guard.LoadConfig(filepath.Join(dir, "guard-lite.yaml"))
-	if err != nil {
-		t.Fatalf("generated guard config rejected: %v", err)
+	cfgs, err := guard.LoadConfigs(filepath.Join(dir, "guard.yaml"))
+	if err != nil || len(cfgs) != 1 {
+		t.Fatalf("generated guard config rejected (%d pools): %v", len(cfgs), err)
+	}
+	cfg := cfgs[0]
+	if cfg.Name != "lite" || cfg.Dind != nil {
+		t.Errorf("default is the lite pool alone: %q dind %v", cfg.Name, cfg.Dind != nil)
 	}
 	if cfg.GitHubURL != "https://github.com/acme" || cfg.MaxSlots != 4 {
 		t.Errorf("config %+v", cfg)
@@ -109,6 +113,40 @@ func TestPlanProducesValidFiles(t *testing.T) {
 	}
 	if _, err := p.Write(dir, true); err != nil {
 		t.Errorf("--force: %v", err)
+	}
+}
+
+// Both pools: one guard.yaml, the Sysbox pool sized smaller, subnets inside the fence, and doctor wants Sysbox for it.
+func TestPlanTwoPools(t *testing.T) {
+	p, err := NewPlan(PlanInput{Org: "acme", ClientID: "Iv1.abc", InstallationID: 42, Key: testKey(t), DockerGID: 988,
+		MemTotalGB: 16, Taken: pfx("172.30.0.0/24"), Pools: []string{"lite", "sysbox"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if _, err := p.Write(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("USERDIR", "/srv")
+	cfgs, err := guard.LoadConfigs(filepath.Join(dir, "guard.yaml"))
+	if err != nil || len(cfgs) != 2 {
+		t.Fatalf("%d pools: %v", len(cfgs), err)
+	}
+	lite, sbx := cfgs[0], cfgs[1] // sorted by name
+	if sbx.Name != "sysbox" || sbx.Dind == nil || sbx.Dind.Runtime != "sysbox-runc" || lite.Dind != nil {
+		t.Errorf("pools: %q %q", sbx.Name, lite.Name)
+	}
+	if sbx.MaxSlots != 2 || lite.MaxSlots != 4 {
+		t.Errorf("slots lite %d sysbox %d, want 4 and 2", lite.MaxSlots, sbx.MaxSlots)
+	}
+	if !(Doctor{Dir: dir}).stackWantsSysbox() {
+		t.Error("doctor should require Sysbox for a stack with a sysbox pool")
+	}
+	// A pool the examples do not have, and a bad name, are refused.
+	for _, bad := range []string{"privileged", "x y"} {
+		if _, err := NewPlan(PlanInput{Org: "acme", ClientID: "c", InstallationID: 1, Key: []byte("k"), DockerGID: 1, MemTotalGB: 8, Pools: []string{bad}}); err == nil {
+			t.Errorf("pool %q accepted", bad)
+		}
 	}
 }
 
@@ -241,7 +279,7 @@ func TestAppFlowBadCode(t *testing.T) {
 
 func TestFindAndSetTenant(t *testing.T) {
 	const u = "https://pipelines.actions.githubusercontent.com/AbC123/"
-	log := `guard-lite-1 | time=x level=WARN msg=DENY err="jit: no tenant_url pinned: this config's ServerUrl is \"` + u + `\"; if that is your org's tenant, set tenant_url to it"`
+	log := `guard-1 | time=x level=WARN msg=DENY err="jit: no tenant_url pinned: this config's ServerUrl is \"` + u + `\"; if that is your org's tenant, set tenant_url to it"`
 	got, err := FindTenant(log + "\n" + log)
 	if err != nil || got != u {
 		t.Fatalf("%q %v", got, err)
@@ -322,7 +360,7 @@ func TestDoctorStackFindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A Docker network already sits on the fenced range.
-	d := Doctor{Dir: dir, Offline: true, DockerHost: fakeDocker(t, "1.43", nil, "172.30.22.0/24"), WantSysbox: true}
+	d := Doctor{Dir: dir, Offline: true, DockerHost: fakeDocker(t, "1.43", nil, "172.30.12.0/24"), WantSysbox: true}
 	cs := d.Run(context.Background())
 	for name, want := range map[string]Level{
 		"docker version":  Fail, // API too old
@@ -330,20 +368,20 @@ func TestDoctorStackFindings(t *testing.T) {
 		"app key owner":   Fail, // owned by the test user, not 65532
 		"subnet":          Fail, // overlaps the existing network
 		"tenant_url":      Warn,
-		"guard-lite.yaml": Pass,
+		"guard.yaml pool lite": Pass,
 	} {
 		c := find(cs, name)
 		if c == nil || c.Level != want {
 			t.Errorf("%s: %+v, want level %v", name, c, want)
 		}
 	}
-	if c := find(cs, "subnet"); c != nil && !strings.Contains(c.Detail, "172.30.22.0/24") {
+	if c := find(cs, "subnet"); c != nil && !strings.Contains(c.Detail, "172.30.12.0/24") {
 		t.Errorf("the conflicting range should be named: %q", c.Detail)
 	}
 	// Good Docker, key owner accepted as the test user's uid, fence matches.
 	d = Doctor{Dir: dir, Offline: true, DockerHost: fakeDocker(t, "1.52", []string{"sysbox-runc"}), WantSysbox: true, ExpectOwner: os.Getuid()}
 	cs = d.Run(context.Background())
-	for _, name := range []string{"docker version", "sysbox runtime", "app key file", "guard-lite.yaml"} {
+	for _, name := range []string{"docker version", "sysbox runtime", "app key file", "guard.yaml pool lite"} {
 		if c := find(cs, name); c == nil || c.Level != Pass {
 			t.Errorf("%s: %+v", name, c)
 		}

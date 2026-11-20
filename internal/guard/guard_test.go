@@ -404,19 +404,25 @@ func TestExampleConfigsLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lite, err := LoadConfig("../../examples/guard-lite.yaml")
+	pools, err := LoadConfigs("../../examples/guard-pools.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if main.Dind == nil || lite.Dind != nil {
-		t.Errorf("main pool should have dind and lite should not: %v, %v", main.Dind != nil, lite.Dind != nil)
+	if len(pools) != 2 {
+		t.Fatalf("guard-pools.yaml has %d pools", len(pools))
 	}
-	// Two pools on one host: they must not share names or overlap, and must share the memory budget.
-	if main.Prefix == lite.Prefix || main.Subnet == lite.Subnet {
-		t.Errorf("pools collide: %q/%q, %q/%q", main.Prefix, lite.Prefix, main.Subnet, lite.Subnet)
+	lite, sbx := pools[0], pools[1] // sorted by name
+	if sbx.Dind == nil || sbx.Dind.Runtime != "sysbox-runc" || lite.Dind != nil || main.Dind == nil {
+		t.Errorf("sysbox pool should have a Sysbox dind and lite none: %v %v", sbx.Dind != nil, lite.Dind != nil)
 	}
-	if main.MemoryBudget != lite.MemoryBudget || main.RequireFile != lite.RequireFile {
-		t.Errorf("pools disagree on the shared budget or gate")
+	if sbx.MemoryBudget != lite.MemoryBudget || sbx.RequireFile != lite.RequireFile || sbx.TenantURL != lite.TenantURL {
+		t.Errorf("pools disagree on the shared budget, gate or tenant")
+	}
+	// The standalone privileged example can still run beside the pools file as another guard: no shared names or ranges.
+	for _, p := range pools {
+		if p.Prefix == main.Prefix || p.Subnet == main.Subnet {
+			t.Errorf("pool %s collides with guard.yaml: %q %q", p.Name, p.Prefix, p.Subnet)
+		}
 	}
 }
 

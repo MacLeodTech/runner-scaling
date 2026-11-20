@@ -3,5 +3,5 @@ package examples
 
 import "embed"
 
-//go:embed compose.lite.yaml guard-lite.yaml env.example
+//go:embed compose.yaml guard-pools.yaml env.example
 var FS embed.FS

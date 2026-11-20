@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,8 +36,9 @@ type Config struct {
 	SharedHosts []string `yaml:"shared_hosts"`
 	// Name is the pool's name (the key under `pools:`); empty in a single-pool config. Set by the loader.
 	Name string `yaml:"-"`
-	// Labels are the scale set's labels, i.e. what a workflow puts in runs-on to reach this pool. Default: [name]
-	// (or the prefix in a single-pool config). GitHub adds self-hosted, Linux and X64 itself.
+	// Labels are the scale set's labels, i.e. what a workflow puts in runs-on to reach this pool. Default for a pool
+	// under `pools:`: self-hosted, linux, <this machine's architecture> and the pool's name. A single-pool config
+	// leaves them to the scaler's --labels flag, as before.
 	Labels []string `yaml:"labels"`
 	// Prefix names everything the guard creates (containers, networks, volumes) and is the start of every runner
 	// name. Lowercase letters, digits and dashes.
@@ -244,6 +246,11 @@ func LoadConfigs(file string) ([]*Config, error) {
 			return nil, fmt.Errorf("%s: pools must be a map of pool name to settings, with at least one pool", file)
 		}
 		delete(top, "pools")
+		for k := range top { // x-... keys are for YAML anchors, as in Compose files
+			if strings.HasPrefix(k, "x-") {
+				delete(top, k)
+			}
+		}
 		names := make([]string, 0, len(pm))
 		for n := range pm {
 			names = append(names, n)
@@ -275,7 +282,7 @@ func LoadConfigs(file string) ([]*Config, error) {
 				}
 			}
 			if _, set := merged["labels"]; !set || over["labels"] == nil && top["labels"] == nil {
-				merged["labels"] = []string{n}
+				merged["labels"] = defaultLabels(n)
 			}
 			b, err := yaml.Marshal(merged)
 			if err != nil {
@@ -336,7 +343,7 @@ func crossCheck(cs []*Config) error {
 		return nil
 	}
 	var errs []error
-	seenPrefix, seenLabel := map[string]string{}, map[string]string{}
+	seenPrefix, labelOwners := map[string]string{}, map[string][]string{}
 	paths := map[string]string{}
 	type sub struct {
 		pool string
@@ -352,10 +359,8 @@ func crossCheck(cs []*Config) error {
 		// A prefix that is another's prefix plus "-something" would make names ambiguous only if the suffix looks like
 		// a role; the policy matches names exactly, so this is safe, but two prefixes must still differ.
 		for _, l := range c.Labels {
-			if o, dup := seenLabel[strings.ToLower(l)]; dup {
-				errs = append(errs, fmt.Errorf("pools %s and %s both carry label %q: GitHub could not tell them apart", o, c.Name, l))
-			}
-			seenLabel[strings.ToLower(l)] = c.Name
+			l = strings.ToLower(l)
+			labelOwners[l] = append(labelOwners[l], c.Name)
 		}
 		pats := []string{}
 		if c.WorkBind != "" {
@@ -385,6 +390,15 @@ func crossCheck(cs []*Config) error {
 					subs = append(subs, sub{c.Name, n, p})
 				}
 			}
+		}
+	}
+	for _, c := range cs { // generic labels (self-hosted, linux) are shared; each pool needs one that only it has
+		unique := false
+		for _, l := range c.Labels {
+			unique = unique || len(labelOwners[strings.ToLower(l)]) == 1
+		}
+		if !unique {
+			errs = append(errs, fmt.Errorf("pool %s has no label of its own (labels %v): a workflow could not target it apart from the others", c.Name, c.Labels))
 		}
 	}
 	for i := range subs {
@@ -688,4 +702,13 @@ func (c *Config) Key() string {
 		return c.Name
 	}
 	return c.Prefix
+}
+
+// defaultLabels is what a pool without `labels:` carries: the usual runner labels plus its own name.
+func defaultLabels(name string) []string {
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x64"
+	}
+	return []string{"self-hosted", "linux", arch, name}
 }
