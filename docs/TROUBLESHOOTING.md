@@ -32,7 +32,7 @@ expired token (`docker logout ghcr.io`, then retry).
 **The guard exits at start with `field … not found in type …` (an unknown config key).** Your config uses a key this image version
 does not know. The guard rejects unknown keys on purpose. Use the example files from the same version as your image, or
 update the image. Validate any config without starting anything:
-`docker run --rm -v "$PWD/guard.yaml:/c.yaml:ro" ghcr.io/macleodtech/runner-scaling:0.12 guard --check --config /c.yaml`.
+`docker run --rm -v "$PWD/guard.yaml:/c.yaml:ro" ghcr.io/macleodtech/runner-scaling:0.13 guard --check --config /c.yaml`.
 
 **The guard exits with `unset environment variables: NAME`.** The config contains `${NAME}` and the guard container has
 no such variable. Add it to the guard's `environment:` or remove the reference.

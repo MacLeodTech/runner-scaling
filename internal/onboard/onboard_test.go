@@ -66,7 +66,7 @@ func TestSize(t *testing.T) {
 // The generated files must be accepted by the guard's own validation, fenced consistently, and carry the answers.
 func TestPlanProducesValidFiles(t *testing.T) {
 	p, err := NewPlan(PlanInput{Org: "acme", ClientID: "Iv1.abc", InstallationID: 42, Key: testKey(t), DockerGID: 988,
-		MemTotalGB: 16, Taken: pfx("172.30.0.0/24"), Version: "v0.12.3"})
+		MemTotalGB: 16, Taken: pfx("172.30.0.0/24"), Version: "v0.13.0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestPlanProducesValidFiles(t *testing.T) {
 		t.Errorf("subnet %q should follow the chosen free range 172.31", cfg.Subnet)
 	}
 	compose, _ := os.ReadFile(filepath.Join(dir, "compose.yaml"))
-	if !strings.Contains(string(compose), "FENCE_SRC: 172.31.0.0/16") || !strings.Contains(string(compose), "runner-scaling:0.12") ||
+	if !strings.Contains(string(compose), "FENCE_SRC: 172.31.0.0/16") || !strings.Contains(string(compose), "runner-scaling:0.13") ||
 		strings.Contains(string(compose), "172.30.") {
 		t.Errorf("compose.yaml not rewritten consistently")
 	}

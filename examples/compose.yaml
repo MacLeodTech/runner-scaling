@@ -30,7 +30,7 @@ services:
   # The guard starts no slot until that file exists.
   firewall:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.12   # same image; `firewall` is one of its roles (pin a digest)
+    image: ghcr.io/macleodtech/runner-scaling:0.13   # same image; `firewall` is one of its roles (pin a digest)
     network_mode: host
     user: "0:0"                 # root, but with every capability dropped except the one netlink needs
     cap_add: [NET_ADMIN]
@@ -49,7 +49,7 @@ services:
   # another image). Even a fully compromised guard can then do no more than guard.yaml says. No network.
   docker-policy:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.12
+    image: ghcr.io/macleodtech/runner-scaling:0.13
     user: "65533:65532"        # not root: it only needs the socket's group. 65532 is the group the guard shares with it.
     group_add: ["${DOCKER_GID:?set it in .env: stat -c %g /var/run/docker.sock}"]
     network_mode: none
@@ -68,7 +68,7 @@ services:
   # reaches Docker only through docker-policy.
   guard:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.12   # pin a digest (`docker buildx imagetools inspect <image>`) once it works
+    image: ghcr.io/macleodtech/runner-scaling:0.13   # pin a digest (`docker buildx imagetools inspect <image>`) once it works
     user: "65532:65532"
     network_mode: none
     mem_limit: 64m
@@ -91,7 +91,7 @@ services:
   # It finds the pools in guard.yaml through the guard and keeps one scale set per pool.
   scaler:
     <<: *hardened
-    image: ghcr.io/macleodtech/runner-scaling:0.12
+    image: ghcr.io/macleodtech/runner-scaling:0.13
     mem_limit: 128m
     pids_limit: 64
     command: [scaler]
