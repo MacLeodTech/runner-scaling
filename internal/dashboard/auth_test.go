@@ -309,3 +309,25 @@ func TestFilePermissionsAndNoAdminRefused(t *testing.T) {
 		t.Error("a users file with no admin must be refused")
 	}
 }
+
+func TestSyncAdminPassword(t *testing.T) {
+	c, accts, _ := newServer(t, "tok")
+	if ch, err := accts.SyncAdminPassword("managed-passw0rd"); err != nil || !ch {
+		t.Fatalf("first sync: changed=%v err=%v", ch, err)
+	}
+	if c.login("admin", "admin") != 401 {
+		t.Error("default password still works")
+	}
+	if c.login("admin", "managed-passw0rd") != 200 {
+		t.Fatal("managed password refused")
+	}
+	if _, me := c.do("GET", "/api/me", nil); me["must_change"] == true {
+		t.Errorf("managed password forces a change: %v", me)
+	}
+	if ch, err := accts.SyncAdminPassword("managed-passw0rd"); err != nil || ch {
+		t.Errorf("second sync: changed=%v err=%v", ch, err)
+	}
+	if _, err := accts.SyncAdminPassword("short"); err == nil {
+		t.Error("policy not applied")
+	}
+}

@@ -203,6 +203,34 @@ func (a *Accounts) SetPassword(name, pw string) error {
 	return a.save()
 }
 
+// SyncAdminPassword makes the admin account's password pw, for a password that is managed outside the dashboard
+// (a secret file). It reports whether anything changed: a matching hash is left alone, so a restart does not rewrite
+// the file or end sessions. A missing admin account is created. The password is never a must_change one: whoever
+// supplies it already chose it.
+func (a *Accounts) SyncAdminPassword(pw string) (bool, error) {
+	if err := CheckPassword("admin", pw); err != nil {
+		return false, err
+	}
+	a.mu.Lock()
+	u := a.m["admin"]
+	a.mu.Unlock()
+	if u != nil && u.Role == RoleAdmin && !u.MustChange && verifyPassword(u.Hash, pw) {
+		return false, nil
+	}
+	h, err := hashPassword(pw)
+	if err != nil {
+		return false, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if u = a.m["admin"]; u == nil {
+		u = &Account{Name: "admin", Role: RoleAdmin, Created: time.Now().UTC()}
+		a.m["admin"] = u
+	}
+	u.Role, u.Hash, u.MustChange = RoleAdmin, h, false
+	return true, a.save()
+}
+
 // Add creates an account with a generated password the user must change at first login, and returns that password.
 func (a *Accounts) Add(name, role string) (string, error) {
 	if !usernameRE.MatchString(name) {
