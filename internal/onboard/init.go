@@ -180,7 +180,7 @@ func NewPlan(in PlanInput) (*Plan, error) {
 		return nil, err
 	}
 	if m := versionRE.FindStringSubmatch(in.Version); m != nil {
-		c = strings.ReplaceAll(c, "runner-scaling:0.12", "runner-scaling:"+m[1]+"."+m[2])
+		c = strings.ReplaceAll(c, "runner-scaling:0.13", "runner-scaling:"+m[1]+"."+m[2])
 	}
 	p.Files["compose.yaml"] = File{[]byte(c), 0o644}
 
