@@ -341,6 +341,17 @@ func runScaler(ctx context.Context, log *slog.Logger, args []string) error {
 			if fresh {
 				log.Warn("dashboard accounts created with the default login admin:admin; it must change its password at first login", "file", uf)
 			}
+			// An admin password kept in a file (DASHBOARD_ADMIN_PASSWORD[_FILE]) is applied at every start, so it wins over
+			// a change made in the page and a rotated secret takes effect on restart. Unset or empty: accounts as before.
+			if pw, err := secret("DASHBOARD_ADMIN_PASSWORD"); err != nil {
+				return fmt.Errorf("DASHBOARD_ADMIN_PASSWORD: %w", err)
+			} else if pw != "" {
+				changed, err := accts.SyncAdminPassword(pw)
+				if err != nil {
+					return fmt.Errorf("DASHBOARD_ADMIN_PASSWORD: %w", err)
+				}
+				log.Info("dashboard admin password is managed by DASHBOARD_ADMIN_PASSWORD", "updated", changed)
+			}
 			dash.Auth = dashboard.NewAuth(accts, log.WithGroup("auth"))
 			// The audit trail lives next to the users file unless told otherwise; "off" turns it off.
 			switch af := env("DASHBOARD_AUDIT_FILE", filepath.Join(filepath.Dir(uf), "audit.jsonl")); af {

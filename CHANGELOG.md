@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions follow 
 
 ## [Unreleased]
 
+### Dashboard
+- `DASHBOARD_ADMIN_PASSWORD[_FILE]`: when set, the scaler applies it as the `admin` password at every start (creating `admin` if missing, no forced change). A password changed in the page lasts only until the next restart.
+
 ## [0.12.0] - 2026-11-20
 
 ### Multi-pool: one guard, one policy proxy and one scaler for any number of pools
