@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Is the CI runner image stale? Exits 0 when current, 1 when something needs a rebuild, 2 on error.
 #
-#   images/check.sh --versions ci/tool-versions [guard-lite.yaml guard-sysbox.yaml]
+#   images/check.sh --versions ci/tool-versions [guard.yaml]
 #
 # 1. each built image (runner-ci:lite, runner-ci:sysbox) was built from the current versions file and Dockerfile;
 # 2. each guard config named runs the image it should (lite -> :lite, sysbox -> :sysbox tag family, or a digest of it);
